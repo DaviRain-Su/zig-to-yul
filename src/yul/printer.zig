@@ -5,12 +5,14 @@
 
 const std = @import("std");
 const ast = @import("ast.zig");
+const source_map = @import("source_map.zig");
 
 pub const Printer = struct {
     output: std.ArrayList(u8),
     allocator: std.mem.Allocator,
     indent_level: u32 = 0,
     indent_string: []const u8 = "    ",
+    source_map: ?*source_map.Builder = null,
 
     const Self = @This();
     const Error = std.mem.Allocator.Error || error{NoSpaceLeft};
@@ -19,6 +21,14 @@ pub const Printer = struct {
         return .{
             .output = .empty,
             .allocator = allocator,
+        };
+    }
+
+    pub fn initWithSourceMap(allocator: std.mem.Allocator, map_builder: *source_map.Builder) Self {
+        return .{
+            .output = .empty,
+            .allocator = allocator,
+            .source_map = map_builder,
         };
     }
 
@@ -94,6 +104,7 @@ pub const Printer = struct {
     }
 
     fn printStatement(self: *Self, stmt: ast.Statement) Error!void {
+        try self.recordStatement(stmt);
         switch (stmt) {
             .expression_statement => |s| try self.printExpression(s.expression),
             .variable_declaration => |s| try self.printVariableDeclaration(s),
@@ -278,6 +289,13 @@ pub const Printer = struct {
             self.indent_level -= 1;
         }
     }
+
+    fn recordStatement(self: *Self, stmt: ast.Statement) Error!void {
+        if (self.source_map) |map_builder| {
+            const offset: u32 = @intCast(self.output.items.len);
+            try map_builder.record(offset, stmt.getLocation());
+        }
+    }
 };
 
 /// Convenience function to print an AST to string
@@ -285,6 +303,28 @@ pub fn format(allocator: std.mem.Allocator, root: ast.AST) ![]const u8 {
     var printer = Printer.init(allocator);
     defer printer.deinit();
     return printer.print(root);
+}
+
+pub const SourceMapOutput = struct {
+    code: []const u8,
+    map: source_map.Map,
+};
+
+/// Convenience function to print an AST and capture source map entries.
+pub fn formatWithSourceMap(
+    allocator: std.mem.Allocator,
+    root: ast.AST,
+    source_name: []const u8,
+) !SourceMapOutput {
+    var builder = source_map.Builder.init(allocator, source_name);
+    defer builder.deinit();
+
+    var printer = Printer.initWithSourceMap(allocator, &builder);
+    defer printer.deinit();
+
+    const code = try printer.print(root);
+    const map = try builder.build(allocator);
+    return .{ .code = code, .map = map };
 }
 
 // =============================================================================
@@ -370,4 +410,32 @@ test "print switch statement" {
 
     try std.testing.expect(std.mem.indexOf(u8, output, "switch shr(224, calldataload(0))") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "default") != null);
+}
+
+test "print with source map" {
+    const allocator = std.testing.allocator;
+
+    var stmt1 = ast.Statement.varDecl(
+        &.{ast.TypedName.init("x")},
+        ast.Expression.lit(ast.Literal.number(1)),
+    );
+    stmt1.variable_declaration.location = .{ .start = 5, .end = 10, .source_index = 0 };
+
+    var stmt2 = ast.Statement.expr(ast.Expression.call("foo", &.{}));
+    stmt2.expression_statement.location = .{ .start = 12, .end = 15, .source_index = 0 };
+
+    const code_block = ast.Block.init(&.{ stmt1, stmt2 });
+    const obj = ast.Object.init("MapTest", code_block, &.{}, &.{});
+    const root = ast.AST.init(obj);
+
+    const result = try formatWithSourceMap(allocator, root, "input.zig");
+    defer allocator.free(result.code);
+    defer result.map.deinit(allocator);
+
+    try std.testing.expect(result.map.sources.len == 1);
+    try std.testing.expect(std.mem.eql(u8, result.map.sources[0], "input.zig"));
+    try std.testing.expect(result.map.mappings.len == 2);
+    try std.testing.expect(result.map.mappings[0].generated < result.map.mappings[1].generated);
+    try std.testing.expect(result.map.mappings[0].start == 5);
+    try std.testing.expect(result.map.mappings[1].end == 15);
 }

@@ -61,6 +61,36 @@ fn runCompile(allocator: std.mem.Allocator, args: []const []const u8) !void {
         std.process.exit(1);
     };
 
+    if (opts.source_map) {
+        if (opts.output_file == null) {
+            std.debug.print("Error: --sourcemap requires -o/--output\n", .{});
+            std.process.exit(1);
+        }
+
+        const result = printer.formatWithSourceMap(allocator, ast, opts.input_file.?) catch |err| {
+            std.debug.print("Code generation error: {}\n", .{err});
+            std.process.exit(1);
+        };
+        defer allocator.free(result.code);
+        defer result.map.deinit(allocator);
+
+        const map_json = result.map.toJson(allocator) catch |err| {
+            std.debug.print("Source map error: {}\n", .{err});
+            std.process.exit(1);
+        };
+        defer allocator.free(map_json);
+
+        try writeOutput(result.code, opts.output_file);
+
+        const map_path = try std.fmt.allocPrint(allocator, "{s}.map", .{opts.output_file.?});
+        defer allocator.free(map_path);
+        const map_file = try std.fs.cwd().createFile(map_path, .{});
+        defer map_file.close();
+        try map_file.writeAll(map_json);
+        std.debug.print("Source map written to: {s}\n", .{map_path});
+        return;
+    }
+
     const yul_code = printer.format(allocator, ast) catch |err| {
         std.debug.print("Code generation error: {}\n", .{err});
         std.process.exit(1);
@@ -77,6 +107,10 @@ fn runBuild(allocator: std.mem.Allocator, args: []const []const u8) !void {
     if (opts.input_file == null) {
         std.debug.print("Error: No input file specified\n", .{});
         printBuildUsageStderr();
+        std.process.exit(1);
+    }
+    if (opts.source_map) {
+        std.debug.print("Error: --sourcemap is only supported with compile\n", .{});
         std.process.exit(1);
     }
 
@@ -169,6 +203,7 @@ const Options = struct {
     input_file: ?[]const u8 = null,
     output_file: ?[]const u8 = null,
     optimize: bool = false,
+    source_map: bool = false,
 };
 
 fn parseOptions(args: []const []const u8) !Options {
@@ -188,6 +223,8 @@ fn parseOptions(args: []const []const u8) !Options {
             }
         } else if (std.mem.eql(u8, arg, "-O") or std.mem.eql(u8, arg, "--optimize")) {
             opts.optimize = true;
+        } else if (std.mem.eql(u8, arg, "--sourcemap") or std.mem.eql(u8, arg, "--source-map")) {
+            opts.source_map = true;
         } else if (arg.len > 0 and arg[0] != '-') {
             opts.input_file = arg;
         } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
@@ -383,6 +420,7 @@ fn printUsageStderr() void {
         \\OPTIONS:
         \\    -o, --output <file>    Write output to <file>
         \\    -O, --optimize         Enable solc optimizer (build only)
+        \\    --sourcemap           Write a .map file next to output (compile only)
         \\    -h, --help             Print help message
         \\
     , .{version});
@@ -394,6 +432,7 @@ fn printCompileUsageStderr() void {
         \\
         \\OPTIONS:
         \\    -o, --output <file>    Write Yul output to <file>
+        \\    --sourcemap           Write a .map file next to output
         \\    -h, --help             Print help
         \\
     , .{});
@@ -435,6 +474,7 @@ fn printUsageTo(writer: anytype) !void {
         \\OPTIONS:
         \\    -o, --output <file>    Write output to <file>
         \\    -O, --optimize         Enable solc optimizer (build only)
+        \\    --sourcemap           Write a .map file next to output (compile only)
         \\    -h, --help             Print help message
         \\
         \\EXAMPLES:
