@@ -394,8 +394,8 @@ pub fn hasBuiltin(self: Dialect, name: []const u8) bool { ... }
 | continue | ✅ | 不支持 label/value |
 | if-else | ✅ | 通过 `iszero` 翻转 |
 | 复杂表达式 | ❌ | 嵌套调用、链式操作 |
-| 数组索引 | ❌ | 内存/存储计算 |
-| 结构体字面量 | ❌ | 内存布局 |
+| 数组索引 | ⚠️ 部分 | 内存用 `mload/mstore`，存储用 slot+index |
+| 结构体字面量 | ⚠️ 部分 | 生成内存初始化 helper 并返回指针 |
 
 ### 6.4 ABI 编解码限制
 

@@ -29,6 +29,10 @@ pub const Compiler = struct {
     ir_builder: yul_ir.Builder,
     errors: std.ArrayList(CompileError),
     dialect: yul_ast.Dialect,
+    struct_defs: std.StringHashMap([]const []const u8),
+    struct_init_helpers: std.StringHashMap([]const u8),
+    local_struct_vars: std.StringHashMap([]const u8),
+    extra_functions: std.ArrayList(yul_ir.Statement),
 
     // Compilation state
     current_contract: ?[]const u8,
@@ -115,6 +119,10 @@ pub const Compiler = struct {
             .ir_builder = yul_ir.Builder.init(allocator),
             .errors = .empty,
             .dialect = yul_ast.Dialect.default(),
+            .struct_defs = std.StringHashMap([]const []const u8).init(allocator),
+            .struct_init_helpers = std.StringHashMap([]const u8).init(allocator),
+            .local_struct_vars = std.StringHashMap([]const u8).init(allocator),
+            .extra_functions = .empty,
             .current_contract = null,
             .functions = .empty,
             .storage_vars = .empty,
@@ -136,6 +144,28 @@ pub const Compiler = struct {
         self.errors.deinit(self.allocator);
         self.functions.deinit(self.allocator);
         self.storage_vars.deinit(self.allocator);
+        self.extra_functions.deinit(self.allocator);
+
+        var struct_it = self.struct_defs.iterator();
+        while (struct_it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            self.allocator.free(entry.value_ptr.*);
+        }
+        self.struct_defs.deinit();
+
+        var helper_it = self.struct_init_helpers.iterator();
+        while (helper_it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            self.allocator.free(entry.value_ptr.*);
+        }
+        self.struct_init_helpers.deinit();
+
+        var local_it = self.local_struct_vars.iterator();
+        while (local_it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            self.allocator.free(entry.value_ptr.*);
+        }
+        self.local_struct_vars.deinit();
 
         // Free function info param arrays
         for (self.function_infos.items) |fi| {
@@ -261,6 +291,7 @@ pub const Compiler = struct {
             // Check if this is a struct definition
             if (var_decl.init_node.unwrap()) |init_idx| {
                 if (p.isContainerDecl(init_idx)) {
+                    try self.recordStructDef(name, init_idx);
                     // This is a struct - treat as contract
                     if (p.isPublic(index)) {
                         self.current_contract = name;
@@ -269,6 +300,32 @@ pub const Compiler = struct {
                 }
             }
         }
+    }
+
+    fn recordStructDef(self: *Self, name: []const u8, index: Ast.Node.Index) !void {
+        const p = &self.zig_parser.?;
+        if (self.struct_defs.get(name) != null) return;
+
+        var fields: std.ArrayList([]const u8) = .empty;
+        defer fields.deinit(self.allocator);
+
+        var buf: [2]Ast.Node.Index = undefined;
+        if (p.ast.fullContainerDecl(&buf, index)) |container| {
+            for (container.ast.members) |member| {
+                if (@intFromEnum(member) == 0) continue;
+                const tag = p.getNodeTag(member);
+                if (tag == .container_field_init or tag == .container_field) {
+                    const field_name = p.getIdentifier(p.getMainToken(member));
+                    if (field_name.len > 0) {
+                        try fields.append(self.allocator, field_name);
+                    }
+                }
+            }
+        }
+
+        const fields_copy = try self.allocator.dupe([]const u8, fields.items);
+        const key = try self.allocator.dupe(u8, name);
+        try self.struct_defs.put(key, fields_copy);
     }
 
     /// Process a contract struct
@@ -522,6 +579,13 @@ pub const Compiler = struct {
 
             var value: ?yul_ir.Expression = null;
             if (var_decl.init_node.unwrap()) |init_idx| {
+                if (self.isStructInitTag(p.getNodeTag(init_idx))) {
+                    if (try self.structInitTypeNameLegacy(init_idx)) |type_name| {
+                        const key = try self.allocator.dupe(u8, name);
+                        const val = try self.allocator.dupe(u8, type_name);
+                        try self.local_struct_vars.put(key, val);
+                    }
+                }
                 value = try self.translateExpression(init_idx);
             }
 
@@ -537,7 +601,18 @@ pub const Compiler = struct {
 
         const target_node = nodes[0];
         const target_tag = p.getNodeTag(target_node);
+        const value_node = nodes[1];
+        const value_tag = p.getNodeTag(value_node);
         const value = try self.translateExpression(nodes[1]);
+
+        if (target_tag == .identifier and self.isStructInitTag(value_tag)) {
+            const target_name = p.getNodeSource(target_node);
+            if (try self.structInitTypeNameLegacy(value_node)) |type_name| {
+                const key = try self.allocator.dupe(u8, target_name);
+                const val = try self.allocator.dupe(u8, type_name);
+                try self.local_struct_vars.put(key, val);
+            }
+        }
 
         // Check if this is a storage write (self.field = value)
         if (target_tag == .field_access) {
@@ -560,6 +635,27 @@ pub const Compiler = struct {
                         return;
                     }
                 }
+            }
+
+            if (self.local_struct_vars.get(obj_src)) |struct_name| {
+                if (self.struct_defs.get(struct_name)) |fields| {
+                    if (self.structFieldOffsetLegacy(fields, field_name)) |offset| {
+                        const addr = try self.ir_builder.builtin_call("add", &.{
+                            self.ir_builder.identifier(obj_src),
+                            self.ir_builder.literal_num(offset),
+                        });
+                        const mstore_call = try self.ir_builder.builtin_call("mstore", &.{ addr, value });
+                        try stmts.append(self.allocator, .{ .expression = mstore_call });
+                        return;
+                    }
+                }
+            }
+        }
+
+        if (target_tag == .array_access) {
+            if (try self.translateArrayAccessStoreLegacy(target_node, value)) |stmt| {
+                try stmts.append(self.allocator, stmt);
+                return;
             }
         }
 
@@ -987,15 +1083,43 @@ pub const Compiler = struct {
                 }
                 break :blk self.ir_builder.identifier(name);
             },
+            .grouped_expression => blk: {
+                const data = p.ast.nodeData(index).node_and_token;
+                break :blk try self.translateExpression(data[0]);
+            },
             .add => try self.translateBinaryOp(index, "add"),
             .sub => try self.translateBinaryOp(index, "sub"),
             .mul => try self.translateBinaryOp(index, "mul"),
             .div => try self.translateBinaryOp(index, "div"),
+            .mod => try self.translateBinaryOp(index, "mod"),
+            .shl => try self.translateBinaryOp(index, "shl"),
+            .shr => try self.translateBinaryOp(index, "shr"),
+            .bit_and => try self.translateBinaryOp(index, "and"),
+            .bit_or => try self.translateBinaryOp(index, "or"),
+            .bit_xor => try self.translateBinaryOp(index, "xor"),
+            .bool_and => try self.translateBinaryOp(index, "and"),
+            .bool_or => try self.translateBinaryOp(index, "or"),
             .equal_equal => try self.translateBinaryOp(index, "eq"),
+            .bang_equal => try self.translateInequalityLegacy(index),
             .less_than => try self.translateBinaryOp(index, "lt"),
             .greater_than => try self.translateBinaryOp(index, "gt"),
+            .less_or_equal => try self.translateComparisonNegatedLegacy(index, "gt"),
+            .greater_or_equal => try self.translateComparisonNegatedLegacy(index, "lt"),
+            .bool_not => try self.translateUnaryIsZeroLegacy(index),
+            .bit_not => try self.translateUnaryOpLegacy(index, "not"),
+            .negation, .negation_wrap => try self.translateUnaryNegationLegacy(index),
             .call, .call_one => try self.translateCall(index),
             .field_access => try self.translateFieldAccess(index),
+            .array_access => try self.translateArrayAccessLegacy(index),
+            .struct_init_one,
+            .struct_init_one_comma,
+            .struct_init_dot_two,
+            .struct_init_dot_two_comma,
+            .struct_init_dot,
+            .struct_init_dot_comma,
+            .struct_init,
+            .struct_init_comma,
+            => try self.translateStructInitLegacy(index),
             else => blk: {
                 self.reportUnsupportedExprLegacy(index) catch {};
                 break :blk self.ir_builder.literal_num(0);
@@ -1062,6 +1186,43 @@ pub const Compiler = struct {
         return try self.ir_builder.builtin_call(op, &.{ left, right });
     }
 
+    fn translateInequalityLegacy(self: *Self, index: Ast.Node.Index) ProcessError!yul_ir.Expression {
+        const eq = try self.translateBinaryOp(index, "eq");
+        return try self.ir_builder.builtin_call("iszero", &.{eq});
+    }
+
+    fn translateComparisonNegatedLegacy(self: *Self, index: Ast.Node.Index, op: []const u8) ProcessError!yul_ir.Expression {
+        const cmp = try self.translateBinaryOp(index, op);
+        return try self.ir_builder.builtin_call("iszero", &.{cmp});
+    }
+
+    fn translateUnaryIsZeroLegacy(self: *Self, index: Ast.Node.Index) ProcessError!yul_ir.Expression {
+        const p = &self.zig_parser.?;
+        const data = p.ast.nodeData(index);
+        const child = data.node;
+        const expr = try self.translateExpression(child);
+        return try self.ir_builder.builtin_call("iszero", &.{expr});
+    }
+
+    fn translateUnaryOpLegacy(self: *Self, index: Ast.Node.Index, op: []const u8) ProcessError!yul_ir.Expression {
+        const p = &self.zig_parser.?;
+        const data = p.ast.nodeData(index);
+        const child = data.node;
+        const expr = try self.translateExpression(child);
+        return try self.ir_builder.builtin_call(op, &.{expr});
+    }
+
+    fn translateUnaryNegationLegacy(self: *Self, index: Ast.Node.Index) ProcessError!yul_ir.Expression {
+        const p = &self.zig_parser.?;
+        const data = p.ast.nodeData(index);
+        const child = data.node;
+        const expr = try self.translateExpression(child);
+        return try self.ir_builder.builtin_call("sub", &.{
+            self.ir_builder.literal_num(@as(evm_types.U256, 0)),
+            expr,
+        });
+    }
+
     fn translateCall(self: *Self, index: Ast.Node.Index) ProcessError!yul_ir.Expression {
         const p = &self.zig_parser.?;
 
@@ -1126,7 +1287,255 @@ pub const Compiler = struct {
             }
         }
 
+        if (self.local_struct_vars.get(obj_src)) |struct_name| {
+            if (self.struct_defs.get(struct_name)) |fields| {
+                if (self.structFieldOffsetLegacy(fields, field_name)) |offset| {
+                    const addr = try self.ir_builder.builtin_call("add", &.{
+                        self.ir_builder.identifier(obj_src),
+                        self.ir_builder.literal_num(offset),
+                    });
+                    return try self.ir_builder.builtin_call("mload", &.{addr});
+                }
+            }
+        }
+
         return self.ir_builder.identifier(field_name);
+    }
+
+    fn translateArrayAccessLegacy(self: *Self, index: Ast.Node.Index) ProcessError!yul_ir.Expression {
+        const p = &self.zig_parser.?;
+        const data = p.ast.nodeData(index).node_and_node;
+        const base_node = data[0];
+        const index_node = data[1];
+        const base_tag = p.getNodeTag(base_node);
+
+        if (base_tag == .field_access) {
+            const base_data = p.ast.nodeData(base_node).node_and_token;
+            const obj_src = p.getNodeSource(base_data[0]);
+            const field_name = p.getIdentifier(base_data[1]);
+            if (std.mem.eql(u8, obj_src, "self")) {
+                if (self.storageSlotForLegacy(field_name)) |slot| {
+                    const idx_expr = try self.translateExpression(index_node);
+                    const addr = try self.indexedStorageSlotLegacy(slot, idx_expr);
+                    return try self.ir_builder.builtin_call("sload", &.{addr});
+                }
+            }
+        }
+
+        const base_expr = try self.translateExpression(base_node);
+        const idx_expr = try self.translateExpression(index_node);
+        const addr = try self.indexedMemoryAddressLegacy(base_expr, idx_expr);
+        return try self.ir_builder.builtin_call("mload", &.{addr});
+    }
+
+    fn translateArrayAccessStoreLegacy(self: *Self, target: Ast.Node.Index, value: yul_ir.Expression) ProcessError!?yul_ir.Statement {
+        const p = &self.zig_parser.?;
+        const data = p.ast.nodeData(target).node_and_node;
+        const base_node = data[0];
+        const index_node = data[1];
+        const base_tag = p.getNodeTag(base_node);
+
+        if (base_tag == .field_access) {
+            const base_data = p.ast.nodeData(base_node).node_and_token;
+            const obj_src = p.getNodeSource(base_data[0]);
+            const field_name = p.getIdentifier(base_data[1]);
+            if (std.mem.eql(u8, obj_src, "self")) {
+                if (self.storageSlotForLegacy(field_name)) |slot| {
+                    const idx_expr = try self.translateExpression(index_node);
+                    const addr = try self.indexedStorageSlotLegacy(slot, idx_expr);
+                    const store = try self.ir_builder.builtin_call("sstore", &.{addr, value});
+                    return .{ .expression = store };
+                }
+            }
+        }
+
+        const base_expr = try self.translateExpression(base_node);
+        const idx_expr = try self.translateExpression(index_node);
+        const addr = try self.indexedMemoryAddressLegacy(base_expr, idx_expr);
+        const store = try self.ir_builder.builtin_call("mstore", &.{addr, value});
+        return .{ .expression = store };
+    }
+
+    fn storageSlotForLegacy(self: *Self, field_name: []const u8) ?evm_types.U256 {
+        for (self.storage_vars.items) |sv| {
+            if (std.mem.eql(u8, sv.name, field_name)) return sv.slot;
+        }
+        return null;
+    }
+
+    fn indexedStorageSlotLegacy(self: *Self, base: evm_types.U256, idx_expr: yul_ir.Expression) ProcessError!yul_ir.Expression {
+        const offset = try self.ir_builder.builtin_call("mul", &.{
+            idx_expr,
+            self.ir_builder.literal_num(@as(evm_types.U256, 32)),
+        });
+        return try self.ir_builder.builtin_call("add", &.{
+            self.ir_builder.literal_num(base),
+            offset,
+        });
+    }
+
+    fn indexedMemoryAddressLegacy(self: *Self, base: yul_ir.Expression, idx_expr: yul_ir.Expression) ProcessError!yul_ir.Expression {
+        const offset = try self.ir_builder.builtin_call("mul", &.{
+            idx_expr,
+            self.ir_builder.literal_num(@as(evm_types.U256, 32)),
+        });
+        return try self.ir_builder.builtin_call("add", &.{base, offset});
+    }
+
+    fn translateStructInitLegacy(self: *Self, index: Ast.Node.Index) ProcessError!yul_ir.Expression {
+        const p = &self.zig_parser.?;
+        var buf: [2]Ast.Node.Index = undefined;
+        const struct_init = p.ast.fullStructInit(&buf, index) orelse return self.ir_builder.literal_num(0);
+
+        const type_node = struct_init.ast.type_expr.unwrap() orelse {
+            try self.reportUnsupportedExprLegacy(index);
+            return self.ir_builder.literal_num(0);
+        };
+        const type_name = p.getNodeSource(type_node);
+        const fields = self.struct_defs.get(type_name) orelse {
+            try self.reportUnsupportedExprLegacy(index);
+            return self.ir_builder.literal_num(0);
+        };
+
+        var values: std.ArrayList(yul_ir.Expression) = .empty;
+        defer values.deinit(self.allocator);
+
+        for (fields) |field_name| {
+            if (try self.structInitFieldValueLegacy(struct_init, field_name)) |expr| {
+                try values.append(self.allocator, expr);
+            } else {
+                try values.append(self.allocator, self.ir_builder.literal_num(@as(evm_types.U256, 0)));
+            }
+        }
+
+        const helper = try self.ensureStructInitHelperLegacy(type_name, fields);
+        return try self.ir_builder.call(helper, values.items);
+    }
+
+    fn ensureStructInitHelperLegacy(self: *Self, type_name: []const u8, fields: []const []const u8) ![]const u8 {
+        if (self.struct_init_helpers.get(type_name)) |helper| return helper;
+
+        const helper_name = try self.structInitHelperNameLegacy(type_name);
+        const helper_key = try self.allocator.dupe(u8, type_name);
+        try self.struct_init_helpers.put(helper_key, helper_name);
+
+        var body_stmts: std.ArrayList(yul_ir.Statement) = .empty;
+        defer body_stmts.deinit(self.allocator);
+
+        const ptr_assign = try self.ir_builder.assign(&.{"ptr"}, try self.ir_builder.builtin_call("mload", &.{
+            self.ir_builder.literal_num(@as(evm_types.U256, 0x40)),
+        }));
+        try body_stmts.append(self.allocator, ptr_assign);
+
+        for (fields, 0..) |field_name, i| {
+            const offset: evm_types.U256 = @intCast(i * 32);
+            const addr = try self.ir_builder.builtin_call("add", &.{
+                self.ir_builder.identifier("ptr"),
+                self.ir_builder.literal_num(offset),
+            });
+            const store = try self.ir_builder.builtin_call("mstore", &.{addr, self.ir_builder.identifier(field_name)});
+            try body_stmts.append(self.allocator, .{ .expression = store });
+        }
+
+        const total_size: evm_types.U256 = @intCast(fields.len * 32);
+        const update_ptr = try self.ir_builder.builtin_call("mstore", &.{
+            self.ir_builder.literal_num(@as(evm_types.U256, 0x40)),
+            try self.ir_builder.builtin_call("add", &.{
+                self.ir_builder.identifier("ptr"),
+                self.ir_builder.literal_num(total_size),
+            }),
+        });
+        try body_stmts.append(self.allocator, .{ .expression = update_ptr });
+
+        const func = try self.ir_builder.function(helper_name, fields, &.{"ptr"}, body_stmts.items);
+        try self.extra_functions.append(self.allocator, func);
+
+        return helper_name;
+    }
+
+    fn structInitFieldValueLegacy(self: *Self, struct_init: Ast.full.StructInit, field_name: []const u8) ProcessError!?yul_ir.Expression {
+        const p = &self.zig_parser.?;
+        for (struct_init.ast.fields) |field_node| {
+            if (self.structInitFieldNameLegacy(field_node)) |name| {
+                if (std.mem.eql(u8, name, field_name)) {
+                    if (p.getNodeTag(field_node) == .assign) {
+                        const nodes = p.ast.nodeData(field_node).node_and_node;
+                        return try self.translateExpression(nodes[1]);
+                    }
+                    return try self.translateExpression(field_node);
+                }
+            }
+        }
+        return null;
+    }
+
+    fn structInitFieldNameLegacy(self: *Self, field_node: Ast.Node.Index) ?[]const u8 {
+        const p = &self.zig_parser.?;
+        if (p.getNodeTag(field_node) == .assign) {
+            const nodes = p.ast.nodeData(field_node).node_and_node;
+            if (p.getNodeTag(nodes[0]) == .field_access) {
+                const fa = p.ast.nodeData(nodes[0]).node_and_token;
+                return p.getIdentifier(fa[1]);
+            }
+        }
+        var tok = p.ast.firstToken(field_node);
+        var steps: usize = 0;
+        while (tok > 0 and steps < 16) : (steps += 1) {
+            const tag = p.getTokenTag(tok);
+            if (tag == .identifier and tok > 0 and p.getTokenTag(tok - 1) == .period) {
+                return p.getTokenSlice(tok);
+            }
+            tok -= 1;
+        }
+        return null;
+    }
+
+    fn structFieldOffsetLegacy(_: *Self, fields: []const []const u8, field_name: []const u8) ?evm_types.U256 {
+        for (fields, 0..) |name, i| {
+            if (std.mem.eql(u8, name, field_name)) {
+                return @intCast(i * 32);
+            }
+        }
+        return null;
+    }
+
+    fn isStructInitTag(self: *Self, tag: Ast.Node.Tag) bool {
+        _ = self;
+        return switch (tag) {
+            .struct_init_one,
+            .struct_init_one_comma,
+            .struct_init_dot_two,
+            .struct_init_dot_two_comma,
+            .struct_init_dot,
+            .struct_init_dot_comma,
+            .struct_init,
+            .struct_init_comma,
+            => true,
+            else => false,
+        };
+    }
+
+    fn structInitTypeNameLegacy(self: *Self, index: Ast.Node.Index) ProcessError!?[]const u8 {
+        const p = &self.zig_parser.?;
+        var buf: [2]Ast.Node.Index = undefined;
+        const struct_init = p.ast.fullStructInit(&buf, index) orelse return null;
+        const type_node = struct_init.ast.type_expr.unwrap() orelse return null;
+        return p.getNodeSource(type_node);
+    }
+
+    fn structInitHelperNameLegacy(self: *Self, type_name: []const u8) ![]const u8 {
+        var buf: [128]u8 = undefined;
+        var len: usize = 0;
+        const prefix = "__zig2yul$init$";
+        @memcpy(buf[0..prefix.len], prefix);
+        len = prefix.len;
+        for (type_name) |c| {
+            const out = if (std.ascii.isAlphanumeric(c) or c == '_') c else '$';
+            if (len >= buf.len) break;
+            buf[len] = out;
+            len += 1;
+        }
+        return try std.fmt.allocPrint(self.allocator, "{s}", .{buf[0..len]});
     }
 
     /// Generate complete Yul object
@@ -1142,6 +1551,9 @@ pub const Compiler = struct {
 
         // Add all functions
         for (self.functions.items) |func| {
+            try deployed_code.append(self.allocator, func);
+        }
+        for (self.extra_functions.items) |func| {
             try deployed_code.append(self.allocator, func);
         }
 

@@ -20,6 +20,10 @@ pub const Transformer = struct {
     builder: ast.AstBuilder,
     errors: std.ArrayList(TransformError),
     dialect: ast.Dialect,
+    struct_defs: std.StringHashMap([]const []const u8),
+    struct_init_helpers: std.StringHashMap([]const u8),
+    local_struct_vars: std.StringHashMap([]const u8),
+    extra_functions: std.ArrayList(ast.Statement),
 
     // State tracking
     current_contract: ?[]const u8,
@@ -106,6 +110,10 @@ pub const Transformer = struct {
             .builder = ast.AstBuilder.init(allocator),
             .errors = .empty,
             .dialect = ast.Dialect.default(),
+            .struct_defs = std.StringHashMap([]const []const u8).init(allocator),
+            .struct_init_helpers = std.StringHashMap([]const u8).init(allocator),
+            .local_struct_vars = std.StringHashMap([]const u8).init(allocator),
+            .extra_functions = .empty,
             .current_contract = null,
             .functions = .empty,
             .storage_vars = .empty,
@@ -124,6 +132,28 @@ pub const Transformer = struct {
         self.errors.deinit(self.allocator);
         self.functions.deinit(self.allocator);
         self.storage_vars.deinit(self.allocator);
+        self.extra_functions.deinit(self.allocator);
+
+        var struct_it = self.struct_defs.iterator();
+        while (struct_it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            self.allocator.free(entry.value_ptr.*);
+        }
+        self.struct_defs.deinit();
+
+        var helper_it = self.struct_init_helpers.iterator();
+        while (helper_it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            self.allocator.free(entry.value_ptr.*);
+        }
+        self.struct_init_helpers.deinit();
+
+        var local_it = self.local_struct_vars.iterator();
+        while (local_it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            self.allocator.free(entry.value_ptr.*);
+        }
+        self.local_struct_vars.deinit();
 
         // Free function info param arrays
         for (self.function_infos.items) |fi| {
@@ -218,6 +248,7 @@ pub const Transformer = struct {
             // Check if this is a struct definition
             if (var_decl.init_node.unwrap()) |init_idx| {
                 if (p.isContainerDecl(init_idx)) {
+                    try self.recordStructDef(name, init_idx);
                     // This is a struct - treat as contract
                     if (p.isPublic(index)) {
                         self.current_contract = name;
@@ -226,6 +257,32 @@ pub const Transformer = struct {
                 }
             }
         }
+    }
+
+    fn recordStructDef(self: *Self, name: []const u8, index: ZigAst.Node.Index) !void {
+        const p = &self.zig_parser.?;
+        if (self.struct_defs.get(name) != null) return;
+
+        var fields: std.ArrayList([]const u8) = .empty;
+        defer fields.deinit(self.allocator);
+
+        var buf: [2]ZigAst.Node.Index = undefined;
+        if (p.ast.fullContainerDecl(&buf, index)) |container| {
+            for (container.ast.members) |member| {
+                if (@intFromEnum(member) == 0) continue;
+                const tag = p.getNodeTag(member);
+                if (tag == .container_field_init or tag == .container_field) {
+                    const field_name = p.getIdentifier(p.getMainToken(member));
+                    if (field_name.len > 0) {
+                        try fields.append(self.allocator, field_name);
+                    }
+                }
+            }
+        }
+
+        const fields_copy = try self.allocator.dupe([]const u8, fields.items);
+        const key = try self.allocator.dupe(u8, name);
+        try self.struct_defs.put(key, fields_copy);
     }
 
     /// Process a contract struct
@@ -465,6 +522,13 @@ pub const Transformer = struct {
 
             var value: ?ast.Expression = null;
             if (var_decl.init_node.unwrap()) |init_idx| {
+                if (self.isStructInitTag(p.getNodeTag(init_idx))) {
+                    if (try self.structInitTypeName(init_idx)) |type_name| {
+                        const key = try self.allocator.dupe(u8, name);
+                        const val = try self.allocator.dupe(u8, type_name);
+                        try self.local_struct_vars.put(key, val);
+                    }
+                }
                 value = try self.translateExpression(init_idx);
             }
 
@@ -480,7 +544,18 @@ pub const Transformer = struct {
 
         const target_node = nodes[0];
         const target_tag = p.getNodeTag(target_node);
+        const value_node = nodes[1];
+        const value_tag = p.getNodeTag(value_node);
         const value = try self.translateExpression(nodes[1]);
+
+        if (target_tag == .identifier and self.isStructInitTag(value_tag)) {
+            const target_name = p.getNodeSource(target_node);
+            if (try self.structInitTypeName(value_node)) |type_name| {
+                const key = try self.allocator.dupe(u8, target_name);
+                const val = try self.allocator.dupe(u8, type_name);
+                try self.local_struct_vars.put(key, val);
+            }
+        }
 
         // Check if this is a storage write (self.field = value)
         if (target_tag == .field_access) {
@@ -503,6 +578,27 @@ pub const Transformer = struct {
                         return;
                     }
                 }
+            }
+
+            if (self.local_struct_vars.get(obj_src)) |struct_name| {
+                if (self.struct_defs.get(struct_name)) |fields| {
+                    if (self.structFieldOffset(fields, field_name)) |offset| {
+                        const addr = try self.builder.builtinCall("add", &.{
+                            ast.Expression.id(obj_src),
+                            ast.Expression.lit(ast.Literal.number(offset)),
+                        });
+                        const mstore_call = try self.builder.builtinCall("mstore", &.{ addr, value });
+                        try stmts.append(self.allocator, ast.Statement.expr(mstore_call));
+                        return;
+                    }
+                }
+            }
+        }
+
+        if (target_tag == .array_access) {
+            if (try self.translateArrayAccessStore(target_node, value)) |stmt| {
+                try stmts.append(self.allocator, stmt);
+                return;
             }
         }
 
@@ -936,15 +1032,43 @@ pub const Transformer = struct {
                 }
                 break :blk ast.Expression.id(name);
             },
+            .grouped_expression => blk: {
+                const data = p.ast.nodeData(index).node_and_token;
+                break :blk try self.translateExpression(data[0]);
+            },
             .add => try self.translateBinaryOp(index, "add"),
             .sub => try self.translateBinaryOp(index, "sub"),
             .mul => try self.translateBinaryOp(index, "mul"),
             .div => try self.translateBinaryOp(index, "div"),
+            .mod => try self.translateBinaryOp(index, "mod"),
+            .shl => try self.translateBinaryOp(index, "shl"),
+            .shr => try self.translateBinaryOp(index, "shr"),
+            .bit_and => try self.translateBinaryOp(index, "and"),
+            .bit_or => try self.translateBinaryOp(index, "or"),
+            .bit_xor => try self.translateBinaryOp(index, "xor"),
+            .bool_and => try self.translateBinaryOp(index, "and"),
+            .bool_or => try self.translateBinaryOp(index, "or"),
             .equal_equal => try self.translateBinaryOp(index, "eq"),
+            .bang_equal => try self.translateInequality(index),
             .less_than => try self.translateBinaryOp(index, "lt"),
             .greater_than => try self.translateBinaryOp(index, "gt"),
+            .less_or_equal => try self.translateComparisonNegated(index, "gt"),
+            .greater_or_equal => try self.translateComparisonNegated(index, "lt"),
+            .bool_not => try self.translateUnaryIsZero(index),
+            .bit_not => try self.translateUnaryOp(index, "not"),
+            .negation, .negation_wrap => try self.translateUnaryNegation(index),
             .call, .call_one => try self.translateCall(index),
             .field_access => try self.translateFieldAccess(index),
+            .array_access => try self.translateArrayAccess(index),
+            .struct_init_one,
+            .struct_init_one_comma,
+            .struct_init_dot_two,
+            .struct_init_dot_two_comma,
+            .struct_init_dot,
+            .struct_init_dot_comma,
+            .struct_init,
+            .struct_init_comma,
+            => try self.translateStructInit(index),
             else => blk: {
                 self.reportUnsupportedExpr(index) catch {};
                 break :blk ast.Expression.lit(ast.Literal.number(0));
@@ -1016,6 +1140,43 @@ pub const Transformer = struct {
         return try self.builder.builtinCall(op, &.{ left, right });
     }
 
+    fn translateInequality(self: *Self, index: ZigAst.Node.Index) TransformProcessError!ast.Expression {
+        const eq = try self.translateBinaryOp(index, "eq");
+        return try self.builder.builtinCall("iszero", &.{eq});
+    }
+
+    fn translateComparisonNegated(self: *Self, index: ZigAst.Node.Index, op: []const u8) TransformProcessError!ast.Expression {
+        const cmp = try self.translateBinaryOp(index, op);
+        return try self.builder.builtinCall("iszero", &.{cmp});
+    }
+
+    fn translateUnaryIsZero(self: *Self, index: ZigAst.Node.Index) TransformProcessError!ast.Expression {
+        const p = &self.zig_parser.?;
+        const data = p.ast.nodeData(index);
+        const child = data.node;
+        const expr = try self.translateExpression(child);
+        return try self.builder.builtinCall("iszero", &.{expr});
+    }
+
+    fn translateUnaryOp(self: *Self, index: ZigAst.Node.Index, op: []const u8) TransformProcessError!ast.Expression {
+        const p = &self.zig_parser.?;
+        const data = p.ast.nodeData(index);
+        const child = data.node;
+        const expr = try self.translateExpression(child);
+        return try self.builder.builtinCall(op, &.{expr});
+    }
+
+    fn translateUnaryNegation(self: *Self, index: ZigAst.Node.Index) TransformProcessError!ast.Expression {
+        const p = &self.zig_parser.?;
+        const data = p.ast.nodeData(index);
+        const child = data.node;
+        const expr = try self.translateExpression(child);
+        return try self.builder.builtinCall("sub", &.{
+            ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0))),
+            expr,
+        });
+    }
+
     fn translateCall(self: *Self, index: ZigAst.Node.Index) TransformProcessError!ast.Expression {
         const p = &self.zig_parser.?;
 
@@ -1076,7 +1237,257 @@ pub const Transformer = struct {
             }
         }
 
+        if (self.local_struct_vars.get(obj_src)) |struct_name| {
+            if (self.struct_defs.get(struct_name)) |fields| {
+                if (self.structFieldOffset(fields, field_name)) |offset| {
+                    const addr = try self.builder.builtinCall("add", &.{
+                        ast.Expression.id(obj_src),
+                        ast.Expression.lit(ast.Literal.number(offset)),
+                    });
+                    return try self.builder.builtinCall("mload", &.{addr});
+                }
+            }
+        }
+
         return ast.Expression.id(field_name);
+    }
+
+    fn translateArrayAccess(self: *Self, index: ZigAst.Node.Index) TransformProcessError!ast.Expression {
+        const p = &self.zig_parser.?;
+        const data = p.ast.nodeData(index).node_and_node;
+        const base_node = data[0];
+        const index_node = data[1];
+        const base_tag = p.getNodeTag(base_node);
+
+        if (base_tag == .field_access) {
+            const base_data = p.ast.nodeData(base_node).node_and_token;
+            const obj_src = p.getNodeSource(base_data[0]);
+            const field_name = p.getIdentifier(base_data[1]);
+            if (std.mem.eql(u8, obj_src, "self")) {
+                if (self.storageSlotFor(field_name)) |slot| {
+                    const idx_expr = try self.translateExpression(index_node);
+                    const addr = try self.indexedStorageSlot(slot, idx_expr);
+                    return try self.builder.builtinCall("sload", &.{addr});
+                }
+            }
+        }
+
+        const base_expr = try self.translateExpression(base_node);
+        const idx_expr = try self.translateExpression(index_node);
+        const addr = try self.indexedMemoryAddress(base_expr, idx_expr);
+        return try self.builder.builtinCall("mload", &.{addr});
+    }
+
+    fn translateArrayAccessStore(self: *Self, target: ZigAst.Node.Index, value: ast.Expression) TransformProcessError!?ast.Statement {
+        const p = &self.zig_parser.?;
+        const data = p.ast.nodeData(target).node_and_node;
+        const base_node = data[0];
+        const index_node = data[1];
+        const base_tag = p.getNodeTag(base_node);
+
+        if (base_tag == .field_access) {
+            const base_data = p.ast.nodeData(base_node).node_and_token;
+            const obj_src = p.getNodeSource(base_data[0]);
+            const field_name = p.getIdentifier(base_data[1]);
+            if (std.mem.eql(u8, obj_src, "self")) {
+                if (self.storageSlotFor(field_name)) |slot| {
+                    const idx_expr = try self.translateExpression(index_node);
+                    const addr = try self.indexedStorageSlot(slot, idx_expr);
+                    const store = try self.builder.builtinCall("sstore", &.{addr, value});
+                    return ast.Statement.expr(store);
+                }
+            }
+        }
+
+        const base_expr = try self.translateExpression(base_node);
+        const idx_expr = try self.translateExpression(index_node);
+        const addr = try self.indexedMemoryAddress(base_expr, idx_expr);
+        const store = try self.builder.builtinCall("mstore", &.{addr, value});
+        return ast.Statement.expr(store);
+    }
+
+    fn storageSlotFor(self: *Self, field_name: []const u8) ?ast.U256 {
+        for (self.storage_vars.items) |sv| {
+            if (std.mem.eql(u8, sv.name, field_name)) return sv.slot;
+        }
+        return null;
+    }
+
+    fn indexedStorageSlot(self: *Self, base: ast.U256, idx_expr: ast.Expression) TransformProcessError!ast.Expression {
+        const offset = try self.builder.builtinCall("mul", &.{
+            idx_expr,
+            ast.Expression.lit(ast.Literal.number(@as(ast.U256, 32))),
+        });
+        return try self.builder.builtinCall("add", &.{
+            ast.Expression.lit(ast.Literal.number(base)),
+            offset,
+        });
+    }
+
+    fn indexedMemoryAddress(self: *Self, base: ast.Expression, idx_expr: ast.Expression) TransformProcessError!ast.Expression {
+        const offset = try self.builder.builtinCall("mul", &.{
+            idx_expr,
+            ast.Expression.lit(ast.Literal.number(@as(ast.U256, 32))),
+        });
+        return try self.builder.builtinCall("add", &.{base, offset});
+    }
+
+    fn translateStructInit(self: *Self, index: ZigAst.Node.Index) TransformProcessError!ast.Expression {
+        const p = &self.zig_parser.?;
+        var buf: [2]ZigAst.Node.Index = undefined;
+        const struct_init = p.ast.fullStructInit(&buf, index) orelse return ast.Expression.lit(ast.Literal.number(0));
+
+        const type_node = struct_init.ast.type_expr.unwrap() orelse {
+            try self.addError("struct literal requires explicit type", self.nodeLocation(index), .unsupported_feature);
+            return ast.Expression.lit(ast.Literal.number(0));
+        };
+        const type_name = p.getNodeSource(type_node);
+        const fields = self.struct_defs.get(type_name) orelse {
+            try self.addError("unknown struct type in literal", self.nodeLocation(index), .unsupported_feature);
+            return ast.Expression.lit(ast.Literal.number(0));
+        };
+
+        var values: std.ArrayList(ast.Expression) = .empty;
+        defer values.deinit(self.allocator);
+
+        for (fields) |field_name| {
+            if (try self.structInitFieldValue(struct_init, field_name)) |expr| {
+                try values.append(self.allocator, expr);
+            } else {
+                try values.append(self.allocator, ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0))));
+            }
+        }
+
+        const helper = try self.ensureStructInitHelper(type_name, fields);
+        return try self.builder.call(helper, values.items);
+    }
+
+    fn ensureStructInitHelper(self: *Self, type_name: []const u8, fields: []const []const u8) ![]const u8 {
+        if (self.struct_init_helpers.get(type_name)) |helper| return helper;
+
+        const helper_name = try self.structInitHelperName(type_name);
+        const helper_key = try self.allocator.dupe(u8, type_name);
+        try self.struct_init_helpers.put(helper_key, helper_name);
+
+        var body_stmts: std.ArrayList(ast.Statement) = .empty;
+        defer body_stmts.deinit(self.allocator);
+
+        const ptr_assign = try self.builder.assign(&.{"ptr"}, try self.builder.builtinCall("mload", &.{
+            ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0x40))),
+        }));
+        try body_stmts.append(self.allocator, ptr_assign);
+
+        for (fields, 0..) |field_name, i| {
+            const offset: ast.U256 = @intCast(i * 32);
+            const addr = try self.builder.builtinCall("add", &.{
+                ast.Expression.id("ptr"),
+                ast.Expression.lit(ast.Literal.number(offset)),
+            });
+            const store = try self.builder.builtinCall("mstore", &.{addr, ast.Expression.id(field_name)});
+            try body_stmts.append(self.allocator, ast.Statement.expr(store));
+        }
+
+        const total_size: ast.U256 = @intCast(fields.len * 32);
+        const update_ptr = try self.builder.builtinCall("mstore", &.{
+            ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0x40))),
+            try self.builder.builtinCall("add", &.{
+                ast.Expression.id("ptr"),
+                ast.Expression.lit(ast.Literal.number(total_size)),
+            }),
+        });
+        try body_stmts.append(self.allocator, ast.Statement.expr(update_ptr));
+
+        const body = try self.builder.block(body_stmts.items);
+        const func = try self.builder.funcDef(helper_name, fields, &.{"ptr"}, body);
+        try self.extra_functions.append(self.allocator, func);
+
+        return helper_name;
+    }
+
+    fn structInitFieldValue(self: *Self, struct_init: ZigAst.full.StructInit, field_name: []const u8) TransformProcessError!?ast.Expression {
+        const p = &self.zig_parser.?;
+        for (struct_init.ast.fields) |field_node| {
+            if (self.structInitFieldName(field_node)) |name| {
+                if (std.mem.eql(u8, name, field_name)) {
+                    if (p.getNodeTag(field_node) == .assign) {
+                        const nodes = p.ast.nodeData(field_node).node_and_node;
+                        return try self.translateExpression(nodes[1]);
+                    }
+                    return try self.translateExpression(field_node);
+                }
+            }
+        }
+        return null;
+    }
+
+    fn structInitFieldName(self: *Self, field_node: ZigAst.Node.Index) ?[]const u8 {
+        const p = &self.zig_parser.?;
+        if (p.getNodeTag(field_node) == .assign) {
+            const nodes = p.ast.nodeData(field_node).node_and_node;
+            if (p.getNodeTag(nodes[0]) == .field_access) {
+                const fa = p.ast.nodeData(nodes[0]).node_and_token;
+                return p.getIdentifier(fa[1]);
+            }
+        }
+        var tok = p.ast.firstToken(field_node);
+        var steps: usize = 0;
+        while (tok > 0 and steps < 16) : (steps += 1) {
+            const tag = p.getTokenTag(tok);
+            if (tag == .identifier and tok > 0 and p.getTokenTag(tok - 1) == .period) {
+                return p.getTokenSlice(tok);
+            }
+            tok -= 1;
+        }
+        return null;
+    }
+
+    fn structFieldOffset(self: *Self, fields: []const []const u8, field_name: []const u8) ?ast.U256 {
+        _ = self;
+        for (fields, 0..) |name, i| {
+            if (std.mem.eql(u8, name, field_name)) {
+                return @intCast(i * 32);
+            }
+        }
+        return null;
+    }
+
+    fn isStructInitTag(self: *Self, tag: ZigAst.Node.Tag) bool {
+        _ = self;
+        return switch (tag) {
+            .struct_init_one,
+            .struct_init_one_comma,
+            .struct_init_dot_two,
+            .struct_init_dot_two_comma,
+            .struct_init_dot,
+            .struct_init_dot_comma,
+            .struct_init,
+            .struct_init_comma,
+            => true,
+            else => false,
+        };
+    }
+
+    fn structInitTypeName(self: *Self, index: ZigAst.Node.Index) TransformProcessError!?[]const u8 {
+        const p = &self.zig_parser.?;
+        var buf: [2]ZigAst.Node.Index = undefined;
+        const struct_init = p.ast.fullStructInit(&buf, index) orelse return null;
+        const type_node = struct_init.ast.type_expr.unwrap() orelse return null;
+        return p.getNodeSource(type_node);
+    }
+
+    fn structInitHelperName(self: *Self, type_name: []const u8) ![]const u8 {
+        var buf: [128]u8 = undefined;
+        var len: usize = 0;
+        const prefix = "__zig2yul$init$";
+        @memcpy(buf[0..prefix.len], prefix);
+        len = prefix.len;
+        for (type_name) |c| {
+            const out = if (std.ascii.isAlphanumeric(c) or c == '_') c else '$';
+            if (len >= buf.len) break;
+            buf[len] = out;
+            len += 1;
+        }
+        return try std.fmt.allocPrint(self.allocator, "{s}", .{buf[0..len]});
     }
 
     /// Generate complete Yul AST
@@ -1092,6 +1503,9 @@ pub const Transformer = struct {
 
         // Add all functions
         for (self.functions.items) |func| {
+            try deployed_stmts.append(self.allocator, func);
+        }
+        for (self.extra_functions.items) |func| {
             try deployed_stmts.append(self.allocator, func);
         }
 
@@ -1440,4 +1854,53 @@ test "transform loops and control flow" {
     try std.testing.expect(std.mem.indexOf(u8, output, "break") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "continue") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "let j") != null);
+}
+
+test "transform expression coverage" {
+    const allocator = std.testing.allocator;
+    const printer = @import("printer.zig");
+
+    // Test arithmetic expressions, array access, and struct literals
+    const source =
+        \\const Pair = struct {
+        \\    a: u256,
+        \\    b: u256,
+        \\};
+        \\
+        \\pub const Counter = struct {
+        \\    value: u256,
+        \\
+        \\    pub fn compute(self: *Counter, offset: u256) u256 {
+        \\        var x = (1 + 2) * 3;
+        \\        var y = offset[1];
+        \\        const p = Pair{ .a = 7, .b = 9 };
+        \\        self.value = x;
+        \\        return p.a + y;
+        \\    }
+        \\};
+    ;
+
+    const source_z = try allocator.dupeZ(u8, source);
+    defer allocator.free(source_z);
+
+    var transformer = Transformer.init(allocator);
+    defer transformer.deinit();
+
+    const yul_ast = transformer.transform(source_z) catch |err| {
+        // Print errors for debugging
+        for (transformer.errors.items) |e| {
+            std.debug.print("Transform error: {s}\n", .{e.message});
+        }
+        return err;
+    };
+    const output = try printer.format(allocator, yul_ast);
+    defer allocator.free(output);
+
+    // Verify function is generated
+    try std.testing.expect(std.mem.indexOf(u8, output, "function compute") != null);
+    // Verify arithmetic operations
+    try std.testing.expect(std.mem.indexOf(u8, output, "add") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "mul") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "__zig2yul$init$Pair") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "mload") != null);
 }
