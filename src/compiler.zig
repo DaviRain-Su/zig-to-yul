@@ -1058,7 +1058,7 @@ pub const Compiler = struct {
 
             const case_cond = try self.foldOrConditionsLegacy(conds.items);
             const not_matched = try self.ir_builder.builtin_call("iszero", &.{match_id});
-            const guard = try self.ir_builder.builtin_call("and", &.{not_matched, case_cond});
+            const guard = try self.ir_builder.builtin_call("and", &.{ not_matched, case_cond });
 
             var guarded_body: std.ArrayList(yul_ir.Statement) = .empty;
             defer guarded_body.deinit(self.allocator);
@@ -1086,21 +1086,21 @@ pub const Compiler = struct {
             const nodes = p.ast.nodeData(value_node).node_and_node;
             const start_expr = try self.translateExpression(nodes[0]);
             const end_expr = try self.translateExpression(nodes[1]);
-            const lt_call = try self.ir_builder.builtin_call("lt", &.{cond, start_expr});
+            const lt_call = try self.ir_builder.builtin_call("lt", &.{ cond, start_expr });
             const not_lt = try self.ir_builder.builtin_call("iszero", &.{lt_call});
-            const gt_call = try self.ir_builder.builtin_call("gt", &.{cond, end_expr});
+            const gt_call = try self.ir_builder.builtin_call("gt", &.{ cond, end_expr });
             const not_gt = try self.ir_builder.builtin_call("iszero", &.{gt_call});
-            return try self.ir_builder.builtin_call("and", &.{not_lt, not_gt});
+            return try self.ir_builder.builtin_call("and", &.{ not_lt, not_gt });
         }
 
         if (self.isLiteralSwitchValueLegacy(value_node)) {
             if (try self.translateSwitchValueLegacy(value_node)) |lit| {
-                return try self.ir_builder.builtin_call("eq", &.{cond, .{ .literal = lit }});
+                return try self.ir_builder.builtin_call("eq", &.{ cond, .{ .literal = lit } });
             }
         }
 
         const expr = try self.translateExpression(value_node);
-        return try self.ir_builder.builtin_call("eq", &.{cond, expr});
+        return try self.ir_builder.builtin_call("eq", &.{ cond, expr });
     }
 
     fn foldOrConditionsLegacy(self: *Self, conds: []const yul_ir.Expression) ProcessError!yul_ir.Expression {
@@ -1108,7 +1108,7 @@ pub const Compiler = struct {
         var current = conds[0];
         var i: usize = 1;
         while (i < conds.len) : (i += 1) {
-            current = try self.ir_builder.builtin_call("or", &.{current, conds[i]});
+            current = try self.ir_builder.builtin_call("or", &.{ current, conds[i] });
         }
         return current;
     }
@@ -1474,7 +1474,7 @@ pub const Compiler = struct {
                 if (self.storageSlotForLegacy(field_name)) |slot| {
                     const idx_expr = try self.translateExpression(index_node);
                     const addr = try self.indexedStorageSlotLegacy(slot, idx_expr);
-                    const store = try self.ir_builder.builtin_call("sstore", &.{addr, value});
+                    const store = try self.ir_builder.builtin_call("sstore", &.{ addr, value });
                     return .{ .expression = store };
                 }
             }
@@ -1487,7 +1487,7 @@ pub const Compiler = struct {
                         });
                         const idx_expr = try self.translateExpression(index_node);
                         const addr = try self.indexedMemoryAddressLegacy(base_addr, idx_expr);
-                        const store = try self.ir_builder.builtin_call("mstore", &.{addr, value});
+                        const store = try self.ir_builder.builtin_call("mstore", &.{ addr, value });
                         return .{ .expression = store };
                     }
                 }
@@ -1497,7 +1497,7 @@ pub const Compiler = struct {
         const base_expr = try self.translateExpression(base_node);
         const idx_expr = try self.translateExpression(index_node);
         const addr = try self.indexedMemoryAddressLegacy(base_expr, idx_expr);
-        const store = try self.ir_builder.builtin_call("mstore", &.{addr, value});
+        const store = try self.ir_builder.builtin_call("mstore", &.{ addr, value });
         return .{ .expression = store };
     }
 
@@ -1524,7 +1524,7 @@ pub const Compiler = struct {
             idx_expr,
             self.ir_builder.literal_num(@as(evm_types.U256, 32)),
         });
-        return try self.ir_builder.builtin_call("add", &.{base, offset});
+        return try self.ir_builder.builtin_call("add", &.{ base, offset });
     }
 
     fn translateStructInitLegacy(self: *Self, index: Ast.Node.Index) ProcessError!yul_ir.Expression {
@@ -1578,7 +1578,7 @@ pub const Compiler = struct {
                 self.ir_builder.identifier("ptr"),
                 self.ir_builder.literal_num(offset),
             });
-            const store = try self.ir_builder.builtin_call("mstore", &.{addr, self.ir_builder.identifier(field.name)});
+            const store = try self.ir_builder.builtin_call("mstore", &.{ addr, self.ir_builder.identifier(field.name) });
             try body_stmts.append(self.allocator, .{ .expression = store });
         }
 
@@ -1794,7 +1794,7 @@ pub const Compiler = struct {
                             self.ir_builder.identifier(mem_name),
                             self.ir_builder.literal_num(@as(evm_types.U256, @intCast(idx * 32))),
                         });
-                        const store = try self.ir_builder.builtin_call("mstore", &.{addr, val});
+                        const store = try self.ir_builder.builtin_call("mstore", &.{ addr, val });
                         try case_stmts.append(self.allocator, .{ .expression = store });
                     }
 
@@ -1924,7 +1924,7 @@ pub const Compiler = struct {
                                 try case_stmts.append(self.allocator, .{ .expression = store_ptr });
                             } else {
                                 const val = try self.ir_builder.builtin_call("calldataload", &.{head_slot});
-                                const store = try self.ir_builder.builtin_call("mstore", &.{field_slot, val});
+                                const store = try self.ir_builder.builtin_call("mstore", &.{ field_slot, val });
                                 try case_stmts.append(self.allocator, .{ .expression = store });
                             }
                         }
@@ -1939,7 +1939,7 @@ pub const Compiler = struct {
                                 self.ir_builder.identifier(mem_name),
                                 self.ir_builder.literal_num(@as(evm_types.U256, @intCast(idx * 32))),
                             });
-                            const store = try self.ir_builder.builtin_call("mstore", &.{addr, val});
+                            const store = try self.ir_builder.builtin_call("mstore", &.{ addr, val });
                             try case_stmts.append(self.allocator, .{ .expression = store });
                         }
                     }
@@ -2039,7 +2039,7 @@ pub const Compiler = struct {
                 if (fi.return_struct_len > 0) {
                     for (0..fi.return_struct_len) |idx| {
                         const offset = self.ir_builder.literal_num(@as(evm_types.U256, @intCast(idx * 32)));
-                        const src = try self.ir_builder.builtin_call("add", &.{self.ir_builder.identifier("_result"), offset});
+                        const src = try self.ir_builder.builtin_call("add", &.{ self.ir_builder.identifier("_result"), offset });
                         const val = try self.ir_builder.builtin_call("mload", &.{src});
                         const store = try self.ir_builder.builtin_call("mstore", &.{
                             self.ir_builder.literal_num(@as(evm_types.U256, @intCast(idx * 32))),
@@ -2181,17 +2181,17 @@ pub const Compiler = struct {
     ) ProcessError!void {
         const idx_name = try self.makeTempLegacy("copy_i");
         const init_decl = try self.ir_builder.variable(&.{idx_name}, self.ir_builder.literal_num(@as(evm_types.U256, 0)));
-        const cond = try self.ir_builder.builtin_call("lt", &.{self.ir_builder.identifier(idx_name), size});
+        const cond = try self.ir_builder.builtin_call("lt", &.{ self.ir_builder.identifier(idx_name), size });
         const post_expr = try self.ir_builder.builtin_call("add", &.{
             self.ir_builder.identifier(idx_name),
             self.ir_builder.literal_num(@as(evm_types.U256, 32)),
         });
         const post_stmt = try self.ir_builder.assign(&.{idx_name}, post_expr);
 
-        const src_addr = try self.ir_builder.builtin_call("add", &.{src, self.ir_builder.identifier(idx_name)});
+        const src_addr = try self.ir_builder.builtin_call("add", &.{ src, self.ir_builder.identifier(idx_name) });
         const val = try self.ir_builder.builtin_call("mload", &.{src_addr});
-        const dst_addr = try self.ir_builder.builtin_call("add", &.{dest, self.ir_builder.identifier(idx_name)});
-        const store = try self.ir_builder.builtin_call("mstore", &.{dst_addr, val});
+        const dst_addr = try self.ir_builder.builtin_call("add", &.{ dest, self.ir_builder.identifier(idx_name) });
+        const store = try self.ir_builder.builtin_call("mstore", &.{ dst_addr, val });
 
         const loop_stmt = try self.ir_builder.for_loop(
             &.{init_decl},

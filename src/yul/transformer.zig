@@ -1009,7 +1009,7 @@ pub const Transformer = struct {
 
             const case_cond = try self.foldOrConditions(conds.items);
             const not_matched = try self.builder.builtinCall("iszero", &.{match_id});
-            const guard = try self.builder.builtinCall("and", &.{not_matched, case_cond});
+            const guard = try self.builder.builtinCall("and", &.{ not_matched, case_cond });
 
             var guarded_body: std.ArrayList(ast.Statement) = .empty;
             defer guarded_body.deinit(self.allocator);
@@ -1036,21 +1036,21 @@ pub const Transformer = struct {
             const nodes = p.ast.nodeData(value_node).node_and_node;
             const start_expr = try self.translateExpression(nodes[0]);
             const end_expr = try self.translateExpression(nodes[1]);
-            const lt_call = try self.builder.builtinCall("lt", &.{cond, start_expr});
+            const lt_call = try self.builder.builtinCall("lt", &.{ cond, start_expr });
             const not_lt = try self.builder.builtinCall("iszero", &.{lt_call});
-            const gt_call = try self.builder.builtinCall("gt", &.{cond, end_expr});
+            const gt_call = try self.builder.builtinCall("gt", &.{ cond, end_expr });
             const not_gt = try self.builder.builtinCall("iszero", &.{gt_call});
-            return try self.builder.builtinCall("and", &.{not_lt, not_gt});
+            return try self.builder.builtinCall("and", &.{ not_lt, not_gt });
         }
 
         if (self.isLiteralSwitchValue(value_node)) {
             if (try self.translateSwitchValue(value_node)) |lit| {
-                return try self.builder.builtinCall("eq", &.{cond, ast.Expression.lit(lit)});
+                return try self.builder.builtinCall("eq", &.{ cond, ast.Expression.lit(lit) });
             }
         }
 
         const expr = try self.translateExpression(value_node);
-        return try self.builder.builtinCall("eq", &.{cond, expr});
+        return try self.builder.builtinCall("eq", &.{ cond, expr });
     }
 
     fn foldOrConditions(self: *Self, conds: []const ast.Expression) TransformProcessError!ast.Expression {
@@ -1058,7 +1058,7 @@ pub const Transformer = struct {
         var current = conds[0];
         var i: usize = 1;
         while (i < conds.len) : (i += 1) {
-            current = try self.builder.builtinCall("or", &.{current, conds[i]});
+            current = try self.builder.builtinCall("or", &.{ current, conds[i] });
         }
         return current;
     }
@@ -1424,7 +1424,7 @@ pub const Transformer = struct {
                 if (self.storageSlotFor(field_name)) |slot| {
                     const idx_expr = try self.translateExpression(index_node);
                     const addr = try self.indexedStorageSlot(slot, idx_expr);
-                    const store = try self.builder.builtinCall("sstore", &.{addr, value});
+                    const store = try self.builder.builtinCall("sstore", &.{ addr, value });
                     return ast.Statement.expr(store);
                 }
             }
@@ -1437,7 +1437,7 @@ pub const Transformer = struct {
                         });
                         const idx_expr = try self.translateExpression(index_node);
                         const addr = try self.indexedMemoryAddress(base_addr, idx_expr);
-                        const store = try self.builder.builtinCall("mstore", &.{addr, value});
+                        const store = try self.builder.builtinCall("mstore", &.{ addr, value });
                         return ast.Statement.expr(store);
                     }
                 }
@@ -1447,7 +1447,7 @@ pub const Transformer = struct {
         const base_expr = try self.translateExpression(base_node);
         const idx_expr = try self.translateExpression(index_node);
         const addr = try self.indexedMemoryAddress(base_expr, idx_expr);
-        const store = try self.builder.builtinCall("mstore", &.{addr, value});
+        const store = try self.builder.builtinCall("mstore", &.{ addr, value });
         return ast.Statement.expr(store);
     }
 
@@ -1474,7 +1474,7 @@ pub const Transformer = struct {
             idx_expr,
             ast.Expression.lit(ast.Literal.number(@as(ast.U256, 32))),
         });
-        return try self.builder.builtinCall("add", &.{base, offset});
+        return try self.builder.builtinCall("add", &.{ base, offset });
     }
 
     fn translateStructInit(self: *Self, index: ZigAst.Node.Index) TransformProcessError!ast.Expression {
@@ -1528,7 +1528,7 @@ pub const Transformer = struct {
                 ast.Expression.id("ptr"),
                 ast.Expression.lit(ast.Literal.number(offset)),
             });
-            const store = try self.builder.builtinCall("mstore", &.{addr, ast.Expression.id(field.name)});
+            const store = try self.builder.builtinCall("mstore", &.{ addr, ast.Expression.id(field.name) });
             try body_stmts.append(self.allocator, ast.Statement.expr(store));
         }
 
@@ -1773,7 +1773,7 @@ pub const Transformer = struct {
                         ast.Expression.id(mem_name),
                         ast.Expression.lit(ast.Literal.number(@as(ast.U256, @intCast(idx * 32)))),
                     });
-                    const store = try self.builder.builtinCall("mstore", &.{addr, val});
+                    const store = try self.builder.builtinCall("mstore", &.{ addr, val });
                     try case_stmts.append(self.allocator, ast.Statement.expr(store));
                 }
 
@@ -1905,7 +1905,7 @@ pub const Transformer = struct {
                             try case_stmts.append(self.allocator, ast.Statement.expr(store_ptr));
                         } else {
                             const val = try self.builder.builtinCall("calldataload", &.{head_slot});
-                            const store = try self.builder.builtinCall("mstore", &.{field_slot, val});
+                            const store = try self.builder.builtinCall("mstore", &.{ field_slot, val });
                             try case_stmts.append(self.allocator, ast.Statement.expr(store));
                         }
                     }
@@ -1920,7 +1920,7 @@ pub const Transformer = struct {
                             ast.Expression.id(mem_name),
                             ast.Expression.lit(ast.Literal.number(@as(ast.U256, @intCast(idx * 32)))),
                         });
-                        const store = try self.builder.builtinCall("mstore", &.{addr, val});
+                        const store = try self.builder.builtinCall("mstore", &.{ addr, val });
                         try case_stmts.append(self.allocator, ast.Statement.expr(store));
                     }
                 }
@@ -2026,7 +2026,7 @@ pub const Transformer = struct {
                 const base = ast.Expression.id("_result");
                 for (0..fi.return_struct_len) |idx| {
                     const offset = ast.Expression.lit(ast.Literal.number(@as(ast.U256, @intCast(idx * 32))));
-                    const src = try self.builder.builtinCall("add", &.{base, offset});
+                    const src = try self.builder.builtinCall("add", &.{ base, offset });
                     const val = try self.builder.builtinCall("mload", &.{src});
                     const store = try self.builder.builtinCall("mstore", &.{
                         ast.Expression.lit(ast.Literal.number(@as(ast.U256, @intCast(idx * 32)))),
@@ -2149,7 +2149,7 @@ pub const Transformer = struct {
         const init_decl = try self.builder.varDecl(&.{idx_name}, ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0))));
         const init_block = try self.builder.block(&.{init_decl});
 
-        const cond = try self.builder.builtinCall("lt", &.{ast.Expression.id(idx_name), size});
+        const cond = try self.builder.builtinCall("lt", &.{ ast.Expression.id(idx_name), size });
 
         const post_expr = try self.builder.builtinCall("add", &.{
             ast.Expression.id(idx_name),
@@ -2158,10 +2158,10 @@ pub const Transformer = struct {
         const post_stmt = try self.builder.assign(&.{idx_name}, post_expr);
         const post_block = try self.builder.block(&.{post_stmt});
 
-        const src_addr = try self.builder.builtinCall("add", &.{src, ast.Expression.id(idx_name)});
+        const src_addr = try self.builder.builtinCall("add", &.{ src, ast.Expression.id(idx_name) });
         const val = try self.builder.builtinCall("mload", &.{src_addr});
-        const dst_addr = try self.builder.builtinCall("add", &.{dest, ast.Expression.id(idx_name)});
-        const store = try self.builder.builtinCall("mstore", &.{dst_addr, val});
+        const dst_addr = try self.builder.builtinCall("add", &.{ dest, ast.Expression.id(idx_name) });
+        const store = try self.builder.builtinCall("mstore", &.{ dst_addr, val });
         const body_block = try self.builder.block(&.{ast.Statement.expr(store)});
 
         const loop_stmt = self.builder.forLoop(init_block, cond, post_block, body_block);
