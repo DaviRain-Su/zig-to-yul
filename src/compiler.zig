@@ -572,12 +572,12 @@ pub const Compiler = struct {
         var cond: yul_ir.Expression = cond_expr;
 
         if (has_else) {
-            // Generate unique temp name
-            const temp_name = try std.fmt.allocPrint(self.allocator, "_cond_{d}", .{self.temp_counter});
+            // Generate unique temp name with collision-safe prefix
+            const temp_name = try std.fmt.allocPrint(self.allocator, "__zig2yul_cond_{d}", .{self.temp_counter});
             self.temp_counter += 1;
             try self.temp_strings.append(self.allocator, temp_name);
 
-            // Emit: let _cond_N := <condition>
+            // Emit: let __zig2yul_cond_N := <condition>
             const var_decl = try self.ir_builder.variable(&.{temp_name}, cond_expr);
             try stmts.append(self.allocator, var_decl);
 

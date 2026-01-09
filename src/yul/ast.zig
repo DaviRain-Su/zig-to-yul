@@ -294,7 +294,6 @@ pub const BuiltinName = struct {
             "memoryguard", // Yul memory guard for optimizer
             "loadimmutable", "setimmutable", // Yul immutable support
             "linkersymbol", // Linker placeholder
-            "verbatim", // Raw bytecode insertion (verbatim_*i_*o family)
             // Stack operations (limited in Yul)
             "pop",
         };
@@ -302,6 +301,15 @@ pub const BuiltinName = struct {
         for (builtins) |b| {
             if (std.mem.eql(u8, name, b)) return true;
         }
+
+        // Check for verbatim_*i_*o family (e.g., verbatim_1i_1o, verbatim_2i_0o)
+        if (std.mem.startsWith(u8, name, "verbatim_") and
+            std.mem.indexOf(u8, name, "i_") != null and
+            std.mem.endsWith(u8, name, "o"))
+        {
+            return true;
+        }
+
         return false;
     }
 };
