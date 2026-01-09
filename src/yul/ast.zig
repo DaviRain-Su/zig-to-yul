@@ -311,11 +311,25 @@ pub const BuiltinName = struct {
             if (std.mem.eql(u8, name, b)) return true;
         }
 
-        // Check for verbatim_*i_*o family (e.g., verbatim_1i_1o, verbatim_2i_0o)
-        if (std.mem.startsWith(u8, name, "verbatim_") and
-            std.mem.indexOf(u8, name, "i_") != null and
-            std.mem.endsWith(u8, name, "o"))
-        {
+        // Check for verbatim_<N>i_<M>o family (e.g., verbatim_1i_1o, verbatim_2i_0o)
+        // Format: verbatim_ + digits + i_ + digits + o
+        if (std.mem.startsWith(u8, name, "verbatim_") and name.len > 9) {
+            const suffix = name[9..]; // After "verbatim_"
+            // Find 'i_' position
+            const i_pos = std.mem.indexOf(u8, suffix, "i_") orelse return false;
+            if (i_pos == 0) return false; // Must have digits before 'i_'
+            // Check digits before 'i_'
+            for (suffix[0..i_pos]) |c| {
+                if (c < '0' or c > '9') return false;
+            }
+            // Check part after 'i_' ends with 'o' and has digits before it
+            const after_i = suffix[i_pos + 2 ..]; // After "i_"
+            if (after_i.len < 2) return false; // At least one digit + 'o'
+            if (after_i[after_i.len - 1] != 'o') return false;
+            // Check digits before 'o'
+            for (after_i[0 .. after_i.len - 1]) |c| {
+                if (c < '0' or c > '9') return false;
+            }
             return true;
         }
 

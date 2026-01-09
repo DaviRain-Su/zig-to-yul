@@ -3,6 +3,8 @@
 
 const std = @import("std");
 const Compiler = @import("compiler.zig").Compiler;
+const Transformer = @import("yul/transformer.zig").Transformer;
+const printer = @import("yul/printer.zig");
 
 const version = "0.1.0";
 
@@ -49,8 +51,18 @@ fn runCompile(allocator: std.mem.Allocator, args: []const []const u8) !void {
     defer allocator.free(source);
 
     // Use new AST-based compiler with proper dispatcher
-    const yul_code = Compiler.compileWithAst(allocator, source) catch |err| {
-        std.debug.print("Compilation error: {}\n", .{err});
+    var trans = Transformer.init(allocator);
+    defer trans.deinit();
+
+    const ast = trans.transform(source) catch |err| {
+        // Print detailed error diagnostics
+        printTransformErrorsStderr(&trans, opts.input_file.?);
+        std.debug.print("Compilation failed: {}\n", .{err});
+        std.process.exit(1);
+    };
+
+    const yul_code = printer.format(allocator, ast) catch |err| {
+        std.debug.print("Code generation error: {}\n", .{err});
         std.process.exit(1);
     };
     defer allocator.free(yul_code);
@@ -225,6 +237,17 @@ fn printCompileErrorsStderr(compiler: *Compiler) void {
     std.debug.print("Compilation failed:\n", .{});
     for (compiler.getErrors()) |e| {
         std.debug.print("  {}:{}: {s}\n", .{ e.line, e.column, e.message });
+    }
+}
+
+fn printTransformErrorsStderr(trans: *Transformer, filename: []const u8) void {
+    for (trans.getErrors()) |e| {
+        const loc = e.location;
+        if (loc.start > 0 or loc.end > 0) {
+            std.debug.print("{s}:{}-{}: error: {s}\n", .{ filename, loc.start, loc.end, e.message });
+        } else {
+            std.debug.print("{s}: error: {s}\n", .{ filename, e.message });
+        }
     }
 }
 

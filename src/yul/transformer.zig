@@ -516,11 +516,11 @@ pub const Transformer = struct {
 
         if (has_else) {
             // Generate unique temp name with collision-safe prefix
-            const temp_name = try std.fmt.allocPrint(self.allocator, "__zig2yul_cond_{d}", .{self.temp_counter});
+            const temp_name = try std.fmt.allocPrint(self.allocator, "$zig2yul$cond${d}", .{self.temp_counter});
             self.temp_counter += 1;
             try self.temp_strings.append(self.allocator, temp_name);
 
-            // Emit: let __zig2yul_cond_N := <condition>
+            // Emit: let $zig2yul$cond$N := <condition>
             const var_decl = try self.builder.varDecl(&.{temp_name}, cond_expr);
             try stmts.append(self.allocator, var_decl);
 
