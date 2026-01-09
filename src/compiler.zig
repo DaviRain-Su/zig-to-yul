@@ -28,6 +28,7 @@ pub const Compiler = struct {
     type_mapper: evm_types.TypeMapper,
     ir_builder: yul_ir.Builder,
     errors: std.ArrayList(CompileError),
+    dialect: yul_ast.Dialect,
 
     // Compilation state
     current_contract: ?[]const u8,
@@ -113,6 +114,7 @@ pub const Compiler = struct {
             .type_mapper = evm_types.TypeMapper.init(allocator),
             .ir_builder = yul_ir.Builder.init(allocator),
             .errors = .empty,
+            .dialect = yul_ast.Dialect.default(),
             .current_contract = null,
             .functions = .empty,
             .storage_vars = .empty,
@@ -227,6 +229,13 @@ pub const Compiler = struct {
             .column = column,
             .kind = kind,
         });
+    }
+
+    fn reportUnsupportedStmtLegacy(self: *Self, index: Ast.Node.Index, msg: []const u8) !void {
+        const p = &self.zig_parser.?;
+        const token = p.getMainToken(index);
+        const loc = p.getLocation(p.ast.tokens.get(token).start);
+        try self.addError(msg, loc.line, loc.column, .unsupported_feature);
     }
 
     /// Process a top-level declaration
@@ -481,6 +490,21 @@ pub const Compiler = struct {
             .@"if", .if_simple => {
                 try self.processIf(index, stmts);
             },
+            .@"while", .while_simple, .while_cont => {
+                try self.processWhile(index, stmts);
+            },
+            .@"for", .for_simple => {
+                try self.processFor(index, stmts);
+            },
+            .@"switch", .switch_comma => {
+                try self.processSwitch(index, stmts);
+            },
+            .@"break" => {
+                try self.processBreak(index, stmts);
+            },
+            .@"continue" => {
+                try self.processContinue(index, stmts);
+            },
             else => {
                 // Try to process as expression statement
                 if (self.translateExpression(index)) |expr| {
@@ -615,6 +639,193 @@ pub const Compiler = struct {
         }
     }
 
+    fn processWhile(self: *Self, index: Ast.Node.Index, stmts: *std.ArrayList(yul_ir.Statement)) ProcessError!void {
+        const p = &self.zig_parser.?;
+        const while_info = p.ast.fullWhile(index) orelse return;
+
+        if (while_info.ast.else_expr.unwrap() != null) {
+            try self.reportUnsupportedStmtLegacy(index, "while-else is not supported");
+            return;
+        }
+
+        const cond = try self.translateExpression(while_info.ast.cond_expr);
+
+        var post_stmts: std.ArrayList(yul_ir.Statement) = .empty;
+        defer post_stmts.deinit(self.allocator);
+        if (while_info.ast.cont_expr.unwrap()) |cont_expr| {
+            try self.processStatement(cont_expr, &post_stmts);
+        }
+
+        var body_stmts: std.ArrayList(yul_ir.Statement) = .empty;
+        defer body_stmts.deinit(self.allocator);
+        try self.processBlock(while_info.ast.then_expr, &body_stmts);
+
+        const loop_stmt = try self.ir_builder.for_loop(&.{}, cond, post_stmts.items, body_stmts.items);
+        try stmts.append(self.allocator, loop_stmt);
+    }
+
+    fn processFor(self: *Self, index: Ast.Node.Index, stmts: *std.ArrayList(yul_ir.Statement)) ProcessError!void {
+        const p = &self.zig_parser.?;
+        const for_info = p.ast.fullFor(index) orelse return;
+
+        if (for_info.ast.else_expr.unwrap() != null) {
+            try self.reportUnsupportedStmtLegacy(index, "for-else is not supported");
+            return;
+        }
+
+        if (for_info.ast.inputs.len != 1) {
+            try self.reportUnsupportedStmtLegacy(index, "for requires a single range input");
+            return;
+        }
+
+        const input = for_info.ast.inputs[0];
+        if (p.getNodeTag(input) != .for_range) {
+            try self.reportUnsupportedStmtLegacy(input, "for only supports range syntax (start..end)");
+            return;
+        }
+
+        const range = p.ast.nodeData(input).node_and_opt_node;
+        const start_expr = try self.translateExpression(range[0]);
+        const end_node = range[1].unwrap() orelse {
+            try self.reportUnsupportedStmtLegacy(input, "open-ended ranges are not supported");
+            return;
+        };
+        const end_expr = try self.translateExpression(end_node);
+
+        var payload_token = for_info.payload_token;
+        if (p.getTokenTag(payload_token) == .asterisk) {
+            payload_token += 1;
+        }
+        if (p.getTokenTag(payload_token) != .identifier) {
+            try self.reportUnsupportedStmtLegacy(index, "for payload must be an identifier");
+            return;
+        }
+
+        const body_first_token = p.ast.firstToken(for_info.ast.then_expr);
+        var tok: Ast.TokenIndex = payload_token;
+        while (tok < body_first_token) : (tok += 1) {
+            const tag = p.getTokenTag(tok);
+            if (tag == .pipe) break;
+            if (tag == .comma) {
+                try self.reportUnsupportedStmtLegacy(index, "multiple for payloads are not supported");
+                return;
+            }
+        }
+
+        const payload_name = p.getIdentifier(payload_token);
+
+        var init_stmts: std.ArrayList(yul_ir.Statement) = .empty;
+        defer init_stmts.deinit(self.allocator);
+        const init_decl = try self.ir_builder.variable(&.{payload_name}, start_expr);
+        try init_stmts.append(self.allocator, init_decl);
+
+        const cond = try self.ir_builder.call("lt", &.{
+            self.ir_builder.identifier(payload_name),
+            end_expr,
+        });
+
+        var post_stmts: std.ArrayList(yul_ir.Statement) = .empty;
+        defer post_stmts.deinit(self.allocator);
+        const inc_call = try self.ir_builder.call("add", &.{
+            self.ir_builder.identifier(payload_name),
+            self.ir_builder.literal_num(@as(evm_types.U256, 1)),
+        });
+        const inc_stmt = try self.ir_builder.assign(&.{payload_name}, inc_call);
+        try post_stmts.append(self.allocator, inc_stmt);
+
+        var body_stmts: std.ArrayList(yul_ir.Statement) = .empty;
+        defer body_stmts.deinit(self.allocator);
+        try self.processBlock(for_info.ast.then_expr, &body_stmts);
+
+        const loop_stmt = try self.ir_builder.for_loop(init_stmts.items, cond, post_stmts.items, body_stmts.items);
+        try stmts.append(self.allocator, loop_stmt);
+    }
+
+    fn processSwitch(self: *Self, index: Ast.Node.Index, stmts: *std.ArrayList(yul_ir.Statement)) ProcessError!void {
+        const p = &self.zig_parser.?;
+        const switch_info = p.ast.fullSwitch(index) orelse return;
+
+        const cond_expr = try self.translateExpression(switch_info.ast.condition);
+
+        var cases: std.ArrayList(yul_ir.Statement.SwitchStatement.Case) = .empty;
+        defer cases.deinit(self.allocator);
+
+        var default_body: ?[]const yul_ir.Statement = null;
+
+        for (switch_info.ast.cases) |case_idx| {
+            const case_info = p.ast.fullSwitchCase(case_idx) orelse continue;
+
+            var body_stmts: std.ArrayList(yul_ir.Statement) = .empty;
+            defer body_stmts.deinit(self.allocator);
+            try self.processBlock(case_info.ast.target_expr, &body_stmts);
+            const body_copy = try self.allocator.dupe(yul_ir.Statement, body_stmts.items);
+            try self.alloc_stmts.append(self.allocator, body_copy);
+
+            if (case_info.ast.values.len == 0) {
+                default_body = body_copy;
+                continue;
+            }
+
+            for (case_info.ast.values) |value_node| {
+                if (try self.translateSwitchValueLegacy(value_node)) |lit| {
+                    try cases.append(self.allocator, .{ .value = lit, .body = body_copy });
+                }
+            }
+        }
+
+        const switch_stmt = try self.ir_builder.switch_stmt(cond_expr, cases.items, default_body);
+        try stmts.append(self.allocator, switch_stmt);
+    }
+
+    fn translateSwitchValueLegacy(self: *Self, index: Ast.Node.Index) ProcessError!?yul_ir.Literal {
+        const p = &self.zig_parser.?;
+        const tag = p.getNodeTag(index);
+        switch (tag) {
+            .number_literal => {
+                const src = p.getNodeSource(index);
+                const num = parseNumber(src) catch |err| {
+                    try self.reportExprErrorLegacy("Invalid number literal", index, err);
+                    return null;
+                };
+                const is_hex = src.len > 2 and src[0] == '0' and (src[1] == 'x' or src[1] == 'X');
+                return if (is_hex) .{ .hex_number = num } else .{ .number = num };
+            },
+            .identifier => {
+                const name = p.getNodeSource(index);
+                if (std.mem.eql(u8, name, "true")) {
+                    return .{ .bool_ = true };
+                }
+                if (std.mem.eql(u8, name, "false")) {
+                    return .{ .bool_ = false };
+                }
+            },
+            else => {},
+        }
+
+        try self.reportUnsupportedStmtLegacy(index, "switch case value must be a literal");
+        return null;
+    }
+
+    fn processBreak(self: *Self, index: Ast.Node.Index, stmts: *std.ArrayList(yul_ir.Statement)) ProcessError!void {
+        const p = &self.zig_parser.?;
+        const data = p.ast.nodeData(index).opt_token_and_opt_node;
+        if (data[0] != .none or data[1].unwrap() != null) {
+            try self.reportUnsupportedStmtLegacy(index, "break with label/value is not supported");
+            return;
+        }
+        try stmts.append(self.allocator, .{ .break_ = {} });
+    }
+
+    fn processContinue(self: *Self, index: Ast.Node.Index, stmts: *std.ArrayList(yul_ir.Statement)) ProcessError!void {
+        const p = &self.zig_parser.?;
+        const data = p.ast.nodeData(index).opt_token_and_opt_node;
+        if (data[0] != .none or data[1].unwrap() != null) {
+            try self.reportUnsupportedStmtLegacy(index, "continue with label/value is not supported");
+            return;
+        }
+        try stmts.append(self.allocator, .{ .continue_ = {} });
+    }
+
     fn translateExpression(self: *Self, index: Ast.Node.Index) ProcessError!yul_ir.Expression {
         const p = &self.zig_parser.?;
         const tag = p.getNodeTag(index);
@@ -737,6 +948,19 @@ pub const Compiler = struct {
         if (std.mem.startsWith(u8, callee_src, "evm.")) {
             const builtin_name = callee_src[4..];
             if (builtins.getBuiltin(builtin_name)) |b| {
+                if (!self.dialect.hasBuiltin(b.yul_name)) {
+                    const fallback = "Builtin not available for selected EVM version";
+                    const msg = std.fmt.allocPrint(self.allocator, "Builtin '{s}' not available for EVM {s}", .{
+                        b.yul_name,
+                        @tagName(self.dialect.evm_version),
+                    }) catch fallback;
+                    if (msg.ptr != fallback.ptr) {
+                        try self.temp_strings.append(self.allocator, msg);
+                    }
+                    const token = p.getMainToken(call_info.ast.fn_expr);
+                    const loc = p.getLocation(p.ast.tokens.get(token).start);
+                    try self.addError(msg, loc.line, loc.column, .unsupported_feature);
+                }
                 return try self.ir_builder.call(b.yul_name, args.items);
             }
         }

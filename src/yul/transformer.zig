@@ -19,6 +19,7 @@ pub const Transformer = struct {
     symbol_table: symbols.SymbolTable,
     builder: ast.AstBuilder,
     errors: std.ArrayList(TransformError),
+    dialect: ast.Dialect,
 
     // State tracking
     current_contract: ?[]const u8,
@@ -104,6 +105,7 @@ pub const Transformer = struct {
             .symbol_table = symbols.SymbolTable.init(allocator),
             .builder = ast.AstBuilder.init(allocator),
             .errors = .empty,
+            .dialect = ast.Dialect.default(),
             .current_contract = null,
             .functions = .empty,
             .storage_vars = .empty,
@@ -185,6 +187,13 @@ pub const Transformer = struct {
             .location = location,
             .kind = kind,
         });
+    }
+
+    fn nodeLocation(self: *Self, index: ZigAst.Node.Index) ast.SourceLocation {
+        const p = &self.zig_parser.?;
+        const token = p.getMainToken(index);
+        const loc = p.ast.tokens.get(token);
+        return .{ .start = loc.start, .end = loc.start + 1 };
     }
 
     /// Process a top-level declaration
@@ -425,6 +434,21 @@ pub const Transformer = struct {
             .@"if", .if_simple => {
                 try self.processIf(index, stmts);
             },
+            .@"while", .while_simple, .while_cont => {
+                try self.processWhile(index, stmts);
+            },
+            .@"for", .for_simple => {
+                try self.processFor(index, stmts);
+            },
+            .@"switch", .switch_comma => {
+                try self.processSwitch(index, stmts);
+            },
+            .@"break" => {
+                try self.processBreak(index, stmts);
+            },
+            .@"continue" => {
+                try self.processContinue(index, stmts);
+            },
             else => {
                 if (self.translateExpression(index)) |expr| {
                     try stmts.append(self.allocator, ast.Statement.expr(expr));
@@ -563,6 +587,198 @@ pub const Transformer = struct {
         }
     }
 
+    fn processWhile(self: *Self, index: ZigAst.Node.Index, stmts: *std.ArrayList(ast.Statement)) TransformProcessError!void {
+        const p = &self.zig_parser.?;
+        const while_info = p.ast.fullWhile(index) orelse return;
+
+        if (while_info.ast.else_expr.unwrap() != null) {
+            try self.addError("while-else is not supported", self.nodeLocation(index), .unsupported_feature);
+            return;
+        }
+
+        const cond = try self.translateExpression(while_info.ast.cond_expr);
+
+        var post_stmts: std.ArrayList(ast.Statement) = .empty;
+        defer post_stmts.deinit(self.allocator);
+        if (while_info.ast.cont_expr.unwrap()) |cont_expr| {
+            try self.processStatement(cont_expr, &post_stmts);
+        }
+
+        var body_stmts: std.ArrayList(ast.Statement) = .empty;
+        defer body_stmts.deinit(self.allocator);
+        try self.processBlock(while_info.ast.then_expr, &body_stmts);
+
+        const pre_block = try self.builder.block(&.{});
+        const post_block = try self.builder.block(post_stmts.items);
+        const body_block = try self.builder.block(body_stmts.items);
+
+        const loop_stmt = self.builder.forLoop(pre_block, cond, post_block, body_block);
+        try stmts.append(self.allocator, loop_stmt);
+    }
+
+    fn processFor(self: *Self, index: ZigAst.Node.Index, stmts: *std.ArrayList(ast.Statement)) TransformProcessError!void {
+        const p = &self.zig_parser.?;
+        const for_info = p.ast.fullFor(index) orelse return;
+
+        if (for_info.ast.else_expr.unwrap() != null) {
+            try self.addError("for-else is not supported", self.nodeLocation(index), .unsupported_feature);
+            return;
+        }
+
+        if (for_info.ast.inputs.len != 1) {
+            try self.addError("for requires a single range input", self.nodeLocation(index), .unsupported_feature);
+            return;
+        }
+
+        const input = for_info.ast.inputs[0];
+        if (p.getNodeTag(input) != .for_range) {
+            try self.addError("for only supports range syntax (start..end)", self.nodeLocation(input), .unsupported_feature);
+            return;
+        }
+
+        const range = p.ast.nodeData(input).node_and_opt_node;
+        const start_expr = try self.translateExpression(range[0]);
+        const end_node = range[1].unwrap() orelse {
+            try self.addError("open-ended ranges are not supported", self.nodeLocation(input), .unsupported_feature);
+            return;
+        };
+        const end_expr = try self.translateExpression(end_node);
+
+        var payload_token = for_info.payload_token;
+        if (p.getTokenTag(payload_token) == .asterisk) {
+            payload_token += 1;
+        }
+        if (p.getTokenTag(payload_token) != .identifier) {
+            try self.addError("for payload must be an identifier", self.nodeLocation(index), .unsupported_feature);
+            return;
+        }
+
+        const body_first_token = p.ast.firstToken(for_info.ast.then_expr);
+        var tok: ZigAst.TokenIndex = payload_token;
+        while (tok < body_first_token) : (tok += 1) {
+            const tag = p.getTokenTag(tok);
+            if (tag == .pipe) break;
+            if (tag == .comma) {
+                try self.addError("multiple for payloads are not supported", self.nodeLocation(index), .unsupported_feature);
+                return;
+            }
+        }
+
+        const payload_name = p.getIdentifier(payload_token);
+
+        var init_stmts: std.ArrayList(ast.Statement) = .empty;
+        defer init_stmts.deinit(self.allocator);
+        const init_decl = try self.builder.varDecl(&.{payload_name}, start_expr);
+        try init_stmts.append(self.allocator, init_decl);
+
+        const cond = try self.builder.call("lt", &.{
+            ast.Expression.id(payload_name),
+            end_expr,
+        });
+
+        var post_stmts: std.ArrayList(ast.Statement) = .empty;
+        defer post_stmts.deinit(self.allocator);
+        const inc_call = try self.builder.call("add", &.{
+            ast.Expression.id(payload_name),
+            ast.Expression.lit(ast.Literal.number(@as(ast.U256, 1))),
+        });
+        const inc_stmt = try self.builder.assign(&.{payload_name}, inc_call);
+        try post_stmts.append(self.allocator, inc_stmt);
+
+        var body_stmts: std.ArrayList(ast.Statement) = .empty;
+        defer body_stmts.deinit(self.allocator);
+        try self.processBlock(for_info.ast.then_expr, &body_stmts);
+
+        const pre_block = try self.builder.block(init_stmts.items);
+        const post_block = try self.builder.block(post_stmts.items);
+        const body_block = try self.builder.block(body_stmts.items);
+
+        const loop_stmt = self.builder.forLoop(pre_block, cond, post_block, body_block);
+        try stmts.append(self.allocator, loop_stmt);
+    }
+
+    fn processSwitch(self: *Self, index: ZigAst.Node.Index, stmts: *std.ArrayList(ast.Statement)) TransformProcessError!void {
+        const p = &self.zig_parser.?;
+        const switch_info = p.ast.fullSwitch(index) orelse return;
+
+        const cond_expr = try self.translateExpression(switch_info.ast.condition);
+
+        var cases: std.ArrayList(ast.Case) = .empty;
+        defer cases.deinit(self.allocator);
+
+        for (switch_info.ast.cases) |case_idx| {
+            const case_info = p.ast.fullSwitchCase(case_idx) orelse continue;
+
+            var body_stmts: std.ArrayList(ast.Statement) = .empty;
+            defer body_stmts.deinit(self.allocator);
+            try self.processBlock(case_info.ast.target_expr, &body_stmts);
+            const body_block = try self.builder.block(body_stmts.items);
+
+            if (case_info.ast.values.len == 0) {
+                try cases.append(self.allocator, ast.Case.default(body_block));
+                continue;
+            }
+
+            for (case_info.ast.values) |value_node| {
+                if (try self.translateSwitchValue(value_node)) |lit| {
+                    try cases.append(self.allocator, ast.Case.init(lit, body_block));
+                }
+            }
+        }
+
+        const switch_stmt = try self.builder.switchStmt(cond_expr, cases.items);
+        try stmts.append(self.allocator, switch_stmt);
+    }
+
+    fn translateSwitchValue(self: *Self, index: ZigAst.Node.Index) TransformProcessError!?ast.Literal {
+        const p = &self.zig_parser.?;
+        const tag = p.getNodeTag(index);
+        switch (tag) {
+            .number_literal => {
+                const src = p.getNodeSource(index);
+                const num = parseNumber(src) catch |err| {
+                    try self.reportExprError("Invalid number literal", index, err);
+                    return null;
+                };
+                const is_hex = src.len > 2 and src[0] == '0' and (src[1] == 'x' or src[1] == 'X');
+                return if (is_hex) ast.Literal.hexNumber(num) else ast.Literal.number(num);
+            },
+            .identifier => {
+                const name = p.getNodeSource(index);
+                if (std.mem.eql(u8, name, "true")) {
+                    return ast.Literal.boolean(true);
+                }
+                if (std.mem.eql(u8, name, "false")) {
+                    return ast.Literal.boolean(false);
+                }
+            },
+            else => {},
+        }
+
+        try self.addError("switch case value must be a literal", self.nodeLocation(index), .unsupported_feature);
+        return null;
+    }
+
+    fn processBreak(self: *Self, index: ZigAst.Node.Index, stmts: *std.ArrayList(ast.Statement)) TransformProcessError!void {
+        const p = &self.zig_parser.?;
+        const data = p.ast.nodeData(index).opt_token_and_opt_node;
+        if (data[0] != .none or data[1].unwrap() != null) {
+            try self.addError("break with label/value is not supported", self.nodeLocation(index), .unsupported_feature);
+            return;
+        }
+        try stmts.append(self.allocator, ast.Statement.breakStmt());
+    }
+
+    fn processContinue(self: *Self, index: ZigAst.Node.Index, stmts: *std.ArrayList(ast.Statement)) TransformProcessError!void {
+        const p = &self.zig_parser.?;
+        const data = p.ast.nodeData(index).opt_token_and_opt_node;
+        if (data[0] != .none or data[1].unwrap() != null) {
+            try self.addError("continue with label/value is not supported", self.nodeLocation(index), .unsupported_feature);
+            return;
+        }
+        try stmts.append(self.allocator, ast.Statement.continueStmt());
+    }
+
     fn translateExpression(self: *Self, index: ZigAst.Node.Index) TransformProcessError!ast.Expression {
         const p = &self.zig_parser.?;
         const tag = p.getNodeTag(index);
@@ -689,6 +905,17 @@ pub const Transformer = struct {
         if (std.mem.startsWith(u8, callee_src, "evm.")) {
             const builtin_name = callee_src[4..];
             if (builtins.getBuiltin(builtin_name)) |b| {
+                if (!self.dialect.hasBuiltin(b.yul_name)) {
+                    const fallback = "Builtin not available for selected EVM version";
+                    const msg = std.fmt.allocPrint(self.allocator, "Builtin '{s}' not available for EVM {s}", .{
+                        b.yul_name,
+                        @tagName(self.dialect.evm_version),
+                    }) catch fallback;
+                    if (msg.ptr != fallback.ptr) {
+                        try self.temp_strings.append(self.allocator, msg);
+                    }
+                    try self.addError(msg, self.nodeLocation(call_info.ast.fn_expr), .unsupported_feature);
+                }
                 return try self.builder.call(b.yul_name, args.items);
             }
         }
@@ -1035,4 +1262,46 @@ test "dispatcher with parameterized function" {
 
     // Verify function definition with parameters
     try std.testing.expect(std.mem.indexOf(u8, output, "function transfer(to, amount)") != null);
+}
+
+test "transform loops and control flow" {
+    const allocator = std.testing.allocator;
+    const printer = @import("printer.zig");
+
+    const source =
+        \\pub const Counter = struct {
+        \\    count: u256,
+        \\
+        \\    pub fn loop(self: *Counter) void {
+        \\        var i = 0;
+        \\        while (i < 4) : (i = i + 1) {
+        \\            if (i == 2) {
+        \\                continue;
+        \\            }
+        \\            if (i == 3) {
+        \\                break;
+        \\            }
+        \\        }
+        \\
+        \\        for (0..2) |j| {
+        \\            i = i + j;
+        \\        }
+        \\    }
+        \\};
+    ;
+
+    const source_z = try allocator.dupeZ(u8, source);
+    defer allocator.free(source_z);
+
+    var transformer = Transformer.init(allocator);
+    defer transformer.deinit();
+
+    const yul_ast = try transformer.transform(source_z);
+    const output = try printer.format(allocator, yul_ast);
+    defer allocator.free(output);
+
+    try std.testing.expect(std.mem.indexOf(u8, output, "for {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "break") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "continue") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "let j") != null);
 }
