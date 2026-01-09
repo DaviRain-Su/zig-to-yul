@@ -409,7 +409,7 @@ pub fn hasBuiltin(self: Dialect, name: []const u8) bool { ... }
 | 多返回值 | ✅ | 结构体返回会连续 `mstore` |
 | 事件编码 | ⚠️ 部分 | log0-log4 存在，无高级封装 |
 
-### 6.5 SourceLocation 未填充
+### 6.5 SourceLocation 部分填充
 
 ```zig
 // ast.zig - 结构存在
@@ -419,8 +419,8 @@ pub const SourceLocation = struct {
     source_index: ?u32 = null,
 };
 
-// transformer.zig - 大多数节点使用默认值
-// 结果：错误定位和调试能力受限
+// transformer.zig - 主要语句/表达式已填充
+// 结果：AST 路径错误定位更准确，IR 路径仍无位置
 ```
 
 ---

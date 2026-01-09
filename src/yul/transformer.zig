@@ -239,9 +239,44 @@ pub const Transformer = struct {
 
     fn nodeLocation(self: *Self, index: ZigAst.Node.Index) ast.SourceLocation {
         const p = &self.zig_parser.?;
-        const token = p.getMainToken(index);
-        const loc = p.ast.tokens.get(token);
-        return .{ .start = loc.start, .end = loc.start + 1 };
+        const first_token = p.ast.firstToken(index);
+        const last_token = p.ast.lastToken(index);
+        if (first_token == 0 or last_token == 0) return .none;
+        const first_loc = p.ast.tokens.get(first_token);
+        const last_loc = p.ast.tokens.get(last_token);
+        const last_len: u32 = @intCast(p.getTokenSlice(last_token).len);
+        return .{ .start = first_loc.start, .end = last_loc.start + last_len };
+    }
+
+    fn exprWithLocation(self: *Self, expr: ast.Expression, loc: ast.SourceLocation) ast.Expression {
+        _ = self;
+        var out = expr;
+        switch (out) {
+            .literal => |*l| l.location = loc,
+            .identifier => |*i| i.location = loc,
+            .builtin_call => |*b| b.location = loc,
+            .function_call => |*f| f.location = loc,
+        }
+        return out;
+    }
+
+    fn stmtWithLocation(self: *Self, stmt: ast.Statement, loc: ast.SourceLocation) ast.Statement {
+        _ = self;
+        var out = stmt;
+        switch (out) {
+            .expression_statement => |*s| s.location = loc,
+            .variable_declaration => |*s| s.location = loc,
+            .assignment => |*s| s.location = loc,
+            .block => |*s| s.location = loc,
+            .if_statement => |*s| s.location = loc,
+            .switch_statement => |*s| s.location = loc,
+            .for_loop => |*s| s.location = loc,
+            .function_definition => |*s| s.location = loc,
+            .break_statement => |*s| s.location = loc,
+            .continue_statement => |*s| s.location = loc,
+            .leave_statement => |*s| s.location = loc,
+        }
+        return out;
     }
 
     /// Process a top-level declaration
@@ -633,7 +668,7 @@ pub const Transformer = struct {
             },
             else => {
                 if (self.translateExpression(index)) |expr| {
-                    try stmts.append(self.allocator, ast.Statement.expr(expr));
+                    try stmts.append(self.allocator, self.stmtWithLocation(ast.Statement.expr(expr), self.nodeLocation(index)));
                 } else |_| {}
             },
         }
@@ -656,7 +691,7 @@ pub const Transformer = struct {
             }
 
             const stmt = try self.builder.varDecl(&.{name}, value);
-            try stmts.append(self.allocator, stmt);
+            try stmts.append(self.allocator, self.stmtWithLocation(stmt, self.nodeLocation(index)));
         }
     }
 
@@ -695,7 +730,7 @@ pub const Transformer = struct {
                             ast.Expression.lit(ast.Literal.number(sv.slot)),
                             value,
                         });
-                        try stmts.append(self.allocator, ast.Statement.expr(sstore_call));
+                        try stmts.append(self.allocator, self.stmtWithLocation(ast.Statement.expr(sstore_call), self.nodeLocation(index)));
                         return;
                     }
                 }
@@ -709,7 +744,7 @@ pub const Transformer = struct {
                             ast.Expression.lit(ast.Literal.number(offset)),
                         });
                         const mstore_call = try self.builder.builtinCall("mstore", &.{ addr, value });
-                        try stmts.append(self.allocator, ast.Statement.expr(mstore_call));
+                        try stmts.append(self.allocator, self.stmtWithLocation(ast.Statement.expr(mstore_call), self.nodeLocation(index)));
                         return;
                     }
                 }
@@ -718,7 +753,7 @@ pub const Transformer = struct {
 
         if (target_tag == .array_access) {
             if (try self.translateArrayAccessStore(target_node, value)) |stmt| {
-                try stmts.append(self.allocator, stmt);
+                try stmts.append(self.allocator, self.stmtWithLocation(stmt, self.nodeLocation(index)));
                 return;
             }
         }
@@ -726,7 +761,7 @@ pub const Transformer = struct {
         // Regular assignment
         const target_name = p.getNodeSource(target_node);
         const stmt = try self.builder.assign(&.{target_name}, value);
-        try stmts.append(self.allocator, stmt);
+        try stmts.append(self.allocator, self.stmtWithLocation(stmt, self.nodeLocation(index)));
     }
 
     fn processReturn(self: *Self, index: ZigAst.Node.Index, stmts: *std.ArrayList(ast.Statement)) TransformProcessError!void {
@@ -737,9 +772,9 @@ pub const Transformer = struct {
         if (opt_node.unwrap()) |ret_node| {
             const value = try self.translateExpression(ret_node);
             const assign = try self.builder.assign(&.{"result"}, value);
-            try stmts.append(self.allocator, assign);
+            try stmts.append(self.allocator, self.stmtWithLocation(assign, self.nodeLocation(index)));
         }
-        try stmts.append(self.allocator, ast.Statement.leaveStmt());
+        try stmts.append(self.allocator, self.stmtWithLocation(ast.Statement.leaveStmt(), self.nodeLocation(index)));
     }
 
     fn processIf(self: *Self, index: ZigAst.Node.Index, stmts: *std.ArrayList(ast.Statement)) TransformProcessError!void {
@@ -763,7 +798,7 @@ pub const Transformer = struct {
 
             // Emit: let $zig2yul$cond$N := <condition>
             const var_decl = try self.builder.varDecl(&.{temp_name}, cond_expr);
-            try stmts.append(self.allocator, var_decl);
+            try stmts.append(self.allocator, self.stmtWithLocation(var_decl, self.nodeLocation(index)));
 
             // Use the temp variable as condition
             cond = ast.Expression.id(temp_name);
@@ -776,7 +811,7 @@ pub const Transformer = struct {
 
         const then_block = try self.builder.block(then_body.items);
         const then_stmt = self.builder.ifStmt(cond, then_block);
-        try stmts.append(self.allocator, then_stmt);
+        try stmts.append(self.allocator, self.stmtWithLocation(then_stmt, self.nodeLocation(index)));
 
         // Process else branch if present
         // Yul has no else, so we emit: if iszero(cond) { else_body }
@@ -799,7 +834,7 @@ pub const Transformer = struct {
                 // Use the cached temp variable for iszero
                 const negated_cond = try self.builder.builtinCall("iszero", &.{cond});
                 const else_stmt = self.builder.ifStmt(negated_cond, else_block);
-                try stmts.append(self.allocator, else_stmt);
+                try stmts.append(self.allocator, self.stmtWithLocation(else_stmt, self.nodeLocation(index)));
             }
         }
     }
@@ -830,7 +865,7 @@ pub const Transformer = struct {
         const body_block = try self.builder.block(body_stmts.items);
 
         const loop_stmt = self.builder.forLoop(pre_block, cond, post_block, body_block);
-        try stmts.append(self.allocator, loop_stmt);
+        try stmts.append(self.allocator, self.stmtWithLocation(loop_stmt, self.nodeLocation(index)));
     }
 
     fn processFor(self: *Self, index: ZigAst.Node.Index, stmts: *std.ArrayList(ast.Statement)) TransformProcessError!void {
@@ -913,7 +948,7 @@ pub const Transformer = struct {
         const body_block = try self.builder.block(body_stmts.items);
 
         const loop_stmt = self.builder.forLoop(pre_block, cond, post_block, body_block);
-        try stmts.append(self.allocator, loop_stmt);
+        try stmts.append(self.allocator, self.stmtWithLocation(loop_stmt, self.nodeLocation(index)));
     }
 
     fn processSwitch(self: *Self, index: ZigAst.Node.Index, stmts: *std.ArrayList(ast.Statement)) TransformProcessError!void {
@@ -936,7 +971,7 @@ pub const Transformer = struct {
         }
 
         if (needs_if_chain) {
-            try self.processSwitchAsIfChain(cond_expr, switch_info, stmts);
+            try self.processSwitchAsIfChain(cond_expr, switch_info, stmts, index);
             return;
         }
 
@@ -964,7 +999,7 @@ pub const Transformer = struct {
         }
 
         const switch_stmt = try self.builder.switchStmt(cond_expr, cases.items);
-        try stmts.append(self.allocator, switch_stmt);
+        try stmts.append(self.allocator, self.stmtWithLocation(switch_stmt, self.nodeLocation(index)));
     }
 
     fn processSwitchAsIfChain(
@@ -972,21 +1007,23 @@ pub const Transformer = struct {
         cond_expr: ast.Expression,
         switch_info: ZigAst.full.Switch,
         stmts: *std.ArrayList(ast.Statement),
+        switch_index: ZigAst.Node.Index,
     ) TransformProcessError!void {
         const p = &self.zig_parser.?;
+        const loc = self.nodeLocation(switch_index);
 
         const cond_name = try std.fmt.allocPrint(self.allocator, "$zig2yul$switch$cond${d}", .{self.temp_counter});
         self.temp_counter += 1;
         try self.temp_strings.append(self.allocator, cond_name);
         const cond_decl = try self.builder.varDecl(&.{cond_name}, cond_expr);
-        try stmts.append(self.allocator, cond_decl);
+        try stmts.append(self.allocator, self.stmtWithLocation(cond_decl, loc));
         const cond_id = ast.Expression.id(cond_name);
 
         const match_name = try std.fmt.allocPrint(self.allocator, "$zig2yul$switch$matched${d}", .{self.temp_counter});
         self.temp_counter += 1;
         try self.temp_strings.append(self.allocator, match_name);
         const match_decl = try self.builder.varDecl(&.{match_name}, ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0))));
-        try stmts.append(self.allocator, match_decl);
+        try stmts.append(self.allocator, self.stmtWithLocation(match_decl, loc));
         const match_id = ast.Expression.id(match_name);
 
         var default_block: ?ast.Block = null;
@@ -1022,13 +1059,13 @@ pub const Transformer = struct {
 
             const guarded_block = try self.builder.block(guarded_body.items);
             const if_stmt = self.builder.ifStmt(guard, guarded_block);
-            try stmts.append(self.allocator, if_stmt);
+            try stmts.append(self.allocator, self.stmtWithLocation(if_stmt, loc));
         }
 
         if (default_block) |block| {
             const not_matched = try self.builder.builtinCall("iszero", &.{match_id});
             const else_stmt = self.builder.ifStmt(not_matched, block);
-            try stmts.append(self.allocator, else_stmt);
+            try stmts.append(self.allocator, self.stmtWithLocation(else_stmt, loc));
         }
     }
 
@@ -1115,7 +1152,7 @@ pub const Transformer = struct {
             try self.addError("break with label/value is not supported", self.nodeLocation(index), .unsupported_feature);
             return;
         }
-        try stmts.append(self.allocator, ast.Statement.breakStmt());
+        try stmts.append(self.allocator, self.stmtWithLocation(ast.Statement.breakStmt(), self.nodeLocation(index)));
     }
 
     fn processContinue(self: *Self, index: ZigAst.Node.Index, stmts: *std.ArrayList(ast.Statement)) TransformProcessError!void {
@@ -1125,14 +1162,15 @@ pub const Transformer = struct {
             try self.addError("continue with label/value is not supported", self.nodeLocation(index), .unsupported_feature);
             return;
         }
-        try stmts.append(self.allocator, ast.Statement.continueStmt());
+        try stmts.append(self.allocator, self.stmtWithLocation(ast.Statement.continueStmt(), self.nodeLocation(index)));
     }
 
     fn translateExpression(self: *Self, index: ZigAst.Node.Index) TransformProcessError!ast.Expression {
         const p = &self.zig_parser.?;
         const tag = p.getNodeTag(index);
 
-        return switch (tag) {
+        const loc = self.nodeLocation(index);
+        const expr = switch (tag) {
             .number_literal => blk: {
                 const src = p.getNodeSource(index);
                 // Support decimal, hex (0x), binary (0b), and underscores
@@ -1195,6 +1233,7 @@ pub const Transformer = struct {
                 break :blk ast.Expression.lit(ast.Literal.number(0));
             },
         };
+        return self.exprWithLocation(expr, loc);
     }
 
     /// Parse Zig number literal (supports decimal, hex, binary, octal, underscores)
