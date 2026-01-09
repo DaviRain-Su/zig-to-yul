@@ -14,6 +14,7 @@ pub const EventParam = struct {
     name: []const u8,
     abi_type: []const u8,
     indexed: bool = false,
+    indexed_data: ?[]const u8 = null,
 };
 
 pub const Event = struct {
@@ -168,7 +169,7 @@ pub fn decodeEvent(
             if (topic_index >= topics.len) return error.MissingTopics;
             const topic_word = topics[topic_index];
             topic_index += 1;
-            break :blk try decodeIndexed(param.abi_type, topic_word);
+            break :blk try decodeIndexedParam(allocator, param, topic_word);
         } else blk: {
             const v = try decodeFromData(allocator, param.abi_type, data, head_offset);
             head_offset += try headSizeForParam(param.abi_type);
@@ -197,13 +198,19 @@ fn countIndexed(params: []const EventParam) usize {
     return count;
 }
 
-fn decodeIndexed(abi_type: []const u8, word: [32]u8) !Value {
-    var parsed = try parseAbiTypeAlloc(std.heap.page_allocator, abi_type);
-    defer parsed.deinit(std.heap.page_allocator);
-    if (parsed.array != .none or isDynamicParsed(parsed)) {
-        return .{ .indexed_hash = word };
+fn decodeIndexedParam(allocator: Allocator, param: EventParam, word: [32]u8) !Value {
+    var parsed = try parseAbiTypeAlloc(allocator, param.abi_type);
+    defer parsed.deinit(allocator);
+
+    if (!isDynamicParsed(parsed)) {
+        return decodeWordStatic(parsed, word);
     }
-    return decodeWordStatic(parsed, word);
+
+    if (param.indexed_data) |data| {
+        return decodeFromStart(allocator, parsed, data, 0);
+    }
+
+    return .{ .indexed_hash = word };
 }
 
 fn decodeFromData(allocator: Allocator, abi_type: []const u8, data: []const u8, head_offset: usize) !Value {
@@ -1005,4 +1012,34 @@ test "decode tuple array event" {
     try std.testing.expect(arr[0].tuple[1].bool);
     try std.testing.expect(arr[1].tuple[0].uint256 == 2);
     try std.testing.expect(!arr[1].tuple[1].bool);
+}
+
+test "decode indexed string with preimage" {
+    const allocator = std.testing.allocator;
+
+    var preimage: [64]u8 = undefined;
+    @memset(&preimage, 0);
+    writeU256Be(preimage[0..32], 2);
+    preimage[32] = 'h';
+    preimage[33] = 'i';
+
+    const event = Event{
+        .name = "Indexed",
+        .params = &.{
+            .{
+                .name = "message",
+                .abi_type = "string",
+                .indexed = true,
+                .indexed_data = preimage[0..],
+            },
+        },
+    };
+
+    var topics: [2][32]u8 = undefined;
+    @memset(&topics, 0);
+    const decoded = try decodeEvent(allocator, event, topics[0..], &.{});
+    defer decoded.deinit(allocator);
+
+    const value = decoded.fields[0].value;
+    try std.testing.expect(std.mem.eql(u8, value.string, "hi"));
 }

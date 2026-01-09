@@ -223,6 +223,9 @@ const DecodeEventOptions = struct {
     data: ?[]const u8 = null,
 
     pub fn deinit(self: *DecodeEventOptions, allocator: std.mem.Allocator) void {
+        for (self.params.items) |param| {
+            if (param.indexed_data) |bytes| allocator.free(bytes);
+        }
         self.params.deinit(allocator);
         self.topics.deinit(allocator);
         if (self.data) |d| allocator.free(d);
@@ -246,7 +249,7 @@ fn runDecodeEvent(allocator: std.mem.Allocator, args: []const []const u8) !void 
         } else if (std.mem.eql(u8, arg, "--param")) {
             i += 1;
             if (i >= args.len) return invalidDecodeEvent();
-            const param = parseEventParam(args[i]) catch return invalidDecodeEvent();
+            const param = parseEventParam(allocator, args[i]) catch return invalidDecodeEvent();
             try opts.params.append(allocator, param);
         } else if (std.mem.eql(u8, arg, "--topic")) {
             i += 1;
@@ -290,14 +293,31 @@ fn runDecodeEvent(allocator: std.mem.Allocator, args: []const []const u8) !void 
     stdout.writeAll(stream.getWritten()) catch {};
 }
 
-fn parseEventParam(text: []const u8) !event_decode.EventParam {
+fn parseEventParam(allocator: std.mem.Allocator, text: []const u8) !event_decode.EventParam {
     var parts = std.mem.splitScalar(u8, text, ':');
     const name = parts.next() orelse return error.InvalidArgument;
     const abi_type = parts.next() orelse return error.InvalidArgument;
     const flag = parts.next();
-    const indexed = if (flag) |f| std.mem.eql(u8, f, "indexed") else false;
+    var indexed = false;
+    var indexed_data: ?[]const u8 = null;
+    if (flag) |f| {
+        if (std.mem.startsWith(u8, f, "indexed")) {
+            indexed = true;
+            if (f.len > 7 and f[7] == '=') {
+                const hex = f[8..];
+                indexed_data = try parseHexAlloc(allocator, hex);
+            }
+        } else {
+            return error.InvalidArgument;
+        }
+    }
     if (parts.next() != null) return error.InvalidArgument;
-    return .{ .name = name, .abi_type = abi_type, .indexed = indexed };
+    return .{
+        .name = name,
+        .abi_type = abi_type,
+        .indexed = indexed,
+        .indexed_data = indexed_data,
+    };
 }
 
 fn parseHexAlloc(allocator: std.mem.Allocator, text: []const u8) ![]const u8 {
@@ -597,7 +617,7 @@ fn printDecodeEventUsageStderr() void {
         \\
         \\OPTIONS:
         \\    --event <name>         Event name
-        \\    --param <name:type[:indexed]>  Event parameter definition
+        \\    --param <name:type[:indexed[=hex]]>  Event parameter definition
         \\    --topic <hex>          32-byte topic hex
         \\    --data <hex>           Data hex (non-indexed ABI payload)
         \\    -h, --help             Print help
@@ -607,6 +627,8 @@ fn printDecodeEventUsageStderr() void {
         \\      --param from:address:indexed --param to:address:indexed \\
         \\      --param value:uint256 --topic 0x... --topic 0x... --topic 0x... \\
         \\      --data 0x...
+        \\    zig-to-yul decode-event --event Message \\
+        \\      --param msg:string:indexed=0x... --topic 0x...
         \\
     , .{});
 }
