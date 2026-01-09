@@ -234,8 +234,6 @@ fn decodeArrayFromData(
     data: []const u8,
     head_offset: usize,
 ) !Value {
-    if (!isStaticBase(parsed.base)) return error.UnsupportedType;
-
     var start: usize = undefined;
     var length: usize = undefined;
 
@@ -254,19 +252,41 @@ fn decodeArrayFromData(
         .none => return error.UnsupportedType,
     }
 
-    const total_bytes = length * 32;
-    if (start + total_bytes > data.len) return error.InvalidData;
+    if (isStaticBase(parsed.base)) {
+        const total_bytes = length * 32;
+        if (start + total_bytes > data.len) return error.InvalidData;
 
-    var values = try allocator.alloc(Value, length);
-    errdefer allocator.free(values);
+        var values = try allocator.alloc(Value, length);
+        errdefer allocator.free(values);
 
-    var i: usize = 0;
-    while (i < length) : (i += 1) {
-        const elem_word = readWord(data, start + i * 32);
-        values[i] = try decodeWordStatic(parsed, elem_word);
+        var i: usize = 0;
+        while (i < length) : (i += 1) {
+            const elem_word = readWord(data, start + i * 32);
+            values[i] = try decodeWordStatic(parsed, elem_word);
+        }
+
+        return .{ .array = values };
     }
 
-    return .{ .array = values };
+    if (isDynamicBase(parsed.base)) {
+        const offsets_bytes = length * 32;
+        if (start + offsets_bytes > data.len) return error.InvalidData;
+
+        var values = try allocator.alloc(Value, length);
+        errdefer allocator.free(values);
+
+        var i: usize = 0;
+        while (i < length) : (i += 1) {
+            const off_word = readWord(data, start + i * 32);
+            const rel = u256ToUsize(u256FromBe(off_word[0..])) orelse return error.InvalidData;
+            const elem_start = start + rel;
+            values[i] = try decodeDynamicAt(allocator, parsed.base, data, elem_start);
+        }
+
+        return .{ .array = values };
+    }
+
+    return error.UnsupportedType;
 }
 
 fn parseAbiType(abi_type: []const u8) !ParsedType {
@@ -357,7 +377,7 @@ fn isStaticBase(base: BaseKind) bool {
 
 fn headSizeForParam(abi_type: []const u8) !usize {
     const parsed = try parseAbiType(abi_type);
-    if (parsed.array == .fixed and isStaticBase(parsed.base)) {
+    if (parsed.array == .fixed and (isStaticBase(parsed.base) or isDynamicBase(parsed.base))) {
         return parsed.array_len * 32;
     }
     return 32;
@@ -446,6 +466,22 @@ fn freeValue(allocator: Allocator, value: Value) void {
     }
 }
 
+fn decodeDynamicAt(allocator: Allocator, base: BaseKind, data: []const u8, start: usize) !Value {
+    if (start + 32 > data.len) return error.InvalidData;
+    const len_word = readWord(data, start);
+    const len = u256ToUsize(u256FromBe(len_word[0..])) orelse return error.InvalidData;
+    const payload_start = start + 32;
+    const payload_end = payload_start + len;
+    if (payload_end > data.len) return error.InvalidData;
+
+    const payload = try allocator.dupe(u8, data[payload_start..payload_end]);
+    return switch (base) {
+        .string => .{ .string = payload },
+        .bytes_dynamic => .{ .bytes_dynamic = payload },
+        else => error.UnsupportedType,
+    };
+}
+
 fn writeHex(writer: anytype, bytes: []const u8) !void {
     for (bytes) |b| {
         try writer.print("{x:0>2}", .{b});
@@ -464,8 +500,7 @@ test "decode Transfer event" {
         },
     };
 
-    var topics: [3][32]u8 = undefined;
-    @memset(&topics, 0);
+    var topics: [3][32]u8 = .{.{0} ** 32} ** 3;
     const from_addr: Address = 0x1111111111111111111111111111111111111111;
     const to_addr: Address = 0x2222222222222222222222222222222222222222;
 
@@ -500,8 +535,7 @@ test "decode string event data" {
         },
     };
 
-    var topics: [2][32]u8 = undefined;
-    @memset(&topics, 0);
+    var topics: [2][32]u8 = .{.{0} ** 32} ** 2;
     const from_addr: Address = 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa;
     var from_word: [32]u8 = undefined;
     writeAddressWord(&from_word, from_addr);
@@ -586,4 +620,47 @@ test "decode fixed address array event" {
     try std.testing.expect(arr.len == 2);
     try std.testing.expect(arr[0].address == a0);
     try std.testing.expect(arr[1].address == a1);
+}
+
+test "decode dynamic string array event" {
+    const allocator = std.testing.allocator;
+
+    const event = Event{
+        .name = "Messages",
+        .params = &.{
+            .{ .name = "msgs", .abi_type = "string[]", .indexed = false },
+        },
+    };
+
+    var data: [256]u8 = undefined;
+    @memset(&data, 0);
+
+    // head: offset to array payload
+    writeU256Be(data[0..32], 32);
+    // array payload at offset 32:
+    // length = 2
+    writeU256Be(data[32..64], 2);
+    // offsets (relative to start=64)
+    writeU256Be(data[64..96], 64);
+    writeU256Be(data[96..128], 128);
+
+    // element 0 at start + 64 = 128
+    writeU256Be(data[128..160], 2);
+    data[160] = 'h';
+    data[161] = 'i';
+
+    // element 1 at start + 128 = 192
+    writeU256Be(data[192..224], 3);
+    data[224] = 'b';
+    data[225] = 'y';
+    data[226] = 'e';
+
+    const topics: [1][32]u8 = .{.{0} ** 32};
+    const decoded = try decodeEvent(allocator, event, topics[0..], data[0..]);
+    defer decoded.deinit(allocator);
+
+    const arr = decoded.fields[0].value.array;
+    try std.testing.expect(arr.len == 2);
+    try std.testing.expect(std.mem.eql(u8, arr[0].string, "hi"));
+    try std.testing.expect(std.mem.eql(u8, arr[1].string, "bye"));
 }
