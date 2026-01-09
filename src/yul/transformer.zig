@@ -40,33 +40,46 @@ pub const Transformer = struct {
         name: []const u8,
         params: []const []const u8,
         param_types: []const []const u8,
+        has_return: bool, // Track if function has non-void return
         is_public: bool,
         selector: u32, // First 4 bytes of keccak256(signature)
 
-        /// Calculate function selector using a simple hash (for demo purposes)
-        /// In production, this should use keccak256
-        pub fn calculateSelector(name: []const u8, param_types: []const []const u8) u32 {
+        /// Calculate function selector using keccak256
+        /// Selector = first 4 bytes of keccak256("funcName(type1,type2,...)")
+        pub fn calculateSelector(allocator: Allocator, name: []const u8, param_types: []const []const u8) !u32 {
             // Build signature string: "funcName(type1,type2,...)"
-            var hash: u32 = 0;
-
-            // Hash function name
-            for (name) |c| {
-                hash = hash *% 31 +% c;
+            var sig_len: usize = name.len + 2; // name + "()"
+            for (param_types, 0..) |pt, i| {
+                sig_len += pt.len;
+                if (i > 0) sig_len += 1; // comma
             }
-            hash = hash *% 31 +% '(';
 
-            // Hash parameter types
+            const sig = try allocator.alloc(u8, sig_len);
+            defer allocator.free(sig);
+
+            var pos: usize = 0;
+            @memcpy(sig[pos..][0..name.len], name);
+            pos += name.len;
+            sig[pos] = '(';
+            pos += 1;
+
             for (param_types, 0..) |pt, i| {
                 if (i > 0) {
-                    hash = hash *% 31 +% ',';
+                    sig[pos] = ',';
+                    pos += 1;
                 }
-                for (pt) |c| {
-                    hash = hash *% 31 +% c;
-                }
+                @memcpy(sig[pos..][0..pt.len], pt);
+                pos += pt.len;
             }
-            hash = hash *% 31 +% ')';
+            sig[pos] = ')';
 
-            return hash;
+            // Compute keccak256 hash
+            const Keccak256 = std.crypto.hash.sha3.Keccak256;
+            var hash: [32]u8 = undefined;
+            Keccak256.hash(sig, &hash, .{});
+
+            // Return first 4 bytes as u32 (big-endian)
+            return std.mem.readInt(u32, hash[0..4], .big);
         }
     };
 
@@ -280,13 +293,22 @@ pub const Transformer = struct {
                 }
             }
 
+            // Check if function has a return value (not void)
+            const has_return = blk: {
+                if (proto.return_type.unwrap()) |ret_type| {
+                    const ret_src = p.getNodeSource(ret_type);
+                    break :blk !std.mem.eql(u8, ret_src, "void");
+                }
+                break :blk false;
+            };
+
             // Generate function AST
-            const fn_stmt = try self.generateFunction(name, params.items, is_public, proto.body_node);
+            const fn_stmt = try self.generateFunction(name, params.items, is_public, has_return, proto.body_node);
             try self.functions.append(self.allocator, fn_stmt);
 
             // Track public functions for dispatcher
             if (is_public) {
-                const selector = FunctionInfo.calculateSelector(name, param_types.items);
+                const selector = try FunctionInfo.calculateSelector(self.allocator, name, param_types.items);
                 const owned_params = try self.allocator.dupe([]const u8, params.items);
                 const owned_param_types = try self.allocator.dupe([]const u8, param_types.items);
 
@@ -294,6 +316,7 @@ pub const Transformer = struct {
                     .name = name,
                     .params = owned_params,
                     .param_types = owned_param_types,
+                    .has_return = has_return,
                     .is_public = true,
                     .selector = selector,
                 });
@@ -323,6 +346,7 @@ pub const Transformer = struct {
         name: []const u8,
         params: []const []const u8,
         is_public: bool,
+        has_return: bool,
         body_index: ZigAst.Node.Index,
     ) !ast.Statement {
         _ = is_public;
@@ -335,7 +359,9 @@ pub const Transformer = struct {
 
         const body = try self.builder.block(body_stmts.items);
 
-        return try self.builder.funcDef(name, params, &.{"result"}, body);
+        // Only add return variable if function has a return value
+        const returns: []const []const u8 = if (has_return) &.{"result"} else &.{};
+        return try self.builder.funcDef(name, params, returns, body);
     }
 
     const TransformProcessError = std.mem.Allocator.Error;
@@ -476,17 +502,38 @@ pub const Transformer = struct {
 
         const cond = try self.translateExpression(if_info.ast.cond_expr);
 
-        var body: std.ArrayList(ast.Statement) = .empty;
-        defer body.deinit(self.allocator);
+        // Process then branch
+        var then_body: std.ArrayList(ast.Statement) = .empty;
+        defer then_body.deinit(self.allocator);
+        try self.processBlock(if_info.ast.then_expr, &then_body);
 
-        try self.processBlock(if_info.ast.then_expr, &body);
+        const then_block = try self.builder.block(then_body.items);
+        const then_stmt = self.builder.ifStmt(cond, then_block);
+        try stmts.append(self.allocator, then_stmt);
 
-        const body_block = try self.builder.block(body.items);
-        const stmt = self.builder.ifStmt(cond, body_block);
-        try stmts.append(self.allocator, stmt);
+        // Process else branch if present
+        // Yul has no else, so we emit: if iszero(cond) { else_body }
+        if (if_info.ast.else_expr.unwrap()) |else_expr| {
+            var else_body: std.ArrayList(ast.Statement) = .empty;
+            defer else_body.deinit(self.allocator);
 
-        // Note: Yul doesn't have else, so we ignore if_info.ast.else_expr
-        // If needed, we could emit: if iszero(cond) { else_body }
+            // Check if it's an else-if chain
+            const else_tag = p.getNodeTag(else_expr);
+            if (else_tag == .@"if" or else_tag == .if_simple) {
+                // Else-if: recurse
+                try self.processIf(else_expr, &else_body);
+            } else {
+                // Regular else block
+                try self.processBlock(else_expr, &else_body);
+            }
+
+            if (else_body.items.len > 0) {
+                const else_block = try self.builder.block(else_body.items);
+                const negated_cond = try self.builder.call("iszero", &.{cond});
+                const else_stmt = self.builder.ifStmt(negated_cond, else_block);
+                try stmts.append(self.allocator, else_stmt);
+            }
+        }
     }
 
     fn translateExpression(self: *Self, index: ZigAst.Node.Index) TransformProcessError!ast.Expression {
@@ -496,7 +543,11 @@ pub const Transformer = struct {
         return switch (tag) {
             .number_literal => blk: {
                 const src = p.getNodeSource(index);
-                const num = std.fmt.parseInt(evm_types.U256, src, 10) catch 0;
+                // Support decimal, hex (0x), binary (0b), and underscores
+                const num = parseNumber(src) catch |err| {
+                    self.reportExprError("Invalid number literal", index, err) catch {};
+                    break :blk ast.Expression.lit(ast.Literal.number(0));
+                };
                 break :blk ast.Expression.lit(ast.Literal.number(num));
             },
             .identifier => blk: {
@@ -517,8 +568,60 @@ pub const Transformer = struct {
             .greater_than => try self.translateBinaryOp(index, "gt"),
             .call, .call_one => try self.translateCall(index),
             .field_access => try self.translateFieldAccess(index),
-            else => ast.Expression.lit(ast.Literal.number(0)),
+            else => blk: {
+                self.reportUnsupportedExpr(index) catch {};
+                break :blk ast.Expression.lit(ast.Literal.number(0));
+            },
         };
+    }
+
+    /// Parse Zig number literal (supports decimal, hex, binary, octal, underscores)
+    fn parseNumber(src: []const u8) !evm_types.U256 {
+        // Remove underscores
+        var clean: [256]u8 = undefined;
+        var clean_len: usize = 0;
+        for (src) |c| {
+            if (c != '_') {
+                if (clean_len >= clean.len) return error.NumberTooLong;
+                clean[clean_len] = c;
+                clean_len += 1;
+            }
+        }
+        const num_str = clean[0..clean_len];
+
+        if (num_str.len == 0) return error.EmptyNumber;
+
+        // Detect base
+        if (num_str.len > 2 and num_str[0] == '0') {
+            if (num_str[1] == 'x' or num_str[1] == 'X') {
+                return std.fmt.parseInt(evm_types.U256, num_str[2..], 16);
+            } else if (num_str[1] == 'b' or num_str[1] == 'B') {
+                return std.fmt.parseInt(evm_types.U256, num_str[2..], 2);
+            } else if (num_str[1] == 'o' or num_str[1] == 'O') {
+                return std.fmt.parseInt(evm_types.U256, num_str[2..], 8);
+            }
+        }
+
+        return std.fmt.parseInt(evm_types.U256, num_str, 10);
+    }
+
+    fn reportExprError(self: *Self, msg: []const u8, index: ZigAst.Node.Index, err: anyerror) !void {
+        const p = &self.zig_parser.?;
+        const token = p.getMainToken(index);
+        const loc = p.ast.tokens.get(token);
+        try self.addError(msg, .{ .start = loc.start, .end = loc.start + 1 }, .type_error);
+        _ = err;
+    }
+
+    fn reportUnsupportedExpr(self: *Self, index: ZigAst.Node.Index) !void {
+        const p = &self.zig_parser.?;
+        const tag = p.getNodeTag(index);
+        const token = p.getMainToken(index);
+        const loc = p.ast.tokens.get(token);
+        // Create error message with tag name
+        const msg = std.fmt.allocPrint(self.allocator, "Unsupported expression: {s}", .{@tagName(tag)}) catch "Unsupported expression";
+        try self.temp_strings.append(self.allocator, msg);
+        try self.addError(msg, .{ .start = loc.start, .end = loc.start + 1 }, .unsupported_feature);
     }
 
     fn translateBinaryOp(self: *Self, index: ZigAst.Node.Index, op: []const u8) TransformProcessError!ast.Expression {
@@ -696,23 +799,39 @@ pub const Transformer = struct {
             try call_args.append(self.allocator, ast.Expression.id(param_name));
         }
 
-        // Call the function: let result := funcName(arg1, arg2, ...)
         const func_call = try self.builder.call(fi.name, call_args.items);
-        const result_decl = try self.builder.varDecl(&.{"_result"}, func_call);
-        try case_stmts.append(self.allocator, result_decl);
 
-        // Store result and return: mstore(0, result) then return(0, 32)
-        const mstore_call = try self.builder.call("mstore", &.{
-            ast.Expression.lit(ast.Literal.number(0)),
-            ast.Expression.id("_result"),
-        });
-        try case_stmts.append(self.allocator, ast.Statement.expr(mstore_call));
+        if (fi.has_return) {
+            // For functions with return value:
+            // let _result := funcName(args...)
+            // mstore(0, _result)
+            // return(0, 32)
+            const result_decl = try self.builder.varDecl(&.{"_result"}, func_call);
+            try case_stmts.append(self.allocator, result_decl);
 
-        const return_call = try self.builder.call("return", &.{
-            ast.Expression.lit(ast.Literal.number(0)),
-            ast.Expression.lit(ast.Literal.number(32)),
-        });
-        try case_stmts.append(self.allocator, ast.Statement.expr(return_call));
+            const mstore_call = try self.builder.call("mstore", &.{
+                ast.Expression.lit(ast.Literal.number(0)),
+                ast.Expression.id("_result"),
+            });
+            try case_stmts.append(self.allocator, ast.Statement.expr(mstore_call));
+
+            const return_call = try self.builder.call("return", &.{
+                ast.Expression.lit(ast.Literal.number(0)),
+                ast.Expression.lit(ast.Literal.number(32)),
+            });
+            try case_stmts.append(self.allocator, ast.Statement.expr(return_call));
+        } else {
+            // For void functions:
+            // funcName(args...)
+            // return(0, 0)
+            try case_stmts.append(self.allocator, ast.Statement.expr(func_call));
+
+            const return_call = try self.builder.call("return", &.{
+                ast.Expression.lit(ast.Literal.number(0)),
+                ast.Expression.lit(ast.Literal.number(0)),
+            });
+            try case_stmts.append(self.allocator, ast.Statement.expr(return_call));
+        }
 
         return try self.builder.block(case_stmts.items);
     }

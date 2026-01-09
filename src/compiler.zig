@@ -33,15 +33,61 @@ pub const Compiler = struct {
     current_contract: ?[]const u8,
     functions: std.ArrayList(yul_ir.Statement),
     storage_vars: std.ArrayList(StorageVar),
+    function_infos: std.ArrayList(FunctionInfo),
 
-    // Track allocated strings for cleanup
+    // Track allocated memory for cleanup
     temp_strings: std.ArrayList([]const u8),
+    alloc_stmts: std.ArrayList([]yul_ir.Statement),
+    alloc_cases: std.ArrayList([]yul_ir.Statement.SwitchStatement.Case),
 
     const Self = @This();
 
     pub const StorageVar = struct {
         name: []const u8,
         slot: evm_types.U256,
+    };
+
+    pub const FunctionInfo = struct {
+        name: []const u8,
+        params: []const []const u8,
+        param_types: []const []const u8,
+        has_return: bool,
+        is_public: bool,
+        selector: u32,
+
+        /// Calculate function selector using keccak256
+        pub fn calculateSelector(allocator: Allocator, name: []const u8, param_types: []const []const u8) !u32 {
+            var sig_len: usize = name.len + 2;
+            for (param_types, 0..) |pt, i| {
+                sig_len += pt.len;
+                if (i > 0) sig_len += 1;
+            }
+
+            const sig = try allocator.alloc(u8, sig_len);
+            defer allocator.free(sig);
+
+            var pos: usize = 0;
+            @memcpy(sig[pos..][0..name.len], name);
+            pos += name.len;
+            sig[pos] = '(';
+            pos += 1;
+
+            for (param_types, 0..) |pt, i| {
+                if (i > 0) {
+                    sig[pos] = ',';
+                    pos += 1;
+                }
+                @memcpy(sig[pos..][0..pt.len], pt);
+                pos += pt.len;
+            }
+            sig[pos] = ')';
+
+            const Keccak256 = std.crypto.hash.sha3.Keccak256;
+            var hash: [32]u8 = undefined;
+            Keccak256.hash(sig, &hash, .{});
+
+            return std.mem.readInt(u32, hash[0..4], .big);
+        }
     };
 
     pub const CompileError = struct {
@@ -69,7 +115,10 @@ pub const Compiler = struct {
             .current_contract = null,
             .functions = .empty,
             .storage_vars = .empty,
+            .function_infos = .empty,
             .temp_strings = .empty,
+            .alloc_stmts = .empty,
+            .alloc_cases = .empty,
         };
     }
 
@@ -84,11 +133,29 @@ pub const Compiler = struct {
         self.functions.deinit(self.allocator);
         self.storage_vars.deinit(self.allocator);
 
+        // Free function info param arrays
+        for (self.function_infos.items) |fi| {
+            self.allocator.free(fi.params);
+            self.allocator.free(fi.param_types);
+        }
+        self.function_infos.deinit(self.allocator);
+
         // Free all temporary strings
         for (self.temp_strings.items) |s| {
             self.allocator.free(s);
         }
         self.temp_strings.deinit(self.allocator);
+
+        // Free dispatcher allocations
+        for (self.alloc_stmts.items) |stmts| {
+            self.allocator.free(stmts);
+        }
+        self.alloc_stmts.deinit(self.allocator);
+
+        for (self.alloc_cases.items) |cases| {
+            self.allocator.free(cases);
+        }
+        self.alloc_cases.deinit(self.allocator);
     }
 
     /// Compile Zig source to Yul
@@ -262,21 +329,66 @@ pub const Compiler = struct {
             var params: std.ArrayList([]const u8) = .empty;
             defer params.deinit(self.allocator);
 
+            var param_types: std.ArrayList([]const u8) = .empty;
+            defer param_types.deinit(self.allocator);
+
             const param_infos = try p.getFnParams(self.allocator, proto.fn_proto);
             defer self.allocator.free(param_infos);
 
             for (param_infos) |param_info| {
                 if (param_info.name.len > 0 and !std.mem.eql(u8, param_info.name, "self")) {
                     try params.append(self.allocator, param_info.name);
+                    const zig_type = if (param_info.type_expr) |te| p.getNodeSource(te) else "u256";
+                    const abi_type = mapZigTypeToAbi(zig_type);
+                    try param_types.append(self.allocator, abi_type);
                 }
             }
 
+            // Check if function has a return value (not void)
+            const has_return = blk: {
+                if (proto.return_type.unwrap()) |ret_type| {
+                    const ret_src = p.getNodeSource(ret_type);
+                    break :blk !std.mem.eql(u8, ret_src, "void");
+                }
+                break :blk false;
+            };
+
             // Generate function IR
-            const fn_stmt = try self.generateFunction(name, params.items, is_public, proto.body_node);
+            const fn_stmt = try self.generateFunction(name, params.items, is_public, has_return, proto.body_node);
             try self.functions.append(self.allocator, fn_stmt);
+
+            // Track public functions for dispatcher
+            if (is_public) {
+                const selector = try FunctionInfo.calculateSelector(self.allocator, name, param_types.items);
+                const owned_params = try self.allocator.dupe([]const u8, params.items);
+                const owned_param_types = try self.allocator.dupe([]const u8, param_types.items);
+
+                try self.function_infos.append(self.allocator, .{
+                    .name = name,
+                    .params = owned_params,
+                    .param_types = owned_param_types,
+                    .has_return = has_return,
+                    .is_public = true,
+                    .selector = selector,
+                });
+            }
 
             self.symbol_table.exitScope();
         }
+    }
+
+    /// Map Zig types to Solidity ABI types
+    fn mapZigTypeToAbi(zig_type: []const u8) []const u8 {
+        if (std.mem.eql(u8, zig_type, "u256")) return "uint256";
+        if (std.mem.eql(u8, zig_type, "u128")) return "uint128";
+        if (std.mem.eql(u8, zig_type, "u64")) return "uint64";
+        if (std.mem.eql(u8, zig_type, "u32")) return "uint32";
+        if (std.mem.eql(u8, zig_type, "u8")) return "uint8";
+        if (std.mem.eql(u8, zig_type, "bool")) return "bool";
+        if (std.mem.eql(u8, zig_type, "Address") or std.mem.eql(u8, zig_type, "evm.Address")) return "address";
+        if (std.mem.eql(u8, zig_type, "[20]u8")) return "address";
+        if (std.mem.eql(u8, zig_type, "[32]u8")) return "bytes32";
+        return "uint256";
     }
 
     fn generateFunction(
@@ -284,6 +396,7 @@ pub const Compiler = struct {
         name: []const u8,
         params: []const []const u8,
         is_public: bool,
+        has_return: bool,
         body_index: Ast.Node.Index,
     ) !yul_ir.Statement {
         _ = is_public;
@@ -295,8 +408,8 @@ pub const Compiler = struct {
         // Process function body
         try self.processBlock(body_index, &body_stmts);
 
-        // Determine return value
-        const returns: []const []const u8 = &.{"result"};
+        // Only add return variable if function has a return value
+        const returns: []const []const u8 = if (has_return) &.{"result"} else &.{};
 
         return try self.ir_builder.function(
             name,
@@ -446,15 +559,33 @@ pub const Compiler = struct {
 
         const cond = try self.translateExpression(if_info.ast.cond_expr);
 
-        var body: std.ArrayList(yul_ir.Statement) = .empty;
-        defer body.deinit(self.allocator);
+        // Process then branch
+        var then_body: std.ArrayList(yul_ir.Statement) = .empty;
+        defer then_body.deinit(self.allocator);
+        try self.processBlock(if_info.ast.then_expr, &then_body);
 
-        try self.processBlock(if_info.ast.then_expr, &body);
+        const then_stmt = try self.ir_builder.if_stmt(cond, then_body.items);
+        try stmts.append(self.allocator, then_stmt);
 
-        const stmt = try self.ir_builder.if_stmt(cond, body.items);
-        try stmts.append(self.allocator, stmt);
+        // Process else branch if present
+        // Yul has no else, so we emit: if iszero(cond) { else_body }
+        if (if_info.ast.else_expr.unwrap()) |else_expr| {
+            var else_body: std.ArrayList(yul_ir.Statement) = .empty;
+            defer else_body.deinit(self.allocator);
 
-        // Note: Yul doesn't have else, so we ignore if_info.ast.else_expr
+            const else_tag = p.getNodeTag(else_expr);
+            if (else_tag == .@"if" or else_tag == .if_simple) {
+                try self.processIf(else_expr, &else_body);
+            } else {
+                try self.processBlock(else_expr, &else_body);
+            }
+
+            if (else_body.items.len > 0) {
+                const negated_cond = try self.ir_builder.call("iszero", &.{cond});
+                const else_stmt = try self.ir_builder.if_stmt(negated_cond, else_body.items);
+                try stmts.append(self.allocator, else_stmt);
+            }
+        }
     }
 
     fn translateExpression(self: *Self, index: Ast.Node.Index) ProcessError!yul_ir.Expression {
@@ -464,7 +595,11 @@ pub const Compiler = struct {
         return switch (tag) {
             .number_literal => blk: {
                 const src = p.getNodeSource(index);
-                const num = std.fmt.parseInt(evm_types.U256, src, 10) catch 0;
+                // Support decimal, hex (0x), binary (0b), and underscores
+                const num = parseNumber(src) catch |err| {
+                    self.reportExprErrorLegacy("Invalid number literal", index, err) catch {};
+                    break :blk self.ir_builder.literal_num(0);
+                };
                 break :blk self.ir_builder.literal_num(num);
             },
             .identifier => blk: {
@@ -486,8 +621,55 @@ pub const Compiler = struct {
             .greater_than => try self.translateBinaryOp(index, "gt"),
             .call, .call_one => try self.translateCall(index),
             .field_access => try self.translateFieldAccess(index),
-            else => self.ir_builder.literal_num(0), // Fallback
+            else => blk: {
+                self.reportUnsupportedExprLegacy(index) catch {};
+                break :blk self.ir_builder.literal_num(0);
+            },
         };
+    }
+
+    /// Parse Zig number literal (supports decimal, hex, binary, octal, underscores)
+    fn parseNumber(src: []const u8) !evm_types.U256 {
+        var clean: [256]u8 = undefined;
+        var clean_len: usize = 0;
+        for (src) |c| {
+            if (c != '_') {
+                if (clean_len >= clean.len) return error.NumberTooLong;
+                clean[clean_len] = c;
+                clean_len += 1;
+            }
+        }
+        const num_str = clean[0..clean_len];
+        if (num_str.len == 0) return error.EmptyNumber;
+
+        if (num_str.len > 2 and num_str[0] == '0') {
+            if (num_str[1] == 'x' or num_str[1] == 'X') {
+                return std.fmt.parseInt(evm_types.U256, num_str[2..], 16);
+            } else if (num_str[1] == 'b' or num_str[1] == 'B') {
+                return std.fmt.parseInt(evm_types.U256, num_str[2..], 2);
+            } else if (num_str[1] == 'o' or num_str[1] == 'O') {
+                return std.fmt.parseInt(evm_types.U256, num_str[2..], 8);
+            }
+        }
+        return std.fmt.parseInt(evm_types.U256, num_str, 10);
+    }
+
+    fn reportExprErrorLegacy(self: *Self, msg: []const u8, index: Ast.Node.Index, err: anyerror) !void {
+        const p = &self.zig_parser.?;
+        const token = p.getMainToken(index);
+        const loc = p.getLocation(p.ast.tokens.get(token).start);
+        try self.addError(msg, loc.line, loc.column, .type_error);
+        _ = err;
+    }
+
+    fn reportUnsupportedExprLegacy(self: *Self, index: Ast.Node.Index) !void {
+        const p = &self.zig_parser.?;
+        const tag = p.getNodeTag(index);
+        const token = p.getMainToken(index);
+        const loc = p.getLocation(p.ast.tokens.get(token).start);
+        const msg = std.fmt.allocPrint(self.allocator, "Unsupported expression: {s}", .{@tagName(tag)}) catch "Unsupported expression";
+        try self.temp_strings.append(self.allocator, msg);
+        try self.addError(msg, loc.line, loc.column, .unsupported_feature);
     }
 
     fn translateBinaryOp(self: *Self, index: Ast.Node.Index, op: []const u8) ProcessError!yul_ir.Expression {
@@ -615,15 +797,73 @@ pub const Compiler = struct {
             try self.ir_builder.call("calldataload", &.{self.ir_builder.literal_num(0)}),
         });
 
-        // Build switch cases (simplified - just add default revert for now)
+        // Build switch cases for each public function
+        var cases: std.ArrayList(yul_ir.Statement.SwitchStatement.Case) = .empty;
+        defer cases.deinit(self.allocator);
+
+        for (self.function_infos.items) |fi| {
+            var case_stmts: std.ArrayList(yul_ir.Statement) = .empty;
+            defer case_stmts.deinit(self.allocator);
+
+            // Decode parameters from calldata
+            var call_args: std.ArrayList(yul_ir.Expression) = .empty;
+            defer call_args.deinit(self.allocator);
+
+            for (fi.params, 0..) |param_name, i| {
+                const offset: evm_types.U256 = 4 + @as(evm_types.U256, @intCast(i)) * 32;
+                const load_call = try self.ir_builder.call("calldataload", &.{
+                    self.ir_builder.literal_num(offset),
+                });
+                const var_decl = try self.ir_builder.variable(&.{param_name}, load_call);
+                try case_stmts.append(self.allocator, var_decl);
+                try call_args.append(self.allocator, self.ir_builder.identifier(param_name));
+            }
+
+            const func_call = try self.ir_builder.call(fi.name, call_args.items);
+
+            if (fi.has_return) {
+                const result_decl = try self.ir_builder.variable(&.{"_result"}, func_call);
+                try case_stmts.append(self.allocator, result_decl);
+
+                const mstore_call = try self.ir_builder.call("mstore", &.{
+                    self.ir_builder.literal_num(0),
+                    self.ir_builder.identifier("_result"),
+                });
+                try case_stmts.append(self.allocator, .{ .expression = mstore_call });
+
+                const return_call = try self.ir_builder.call("return", &.{
+                    self.ir_builder.literal_num(0),
+                    self.ir_builder.literal_num(32),
+                });
+                try case_stmts.append(self.allocator, .{ .expression = return_call });
+            } else {
+                try case_stmts.append(self.allocator, .{ .expression = func_call });
+                const return_call = try self.ir_builder.call("return", &.{
+                    self.ir_builder.literal_num(0),
+                    self.ir_builder.literal_num(0),
+                });
+                try case_stmts.append(self.allocator, .{ .expression = return_call });
+            }
+
+            const case_body = try self.allocator.dupe(yul_ir.Statement, case_stmts.items);
+            try self.alloc_stmts.append(self.allocator, case_body); // Track for cleanup
+            try cases.append(self.allocator, .{
+                .value = .{ .number = fi.selector },
+                .body = case_body,
+            });
+        }
+
+        // Default revert case
         const revert_call = try self.ir_builder.call("revert", &.{
             self.ir_builder.literal_num(0),
             self.ir_builder.literal_num(0),
         });
 
+        const owned_cases = try self.allocator.dupe(yul_ir.Statement.SwitchStatement.Case, cases.items);
+        try self.alloc_cases.append(self.allocator, owned_cases); // Track for cleanup
         const switch_stmt = try self.ir_builder.switch_stmt(
             selector,
-            &.{}, // No cases yet - would need function selectors
+            owned_cases,
             &.{.{ .expression = revert_call }},
         );
 
