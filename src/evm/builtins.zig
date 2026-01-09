@@ -144,6 +144,7 @@ pub const builtins = [_]Builtin{
     .{ .name = "linkersymbol", .yul_name = "linkersymbol", .inputs = 1, .outputs = 1, .category = .other, .description = "linker symbol" },
     .{ .name = "memoryguard", .yul_name = "memoryguard", .inputs = 1, .outputs = 1, .category = .other, .description = "memory guard" },
     .{ .name = "verbatim", .yul_name = "verbatim", .inputs = 0, .outputs = 0, .category = .other, .description = "inline bytecode" },
+    .{ .name = "pop", .yul_name = "pop", .inputs = 1, .outputs = 0, .category = .other, .description = "discard stack top" },
 };
 
 /// Lookup a builtin by name
