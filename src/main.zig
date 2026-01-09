@@ -87,10 +87,11 @@ fn runBuild(allocator: std.mem.Allocator, args: []const []const u8) !void {
     const bytecode = try compileSolc(allocator, yul_code, opts.optimize);
     defer allocator.free(bytecode);
 
-    // Output bytecode
+    // Output bytecode with 0x prefix
     if (opts.output_file) |out_path| {
         const file = try std.fs.cwd().createFile(out_path, .{});
         defer file.close();
+        try file.writeAll("0x");
         try file.writeAll(bytecode);
         std.debug.print("Built successfully: {s}\n", .{out_path});
     } else {
