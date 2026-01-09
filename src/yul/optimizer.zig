@@ -4,6 +4,8 @@
 const std = @import("std");
 const ast = @import("ast.zig");
 
+const Error = std.mem.Allocator.Error;
+
 pub const Optimizer = struct {
     allocator: std.mem.Allocator,
     builder: ast.AstBuilder,
@@ -19,12 +21,12 @@ pub const Optimizer = struct {
         self.builder.deinit();
     }
 
-    pub fn optimize(self: *Optimizer, root: ast.AST) !ast.AST {
+    pub fn optimize(self: *Optimizer, root: ast.AST) Error!ast.AST {
         const obj = try self.optimizeObject(root.root);
         return ast.AST.init(obj);
     }
 
-    fn optimizeObject(self: *Optimizer, obj: ast.Object) !ast.Object {
+    fn optimizeObject(self: *Optimizer, obj: ast.Object) Error!ast.Object {
         const code_block = try self.optimizeBlock(obj.code);
 
         var subs = std.ArrayList(ast.Object).empty;
@@ -47,7 +49,7 @@ pub const Optimizer = struct {
         );
     }
 
-    fn optimizeBlock(self: *Optimizer, block: ast.Block) !ast.Block {
+    fn optimizeBlock(self: *Optimizer, block: ast.Block) Error!ast.Block {
         var stmts = std.ArrayList(ast.Statement).empty;
         defer stmts.deinit(self.allocator);
 
@@ -60,7 +62,7 @@ pub const Optimizer = struct {
         return ast.Block.init(try self.builder.dupeStatements(stmts.items));
     }
 
-    fn optimizeStatement(self: *Optimizer, stmt: ast.Statement) !?ast.Statement {
+    fn optimizeStatement(self: *Optimizer, stmt: ast.Statement) Error!?ast.Statement {
         return switch (stmt) {
             .expression_statement => |s| blk: {
                 const expr = try self.optimizeExpression(s.expression);
@@ -131,7 +133,7 @@ pub const Optimizer = struct {
         };
     }
 
-    fn optimizeExpression(self: *Optimizer, expr: ast.Expression) !ast.Expression {
+    fn optimizeExpression(self: *Optimizer, expr: ast.Expression) Error!ast.Expression {
         switch (expr) {
             .literal, .identifier => return expr,
             .function_call => |call| {
@@ -152,7 +154,7 @@ pub const Optimizer = struct {
                 }
 
                 const loc = expr.getLocation();
-                if (try simplifyBuiltin(call.builtin_name.name, args.items)) |replacement| {
+                if (simplifyBuiltin(call.builtin_name.name, args.items)) |replacement| {
                     return withLocation(replacement, loc);
                 }
 
@@ -163,7 +165,7 @@ pub const Optimizer = struct {
         }
     }
 
-    fn simplifyBuiltin(name: []const u8, args: []const ast.Expression) !?ast.Expression {
+    fn simplifyBuiltin(name: []const u8, args: []const ast.Expression) ?ast.Expression {
         if (std.mem.eql(u8, name, "iszero") and args.len == 1) {
             if (literalBoolValue(args[0])) |val| {
                 return makeLiteral(val);

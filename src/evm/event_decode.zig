@@ -8,6 +8,9 @@ const Allocator = std.mem.Allocator;
 const U256 = types.U256;
 const Address = types.Address;
 
+const ParseError = std.mem.Allocator.Error || error{UnsupportedType};
+const DecodeErrorSet = std.mem.Allocator.Error || DecodeError;
+
 pub const I256 = @Type(.{ .int = .{ .signedness = .signed, .bits = 256 } });
 
 pub const EventParam = struct {
@@ -174,7 +177,7 @@ pub fn decodeEvent(
     event: Event,
     topics: []const [32]u8,
     data: []const u8,
-) !DecodedEvent {
+) DecodeErrorSet!DecodedEvent {
     var decoded_fields: std.ArrayList(DecodedField) = .empty;
     defer decoded_fields.deinit(allocator);
 
@@ -229,7 +232,7 @@ fn countIndexed(params: []const EventParam) usize {
     return count;
 }
 
-fn decodeIndexedParam(allocator: Allocator, param: EventParam, word: [32]u8) !Value {
+fn decodeIndexedParam(allocator: Allocator, param: EventParam, word: [32]u8) DecodeErrorSet!Value {
     var parsed = try parseAbiTypeAlloc(allocator, param.abi_type);
     defer parsed.deinit(allocator);
 
@@ -244,13 +247,13 @@ fn decodeIndexedParam(allocator: Allocator, param: EventParam, word: [32]u8) !Va
     return .{ .indexed_hash = word };
 }
 
-fn decodeFromData(allocator: Allocator, abi_type: []const u8, data: []const u8, head_offset: usize) !Value {
+fn decodeFromData(allocator: Allocator, abi_type: []const u8, data: []const u8, head_offset: usize) DecodeErrorSet!Value {
     var parsed = try parseAbiTypeAlloc(allocator, abi_type);
     defer parsed.deinit(allocator);
     return decodeFromHead(allocator, parsed, data, 0, head_offset);
 }
 
-fn decodeWordStatic(parsed: ParsedType, word: [32]u8) !Value {
+fn decodeWordStatic(parsed: ParsedType, word: [32]u8) DecodeErrorSet!Value {
     return switch (parsed.base) {
         .uint => .{ .uint256 = u256FromBe(word[0..]) },
         .int => .{
@@ -269,7 +272,7 @@ fn decodeArrayFromHead(
     data: []const u8,
     base_start: usize,
     head_offset: usize,
-) !Value {
+) DecodeErrorSet!Value {
     if (parsed.base == .tuple) return error.UnsupportedType;
 
     switch (parsed.array) {
@@ -290,7 +293,7 @@ fn decodeArrayFromStart(
     parsed: ParsedType,
     data: []const u8,
     start: usize,
-) !Value {
+) DecodeErrorSet!Value {
     var length: usize = undefined;
     var head_start: usize = undefined;
 
@@ -375,7 +378,7 @@ fn decodeArrayFromStart(
     return error.UnsupportedType;
 }
 
-fn parseAbiTypeAlloc(allocator: Allocator, abi_type: []const u8) !ParsedType {
+fn parseAbiTypeAlloc(allocator: Allocator, abi_type: []const u8) ParseError!ParsedType {
     if (std.mem.startsWith(u8, abi_type, "tuple(") or std.mem.startsWith(u8, abi_type, "struct(")) {
         const prefix_len: usize = if (std.mem.startsWith(u8, abi_type, "tuple(")) 6 else 7;
         var depth: usize = 1;
@@ -437,7 +440,7 @@ fn parseAbiTypeAlloc(allocator: Allocator, abi_type: []const u8) !ParsedType {
     };
 }
 
-fn parseBaseType(base: []const u8) !ParsedType {
+fn parseBaseType(base: []const u8) ParseError!ParsedType {
     if (std.mem.eql(u8, base, "uint")) {
         return .{ .base = .uint, .bits = 256 };
     }
@@ -472,7 +475,7 @@ fn parseBaseType(base: []const u8) !ParsedType {
     return error.UnsupportedType;
 }
 
-fn parseDecimal(comptime T: type, text: []const u8) !T {
+fn parseDecimal(comptime T: type, text: []const u8) ParseError!T {
     if (text.len == 0) return error.UnsupportedType;
     var value: T = 0;
     for (text) |c| {
@@ -493,7 +496,7 @@ fn isStaticBase(base: BaseKind) bool {
     };
 }
 
-fn headSizeForParam(abi_type: []const u8) !usize {
+fn headSizeForParam(abi_type: []const u8) ParseError!usize {
     var parsed = try parseAbiTypeAlloc(std.heap.page_allocator, abi_type);
     defer parsed.deinit(std.heap.page_allocator);
     return headSizeForParsed(parsed);
@@ -588,7 +591,7 @@ fn freeValue(allocator: Allocator, value: Value) void {
     }
 }
 
-fn decodeDynamicAt(allocator: Allocator, base: BaseKind, data: []const u8, start: usize) !Value {
+fn decodeDynamicAt(allocator: Allocator, base: BaseKind, data: []const u8, start: usize) DecodeErrorSet!Value {
     if (start + 32 > data.len) return error.InvalidData;
     const len_word = readWord(data, start);
     const len = u256ToUsize(u256FromBe(len_word[0..])) orelse return error.InvalidData;
@@ -610,7 +613,7 @@ fn decodeFromHead(
     data: []const u8,
     base_start: usize,
     head_offset: usize,
-) !Value {
+) DecodeErrorSet!Value {
     if (head_offset + 32 > data.len) return error.MissingData;
 
     if (parsed.array != .none) {
@@ -641,7 +644,7 @@ fn decodeFromStart(
     parsed: ParsedType,
     data: []const u8,
     start: usize,
-) !Value {
+) DecodeErrorSet!Value {
     if (parsed.array != .none) {
         return decodeArrayFromStart(allocator, parsed, data, start);
     }
@@ -660,7 +663,7 @@ fn decodeTupleAt(
     items: []const ParsedType,
     data: []const u8,
     tuple_start: usize,
-) !Value {
+) DecodeErrorSet!Value {
     var values = try allocator.alloc(Value, items.len);
     errdefer allocator.free(values);
 
@@ -719,7 +722,7 @@ fn isDynamicParsed(parsed: ParsedType) bool {
     return isDynamicBase(parsed.base);
 }
 
-fn parseArraySuffix(suffix: []const u8) !struct { kind: ArrayKind, len: usize } {
+fn parseArraySuffix(suffix: []const u8) ParseError!struct { kind: ArrayKind, len: usize } {
     if (suffix.len < 2) return error.UnsupportedType;
     if (suffix[0] != '[' or suffix[suffix.len - 1] != ']') return error.UnsupportedType;
     const inner = suffix[1 .. suffix.len - 1];
@@ -729,7 +732,7 @@ fn parseArraySuffix(suffix: []const u8) !struct { kind: ArrayKind, len: usize } 
     return .{ .kind = .fixed, .len = try parseDecimal(usize, inner) };
 }
 
-fn parseTupleItems(allocator: Allocator, inner: []const u8) ![]ParsedType {
+fn parseTupleItems(allocator: Allocator, inner: []const u8) ParseError![]ParsedType {
     var items = std.ArrayList(ParsedType).empty;
     errdefer {
         for (items.items) |*item| {
