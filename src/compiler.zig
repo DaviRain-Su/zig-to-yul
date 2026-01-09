@@ -1347,6 +1347,19 @@ pub const Compiler = struct {
                     return try self.ir_builder.builtin_call("sload", &.{addr});
                 }
             }
+            if (self.local_struct_vars.get(obj_src)) |struct_name| {
+                if (self.struct_defs.get(struct_name)) |fields| {
+                    if (self.structFieldOffsetLegacy(fields, field_name)) |offset| {
+                        const base_addr = try self.ir_builder.builtin_call("add", &.{
+                            self.ir_builder.identifier(obj_src),
+                            self.ir_builder.literal_num(offset),
+                        });
+                        const idx_expr = try self.translateExpression(index_node);
+                        const addr = try self.indexedMemoryAddressLegacy(base_addr, idx_expr);
+                        return try self.ir_builder.builtin_call("mload", &.{addr});
+                    }
+                }
+            }
         }
 
         const base_expr = try self.translateExpression(base_node);
@@ -1372,6 +1385,20 @@ pub const Compiler = struct {
                     const addr = try self.indexedStorageSlotLegacy(slot, idx_expr);
                     const store = try self.ir_builder.builtin_call("sstore", &.{addr, value});
                     return .{ .expression = store };
+                }
+            }
+            if (self.local_struct_vars.get(obj_src)) |struct_name| {
+                if (self.struct_defs.get(struct_name)) |fields| {
+                    if (self.structFieldOffsetLegacy(fields, field_name)) |offset| {
+                        const base_addr = try self.ir_builder.builtin_call("add", &.{
+                            self.ir_builder.identifier(obj_src),
+                            self.ir_builder.literal_num(offset),
+                        });
+                        const idx_expr = try self.translateExpression(index_node);
+                        const addr = try self.indexedMemoryAddressLegacy(base_addr, idx_expr);
+                        const store = try self.ir_builder.builtin_call("mstore", &.{addr, value});
+                        return .{ .expression = store };
+                    }
                 }
             }
         }

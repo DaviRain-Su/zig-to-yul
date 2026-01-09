@@ -1297,6 +1297,19 @@ pub const Transformer = struct {
                     return try self.builder.builtinCall("sload", &.{addr});
                 }
             }
+            if (self.local_struct_vars.get(obj_src)) |struct_name| {
+                if (self.struct_defs.get(struct_name)) |fields| {
+                    if (self.structFieldOffset(fields, field_name)) |offset| {
+                        const base_addr = try self.builder.builtinCall("add", &.{
+                            ast.Expression.id(obj_src),
+                            ast.Expression.lit(ast.Literal.number(offset)),
+                        });
+                        const idx_expr = try self.translateExpression(index_node);
+                        const addr = try self.indexedMemoryAddress(base_addr, idx_expr);
+                        return try self.builder.builtinCall("mload", &.{addr});
+                    }
+                }
+            }
         }
 
         const base_expr = try self.translateExpression(base_node);
@@ -1322,6 +1335,20 @@ pub const Transformer = struct {
                     const addr = try self.indexedStorageSlot(slot, idx_expr);
                     const store = try self.builder.builtinCall("sstore", &.{addr, value});
                     return ast.Statement.expr(store);
+                }
+            }
+            if (self.local_struct_vars.get(obj_src)) |struct_name| {
+                if (self.struct_defs.get(struct_name)) |fields| {
+                    if (self.structFieldOffset(fields, field_name)) |offset| {
+                        const base_addr = try self.builder.builtinCall("add", &.{
+                            ast.Expression.id(obj_src),
+                            ast.Expression.lit(ast.Literal.number(offset)),
+                        });
+                        const idx_expr = try self.translateExpression(index_node);
+                        const addr = try self.indexedMemoryAddress(base_addr, idx_expr);
+                        const store = try self.builder.builtinCall("mstore", &.{addr, value});
+                        return ast.Statement.expr(store);
+                    }
                 }
             }
         }
@@ -1849,7 +1876,7 @@ pub const Transformer = struct {
     ) TransformProcessError!void {
         const idx_name = try self.makeTemp("copy_i");
         const init_decl = try self.builder.varDecl(&.{idx_name}, ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0))));
-        var init_block = try self.builder.block(&.{init_decl});
+        const init_block = try self.builder.block(&.{init_decl});
 
         const cond = try self.builder.builtinCall("lt", &.{ast.Expression.id(idx_name), size});
 
@@ -1858,13 +1885,13 @@ pub const Transformer = struct {
             ast.Expression.lit(ast.Literal.number(@as(ast.U256, 32))),
         });
         const post_stmt = try self.builder.assign(&.{idx_name}, post_expr);
-        var post_block = try self.builder.block(&.{post_stmt});
+        const post_block = try self.builder.block(&.{post_stmt});
 
         const src_addr = try self.builder.builtinCall("add", &.{src, ast.Expression.id(idx_name)});
         const val = try self.builder.builtinCall("mload", &.{src_addr});
         const dst_addr = try self.builder.builtinCall("add", &.{dest, ast.Expression.id(idx_name)});
         const store = try self.builder.builtinCall("mstore", &.{dst_addr, val});
-        var body_block = try self.builder.block(&.{ast.Statement.expr(store)});
+        const body_block = try self.builder.block(&.{ast.Statement.expr(store)});
 
         const loop_stmt = self.builder.forLoop(init_block, cond, post_block, body_block);
         try stmts.append(self.allocator, loop_stmt);
@@ -2088,7 +2115,7 @@ test "transform expression coverage" {
     const allocator = std.testing.allocator;
     const printer = @import("printer.zig");
 
-    // Test arithmetic expressions, array access, and struct literals
+    // Test complex expressions, array access, and struct literals
     const source =
         \\const Pair = struct {
         \\    a: u256,
@@ -2098,12 +2125,16 @@ test "transform expression coverage" {
         \\pub const Counter = struct {
         \\    value: u256,
         \\
+        \\    pub fn helper(self: *Counter, x: u256, y: u256) u256 {
+        \\        return (x + y) * 2;
+        \\    }
+        \\
         \\    pub fn compute(self: *Counter, offset: u256) u256 {
-        \\        var x = (1 + 2) * 3;
-        \\        var y = offset[1];
-        \\        const p = Pair{ .a = 7, .b = 9 };
-        \\        self.value = x;
-        \\        return p.a + y;
+        \\        const p = Pair{ .a = 7 + offset, .b = (1 + 2) * 3 };
+        \\        var x = (p.a + self.value) * (offset - 1);
+        \\        var y = p.b[1];
+        \\        self.value = x + self.helper(p.a, y);
+        \\        return x + y;
         \\    }
         \\};
     ;
@@ -2126,9 +2157,10 @@ test "transform expression coverage" {
 
     // Verify function is generated
     try std.testing.expect(std.mem.indexOf(u8, output, "function compute") != null);
-    // Verify arithmetic operations
+    // Verify arithmetic operations and nested calls
     try std.testing.expect(std.mem.indexOf(u8, output, "add") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "mul") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "function helper") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "__zig2yul$init$Pair") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "mload") != null);
 }
