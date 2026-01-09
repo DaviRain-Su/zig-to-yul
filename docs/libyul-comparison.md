@@ -403,10 +403,10 @@ pub fn hasBuiltin(self: Dialect, name: []const u8) bool { ... }
 |------|------|------|
 | 静态参数 (uint256, address) | ✅ | `calldataload(4 + i*32)` |
 | 单返回值 | ✅ | `mstore(0, result); return(0, 32)` |
-| 动态类型 (string, bytes) | ❌ | 需要偏移量解析 |
-| 动态数组 | ❌ | 需要长度前缀 |
+| 动态类型 (string, bytes) | ✅ | 偏移量解码 + 长度前缀 |
+| 动态数组 | ✅ | 偏移量解码 + `len*32` |
 | 结构体参数 | ❌ | 需要 ABI 编码规则 |
-| 多返回值 | ❌ | 需要连续 mstore |
+| 多返回值 | ✅ | 结构体返回会连续 `mstore` |
 | 事件编码 | ⚠️ 部分 | log0-log4 存在，无高级封装 |
 
 ### 6.5 SourceLocation 未填充
