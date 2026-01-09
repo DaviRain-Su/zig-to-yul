@@ -322,7 +322,10 @@ pub const Transformer = struct {
 
     fn structHasDynamicField(self: *Self, fields: []const StructFieldDef) bool {
         for (fields) |field| {
-            if (self.struct_defs.get(field.type_name) != null) continue;
+            if (self.struct_defs.get(field.type_name)) |nested| {
+                if (self.structHasDynamicField(nested)) return true;
+                continue;
+            }
             const abi = mapZigTypeToAbi(field.type_name);
             if (isDynamicAbiType(abi)) return true;
         }
@@ -1760,35 +1763,21 @@ pub const Transformer = struct {
             const struct_len = fi.param_struct_lens[i];
             const struct_dynamic = fi.param_struct_dynamic[i];
             if (struct_len > 0 and !struct_dynamic) {
-                const mem_name = try self.makeTemp("mem");
-                const mem_expr = try self.builder.builtinCall("mload", &.{
-                    ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0x40))),
-                });
-                try case_stmts.append(self.allocator, try self.builder.varDecl(&.{mem_name}, mem_expr));
-
-                for (0..struct_len) |idx| {
-                    const field_offset = ast.Expression.lit(ast.Literal.number(@as(ast.U256, @intCast(offset + idx * 32))));
-                    const val = try self.builder.builtinCall("calldataload", &.{field_offset});
-                    const addr = try self.builder.builtinCall("add", &.{
-                        ast.Expression.id(mem_name),
-                        ast.Expression.lit(ast.Literal.number(@as(ast.U256, @intCast(idx * 32)))),
+                const struct_name = fi.param_struct_names[i];
+                if (self.struct_defs.get(struct_name)) |fields| {
+                    const head_expr = ast.Expression.lit(ast.Literal.number(offset));
+                    const struct_ptr = try self.decodeStructFromHead(fields, head_expr, &case_stmts);
+                    const var_decl = try self.builder.varDecl(&.{param_name}, struct_ptr);
+                    try case_stmts.append(self.allocator, var_decl);
+                    try call_args.append(self.allocator, ast.Expression.id(param_name));
+                } else {
+                    const load_call = try self.builder.builtinCall("calldataload", &.{
+                        ast.Expression.lit(ast.Literal.number(offset)),
                     });
-                    const store = try self.builder.builtinCall("mstore", &.{ addr, val });
-                    try case_stmts.append(self.allocator, ast.Statement.expr(store));
+                    const var_decl = try self.builder.varDecl(&.{param_name}, load_call);
+                    try case_stmts.append(self.allocator, var_decl);
+                    try call_args.append(self.allocator, ast.Expression.id(param_name));
                 }
-
-                const update_free = try self.builder.builtinCall("mstore", &.{
-                    ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0x40))),
-                    try self.builder.builtinCall("add", &.{
-                        ast.Expression.id(mem_name),
-                        ast.Expression.lit(ast.Literal.number(@as(ast.U256, @intCast(struct_len * 32)))),
-                    }),
-                });
-                try case_stmts.append(self.allocator, ast.Statement.expr(update_free));
-
-                const var_decl = try self.builder.varDecl(&.{param_name}, ast.Expression.id(mem_name));
-                try case_stmts.append(self.allocator, var_decl);
-                try call_args.append(self.allocator, ast.Expression.id(param_name));
                 head_offset += @as(ast.U256, @intCast(struct_len * 32));
             } else if (struct_len > 0 and struct_dynamic) {
                 const struct_name = fi.param_struct_names[i];
@@ -1796,7 +1785,6 @@ pub const Transformer = struct {
 
                 const offset_name = try self.makeTemp("offset");
                 const head_name = try self.makeTemp("head");
-                const mem_name = try self.makeTemp("mem");
 
                 const offset_expr = try self.builder.builtinCall("calldataload", &.{
                     ast.Expression.lit(ast.Literal.number(offset)),
@@ -1809,125 +1797,19 @@ pub const Transformer = struct {
                 });
                 try case_stmts.append(self.allocator, try self.builder.varDecl(&.{head_name}, head_expr));
 
-                const mem_expr = try self.builder.builtinCall("mload", &.{
-                    ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0x40))),
-                });
-                try case_stmts.append(self.allocator, try self.builder.varDecl(&.{mem_name}, mem_expr));
-
-                const reserve_struct = try self.builder.builtinCall("mstore", &.{
-                    ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0x40))),
-                    try self.builder.builtinCall("add", &.{
-                        ast.Expression.id(mem_name),
-                        ast.Expression.lit(ast.Literal.number(@as(ast.U256, @intCast(struct_len * 32)))),
-                    }),
-                });
-                try case_stmts.append(self.allocator, ast.Statement.expr(reserve_struct));
-
                 if (fields_opt) |fields| {
-                    for (fields, 0..) |field, idx| {
-                        const field_slot = try self.builder.builtinCall("add", &.{
-                            ast.Expression.id(mem_name),
-                            ast.Expression.lit(ast.Literal.number(@as(ast.U256, @intCast(idx * 32)))),
-                        });
-                        const head_slot = try self.builder.builtinCall("add", &.{
-                            ast.Expression.id(head_name),
-                            ast.Expression.lit(ast.Literal.number(@as(ast.U256, @intCast(idx * 32)))),
-                        });
-
-                        if (self.struct_defs.get(field.type_name) == null and isDynamicAbiType(mapZigTypeToAbi(field.type_name))) {
-                            const rel_name = try self.makeTemp("field_off");
-                            const len_name = try self.makeTemp("field_len");
-                            const data_name = try self.makeTemp("field_data");
-                            const size_name = try self.makeTemp("field_size");
-                            const field_mem = try self.makeTemp("field_mem");
-
-                            const rel_expr = try self.builder.builtinCall("calldataload", &.{head_slot});
-                            try case_stmts.append(self.allocator, try self.builder.varDecl(&.{rel_name}, rel_expr));
-
-                            const field_head = try self.builder.builtinCall("add", &.{
-                                ast.Expression.id(head_name),
-                                ast.Expression.id(rel_name),
-                            });
-                            const len_expr = try self.builder.builtinCall("calldataload", &.{field_head});
-                            try case_stmts.append(self.allocator, try self.builder.varDecl(&.{len_name}, len_expr));
-
-                            const field_mem_expr = try self.builder.builtinCall("mload", &.{
-                                ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0x40))),
-                            });
-                            try case_stmts.append(self.allocator, try self.builder.varDecl(&.{field_mem}, field_mem_expr));
-
-                            const store_len = try self.builder.builtinCall("mstore", &.{
-                                ast.Expression.id(field_mem),
-                                ast.Expression.id(len_name),
-                            });
-                            try case_stmts.append(self.allocator, ast.Statement.expr(store_len));
-
-                            const data_expr = try self.builder.builtinCall("add", &.{
-                                ast.Expression.id(field_mem),
-                                ast.Expression.lit(ast.Literal.number(@as(ast.U256, 32))),
-                            });
-                            try case_stmts.append(self.allocator, try self.builder.varDecl(&.{data_name}, data_expr));
-
-                            const size_expr = if (isDynamicArrayAbiType(mapZigTypeToAbi(field.type_name)))
-                                try self.builder.builtinCall("mul", &.{
-                                    ast.Expression.id(len_name),
-                                    ast.Expression.lit(ast.Literal.number(@as(ast.U256, 32))),
-                                })
-                            else
-                                try self.builder.builtinCall("and", &.{
-                                    try self.builder.builtinCall("add", &.{
-                                        ast.Expression.id(len_name),
-                                        ast.Expression.lit(ast.Literal.number(@as(ast.U256, 31))),
-                                    }),
-                                    try self.builder.builtinCall("not", &.{ast.Expression.lit(ast.Literal.number(@as(ast.U256, 31)))}),
-                                });
-                            try case_stmts.append(self.allocator, try self.builder.varDecl(&.{size_name}, size_expr));
-
-                            const data_start = try self.builder.builtinCall("add", &.{
-                                field_head,
-                                ast.Expression.lit(ast.Literal.number(@as(ast.U256, 32))),
-                            });
-                            try self.appendMemoryCopyLoop(&case_stmts, ast.Expression.id(data_name), data_start, ast.Expression.id(size_name));
-
-                            const update_free = try self.builder.builtinCall("mstore", &.{
-                                ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0x40))),
-                                try self.builder.builtinCall("add", &.{
-                                    ast.Expression.id(data_name),
-                                    ast.Expression.id(size_name),
-                                }),
-                            });
-                            try case_stmts.append(self.allocator, ast.Statement.expr(update_free));
-
-                            const store_ptr = try self.builder.builtinCall("mstore", &.{
-                                field_slot,
-                                ast.Expression.id(field_mem),
-                            });
-                            try case_stmts.append(self.allocator, ast.Statement.expr(store_ptr));
-                        } else {
-                            const val = try self.builder.builtinCall("calldataload", &.{head_slot});
-                            const store = try self.builder.builtinCall("mstore", &.{ field_slot, val });
-                            try case_stmts.append(self.allocator, ast.Statement.expr(store));
-                        }
-                    }
+                    const struct_ptr = try self.decodeStructFromHead(fields, ast.Expression.id(head_name), &case_stmts);
+                    const var_decl = try self.builder.varDecl(&.{param_name}, struct_ptr);
+                    try case_stmts.append(self.allocator, var_decl);
+                    try call_args.append(self.allocator, ast.Expression.id(param_name));
                 } else {
-                    for (0..struct_len) |idx| {
-                        const field_offset = try self.builder.builtinCall("add", &.{
-                            ast.Expression.id(head_name),
-                            ast.Expression.lit(ast.Literal.number(@as(ast.U256, @intCast(idx * 32)))),
-                        });
-                        const val = try self.builder.builtinCall("calldataload", &.{field_offset});
-                        const addr = try self.builder.builtinCall("add", &.{
-                            ast.Expression.id(mem_name),
-                            ast.Expression.lit(ast.Literal.number(@as(ast.U256, @intCast(idx * 32)))),
-                        });
-                        const store = try self.builder.builtinCall("mstore", &.{ addr, val });
-                        try case_stmts.append(self.allocator, ast.Statement.expr(store));
-                    }
+                    const load_call = try self.builder.builtinCall("calldataload", &.{
+                        ast.Expression.lit(ast.Literal.number(offset)),
+                    });
+                    const var_decl = try self.builder.varDecl(&.{param_name}, load_call);
+                    try case_stmts.append(self.allocator, var_decl);
+                    try call_args.append(self.allocator, ast.Expression.id(param_name));
                 }
-
-                const var_decl = try self.builder.varDecl(&.{param_name}, ast.Expression.id(mem_name));
-                try case_stmts.append(self.allocator, var_decl);
-                try call_args.append(self.allocator, ast.Expression.id(param_name));
                 head_offset += @as(ast.U256, 32);
             } else if (isDynamicAbiType(abi_type)) {
                 const offset_name = try self.makeTemp("offset");
@@ -2166,6 +2048,134 @@ pub const Transformer = struct {
 
         const loop_stmt = self.builder.forLoop(init_block, cond, post_block, body_block);
         try stmts.append(self.allocator, loop_stmt);
+    }
+
+    fn decodeStructFromHead(
+        self: *Self,
+        fields: []const StructFieldDef,
+        head_expr: ast.Expression,
+        stmts: *std.ArrayList(ast.Statement),
+    ) TransformProcessError!ast.Expression {
+        const mem_name = try self.makeTemp("struct_mem");
+        const mem_expr = try self.builder.builtinCall("mload", &.{
+            ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0x40))),
+        });
+        try stmts.append(self.allocator, try self.builder.varDecl(&.{mem_name}, mem_expr));
+
+        const reserve = try self.builder.builtinCall("mstore", &.{
+            ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0x40))),
+            try self.builder.builtinCall("add", &.{
+                ast.Expression.id(mem_name),
+                ast.Expression.lit(ast.Literal.number(@as(ast.U256, @intCast(fields.len * 32)))),
+            }),
+        });
+        try stmts.append(self.allocator, ast.Statement.expr(reserve));
+
+        for (fields, 0..) |field, idx| {
+            const field_slot = try self.builder.builtinCall("add", &.{
+                ast.Expression.id(mem_name),
+                ast.Expression.lit(ast.Literal.number(@as(ast.U256, @intCast(idx * 32)))),
+            });
+            const head_slot = try self.builder.builtinCall("add", &.{
+                head_expr,
+                ast.Expression.lit(ast.Literal.number(@as(ast.U256, @intCast(idx * 32)))),
+            });
+
+            if (self.struct_defs.get(field.type_name)) |nested| {
+                if (self.structHasDynamicField(nested)) {
+                    const rel_name = try self.makeTemp("field_off");
+                    const rel_expr = try self.builder.builtinCall("calldataload", &.{head_slot});
+                    try stmts.append(self.allocator, try self.builder.varDecl(&.{rel_name}, rel_expr));
+
+                    const nested_head = try self.builder.builtinCall("add", &.{
+                        head_expr,
+                        ast.Expression.id(rel_name),
+                    });
+                    const nested_ptr = try self.decodeStructFromHead(nested, nested_head, stmts);
+                    const store_ptr = try self.builder.builtinCall("mstore", &.{field_slot, nested_ptr});
+                    try stmts.append(self.allocator, ast.Statement.expr(store_ptr));
+                } else {
+                    const val = try self.builder.builtinCall("calldataload", &.{head_slot});
+                    const store = try self.builder.builtinCall("mstore", &.{field_slot, val});
+                    try stmts.append(self.allocator, ast.Statement.expr(store));
+                }
+            } else if (isDynamicAbiType(mapZigTypeToAbi(field.type_name))) {
+                const rel_name = try self.makeTemp("field_off");
+                const len_name = try self.makeTemp("field_len");
+                const data_name = try self.makeTemp("field_data");
+                const size_name = try self.makeTemp("field_size");
+                const field_mem = try self.makeTemp("field_mem");
+
+                const rel_expr = try self.builder.builtinCall("calldataload", &.{head_slot});
+                try stmts.append(self.allocator, try self.builder.varDecl(&.{rel_name}, rel_expr));
+
+                const field_head = try self.builder.builtinCall("add", &.{
+                    head_expr,
+                    ast.Expression.id(rel_name),
+                });
+                const len_expr = try self.builder.builtinCall("calldataload", &.{field_head});
+                try stmts.append(self.allocator, try self.builder.varDecl(&.{len_name}, len_expr));
+
+                const field_mem_expr = try self.builder.builtinCall("mload", &.{
+                    ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0x40))),
+                });
+                try stmts.append(self.allocator, try self.builder.varDecl(&.{field_mem}, field_mem_expr));
+
+                const store_len = try self.builder.builtinCall("mstore", &.{
+                    ast.Expression.id(field_mem),
+                    ast.Expression.id(len_name),
+                });
+                try stmts.append(self.allocator, ast.Statement.expr(store_len));
+
+                const data_expr = try self.builder.builtinCall("add", &.{
+                    ast.Expression.id(field_mem),
+                    ast.Expression.lit(ast.Literal.number(@as(ast.U256, 32))),
+                });
+                try stmts.append(self.allocator, try self.builder.varDecl(&.{data_name}, data_expr));
+
+                const size_expr = if (isDynamicArrayAbiType(mapZigTypeToAbi(field.type_name)))
+                    try self.builder.builtinCall("mul", &.{
+                        ast.Expression.id(len_name),
+                        ast.Expression.lit(ast.Literal.number(@as(ast.U256, 32))),
+                    })
+                else
+                    try self.builder.builtinCall("and", &.{
+                        try self.builder.builtinCall("add", &.{
+                            ast.Expression.id(len_name),
+                            ast.Expression.lit(ast.Literal.number(@as(ast.U256, 31))),
+                        }),
+                        try self.builder.builtinCall("not", &.{ast.Expression.lit(ast.Literal.number(@as(ast.U256, 31)))}),
+                    });
+                try stmts.append(self.allocator, try self.builder.varDecl(&.{size_name}, size_expr));
+
+                const data_start = try self.builder.builtinCall("add", &.{
+                    field_head,
+                    ast.Expression.lit(ast.Literal.number(@as(ast.U256, 32))),
+                });
+                try self.appendMemoryCopyLoop(stmts, ast.Expression.id(data_name), data_start, ast.Expression.id(size_name));
+
+                const update_free = try self.builder.builtinCall("mstore", &.{
+                    ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0x40))),
+                    try self.builder.builtinCall("add", &.{
+                        ast.Expression.id(data_name),
+                        ast.Expression.id(size_name),
+                    }),
+                });
+                try stmts.append(self.allocator, ast.Statement.expr(update_free));
+
+                const store_ptr = try self.builder.builtinCall("mstore", &.{
+                    field_slot,
+                    ast.Expression.id(field_mem),
+                });
+                try stmts.append(self.allocator, ast.Statement.expr(store_ptr));
+            } else {
+                const val = try self.builder.builtinCall("calldataload", &.{head_slot});
+                const store = try self.builder.builtinCall("mstore", &.{field_slot, val});
+                try stmts.append(self.allocator, ast.Statement.expr(store));
+            }
+        }
+
+        return ast.Expression.id(mem_name);
     }
 
     pub fn hasErrors(self: *const Self) bool {
@@ -2424,8 +2434,8 @@ test "dispatcher with struct param" {
     defer allocator.free(output);
 
     // Struct fields occupy two slots; next param starts at offset 68.
-    try std.testing.expect(std.mem.indexOf(u8, output, "calldataload(4)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "calldataload(36)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "calldataload(add(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "calldataload(68)") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "calldataload(68)") != null);
 }
 
@@ -2457,6 +2467,40 @@ test "dispatcher with struct dynamic field param" {
     defer allocator.free(output);
 
     // Dynamic struct field uses an offset lookup inside the struct head.
+    try std.testing.expect(std.mem.indexOf(u8, output, "calldataload(add(") != null);
+}
+
+test "dispatcher with nested dynamic struct param" {
+    const allocator = std.testing.allocator;
+    const printer = @import("printer.zig");
+
+    const source =
+        \\const Inner = struct {
+        \\    data: []u8,
+        \\};
+        \\
+        \\const Outer = struct {
+        \\    inner: Inner,
+        \\    x: u256,
+        \\};
+        \\
+        \\pub const Box = struct {
+        \\    pub fn take(self: *Box, p: Outer) u256 {
+        \\        return p.x;
+        \\    }
+        \\};
+    ;
+
+    const source_z = try allocator.dupeZ(u8, source);
+    defer allocator.free(source_z);
+
+    var transformer = Transformer.init(allocator);
+    defer transformer.deinit();
+
+    const yul_ast = try transformer.transform(source_z);
+    const output = try printer.format(allocator, yul_ast);
+    defer allocator.free(output);
+
     try std.testing.expect(std.mem.indexOf(u8, output, "calldataload(add(") != null);
 }
 
