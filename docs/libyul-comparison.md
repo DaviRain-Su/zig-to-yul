@@ -387,7 +387,7 @@ pub fn hasBuiltin(self: Dialect, name: []const u8) bool { ... }
 
 | 节点类型 | 状态 | Yul 对应 |
 |----------|------|----------|
-| for 循环 | ✅ 完整 | 支持 `for (start..end)`、`for (start..)`、`for (start..end, 0..) |val, idx|`、`for (base, 0..len) |val, idx|`、`for ... else` |
+| for 循环 | ✅ 完整 | 支持 `for (start..end)`、`for (start..)`、`for (start..end, 0..) |val, idx|`、`for (base, 0..len) |val, idx|`、`for (arr) |val|`、`for ... else` |
 | while 循环 | ✅ | `for { } cond { } { }` |
 | switch 语句 | ✅ | range/表达式 case 会降级为 if 链 |
 | break | ✅ | 不支持 label/value |
