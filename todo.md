@@ -1,7 +1,17 @@
-• 目前的 TODO 主要集中在 docs/libyul-comparison.md 的“未实现特性/限制”部分：
+• 目前的 TODO 清单（汇总自 docs/libyul-comparison.md 的未完成/部分实现项）：
 
-- EOF Prague 相关指令（5.1）
-- 预编译合约封装（5.2）
-- 调试辅助：ObjectDebugData、Object::Structure（5.4）
+- 预编译合约封装未实现（5.2：0x01-0x0a）
+- 事件解码仍为基础实现（5.3：静态类型/bytes/string/数组/动态数组元素/CLI）
+- ABI 解码部分实现（5.3）
+- Gas 估算仅静态估算（5.3）
+- Yul 优化器仅 peephole 基础实现（5.3）
+- for 循环仅部分支持（6.3）
+- 数组索引仅部分支持（6.3）
+- 结构体字面量仅部分支持（6.3）
+- 事件编码仅部分支持（6.4）
+- SourceLocation 仅 AST 路径填充（6.5）
+- ObjectDebugData 未实现（2.3/5.4）
+- Object::Structure 未实现（2.3/5.4）
+- EOF Prague 指令未实现（5.1）
 
-  如果你想继续：我们可以按 5.2（预编译合约封装）→ 5.4（调试辅助）→ 5.1（EOF Prague 指令）的优先级推进。
+如果你想继续：建议按 5.2（预编译合约封装）→ 5.4（调试辅助）→ 5.1（EOF Prague 指令）的优先级推进。
