@@ -23,6 +23,24 @@ pub const Event = struct {
     anonymous: bool = false,
 };
 
+pub fn eventSignatureHash(allocator: Allocator, event: Event) ![32]u8 {
+    var sig_buf: std.ArrayList(u8) = .empty;
+    defer sig_buf.deinit(allocator);
+
+    try sig_buf.appendSlice(allocator, event.name);
+    try sig_buf.append(allocator, '(');
+    for (event.params, 0..) |param, i| {
+        if (i > 0) try sig_buf.appendSlice(allocator, ",");
+        try sig_buf.appendSlice(allocator, param.abi_type);
+    }
+    try sig_buf.append(allocator, ')');
+
+    const Keccak256 = std.crypto.hash.sha3.Keccak256;
+    var hash: [32]u8 = undefined;
+    Keccak256.hash(sig_buf.items, &hash, .{});
+    return hash;
+}
+
 pub const BytesValue = struct {
     data: [32]u8,
     len: u8,
@@ -106,6 +124,7 @@ pub fn writeValue(writer: anytype, value: Value) !void {
 }
 
 pub const DecodeError = error{
+    InvalidSignature,
     MissingTopics,
     MissingData,
     UnsupportedType,
@@ -160,6 +179,13 @@ pub fn decodeEvent(
     const indexed_count = countIndexed(event.params);
     const required_topics: usize = if (event.anonymous) indexed_count else indexed_count + 1;
     if (topics.len < required_topics) return error.MissingTopics;
+
+    if (!event.anonymous) {
+        const expected = try eventSignatureHash(allocator, event);
+        if (!std.mem.eql(u8, expected[0..], topics[0][0..])) {
+            return error.InvalidSignature;
+        }
+    }
 
     var topic_index: usize = if (event.anonymous) 0 else 1;
     var head_offset: usize = 0;
@@ -1042,4 +1068,31 @@ test "decode indexed string with preimage" {
 
     const value = decoded.fields[0].value;
     try std.testing.expect(std.mem.eql(u8, value.string, "hi"));
+}
+
+test "event signature validation" {
+    const allocator = std.testing.allocator;
+
+    const event = Event{
+        .name = "Transfer",
+        .params = &.{
+            .{ .name = "from", .abi_type = "address", .indexed = true },
+            .{ .name = "to", .abi_type = "address", .indexed = true },
+            .{ .name = "value", .abi_type = "uint256", .indexed = false },
+        },
+    };
+
+    var topics: [3][32]u8 = undefined;
+    @memset(&topics, 0);
+    topics[0] = try eventSignatureHash(allocator, event);
+
+    var data: [32]u8 = undefined;
+    @memset(&data, 0);
+
+    const decoded = try decodeEvent(allocator, event, topics[0..], data[0..]);
+    defer decoded.deinit(allocator);
+
+    var bad_topics: [3][32]u8 = topics;
+    bad_topics[0][0] ^= 0x01;
+    try std.testing.expectError(error.InvalidSignature, decodeEvent(allocator, event, bad_topics[0..], data[0..]));
 }
