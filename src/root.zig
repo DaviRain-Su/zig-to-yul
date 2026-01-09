@@ -14,6 +14,7 @@ pub const sema = struct {
 };
 
 pub const yul = struct {
+    // Legacy IR (to be deprecated)
     pub const ir = @import("yul/ir.zig");
     pub const codegen = @import("yul/codegen.zig");
     pub const Expression = ir.Expression;
@@ -21,6 +22,13 @@ pub const yul = struct {
     pub const Object = ir.Object;
     pub const Builder = ir.Builder;
     pub const CodeGenerator = codegen.CodeGenerator;
+
+    // New AST-based architecture
+    pub const yul_ast = @import("yul/ast.zig");
+    pub const printer = @import("yul/printer.zig");
+    pub const AST = yul_ast.AST;
+    pub const AstBuilder = yul_ast.AstBuilder;
+    pub const Printer = printer.Printer;
 };
 
 pub const evm = struct {

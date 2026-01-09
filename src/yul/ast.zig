@@ -1,0 +1,643 @@
+//! Yul Abstract Syntax Tree
+//!
+//! This module defines the AST structure for Yul code, closely following
+//! the libyul AST design from Solidity.
+//!
+//! Reference: https://github.com/ethereum/solidity/blob/develop/libyul/AST.h
+//! Spec: https://docs.soliditylang.org/en/latest/yul.html#specification-of-yul
+
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+
+/// Source location for error reporting and debugging
+pub const SourceLocation = struct {
+    start: u32 = 0,
+    end: u32 = 0,
+    source_index: ?u32 = null,
+
+    pub const none: SourceLocation = .{};
+
+    pub fn format(self: SourceLocation, comptime _: []const u8, _: std.fmt.FormatOptions, writer: anytype) !void {
+        if (self.source_index) |idx| {
+            try writer.print("{}:{}-{}", .{ idx, self.start, self.end });
+        } else {
+            try writer.print("{}-{}", .{ self.start, self.end });
+        }
+    }
+};
+
+/// Yul name/identifier
+pub const YulName = []const u8;
+
+/// Typed name - identifier with optional type annotation
+/// In Yul, all values are u256, but we track the type for validation
+pub const TypedName = struct {
+    location: SourceLocation = .none,
+    name: YulName,
+    type_name: ?YulName = null, // Usually "u256" or omitted
+
+    pub fn init(name: YulName) TypedName {
+        return .{ .name = name };
+    }
+
+    pub fn withType(name: YulName, type_name: YulName) TypedName {
+        return .{ .name = name, .type_name = type_name };
+    }
+
+    pub fn withLocation(name: YulName, location: SourceLocation) TypedName {
+        return .{ .name = name, .location = location };
+    }
+};
+
+/// Literal kind
+pub const LiteralKind = enum {
+    number,
+    boolean,
+    string,
+    hex_string,
+};
+
+/// U256 type from EVM
+pub const U256 = @import("../evm/types.zig").U256;
+
+/// Literal value - can be number, boolean, or string
+pub const LiteralValue = union(LiteralKind) {
+    number: U256,
+    boolean: bool,
+    string: []const u8,
+    hex_string: []const u8,
+};
+
+/// Literal expression
+pub const Literal = struct {
+    location: SourceLocation = .none,
+    kind: LiteralKind,
+    value: LiteralValue,
+    type_name: ?YulName = null,
+
+    pub fn number(n: U256) Literal {
+        return .{
+            .kind = .number,
+            .value = .{ .number = n },
+        };
+    }
+
+    pub fn boolean(b: bool) Literal {
+        return .{
+            .kind = .boolean,
+            .value = .{ .boolean = b },
+        };
+    }
+
+    pub fn string(s: []const u8) Literal {
+        return .{
+            .kind = .string,
+            .value = .{ .string = s },
+        };
+    }
+
+    pub fn hexString(s: []const u8) Literal {
+        return .{
+            .kind = .hex_string,
+            .value = .{ .hex_string = s },
+        };
+    }
+};
+
+/// Identifier reference
+pub const Identifier = struct {
+    location: SourceLocation = .none,
+    name: YulName,
+
+    pub fn init(name: YulName) Identifier {
+        return .{ .name = name };
+    }
+};
+
+/// Function call expression
+pub const FunctionCall = struct {
+    location: SourceLocation = .none,
+    function_name: YulName,
+    arguments: []const Expression,
+
+    pub fn init(name: YulName, args: []const Expression) FunctionCall {
+        return .{ .function_name = name, .arguments = args };
+    }
+};
+
+/// Expression - can be literal, identifier, or function call
+pub const Expression = union(enum) {
+    literal: Literal,
+    identifier: Identifier,
+    function_call: FunctionCall,
+
+    pub fn getLocation(self: Expression) SourceLocation {
+        return switch (self) {
+            .literal => |l| l.location,
+            .identifier => |i| i.location,
+            .function_call => |f| f.location,
+        };
+    }
+
+    // Convenience constructors
+    pub fn lit(value: Literal) Expression {
+        return .{ .literal = value };
+    }
+
+    pub fn id(name: YulName) Expression {
+        return .{ .identifier = Identifier.init(name) };
+    }
+
+    pub fn call(name: YulName, args: []const Expression) Expression {
+        return .{ .function_call = FunctionCall.init(name, args) };
+    }
+};
+
+/// Variable declaration: let x, y := expr
+pub const VariableDeclaration = struct {
+    location: SourceLocation = .none,
+    variables: []const TypedName,
+    value: ?Expression,
+
+    pub fn init(vars: []const TypedName, value: ?Expression) VariableDeclaration {
+        return .{ .variables = vars, .value = value };
+    }
+};
+
+/// Assignment: x, y := expr
+pub const Assignment = struct {
+    location: SourceLocation = .none,
+    variable_names: []const Identifier,
+    value: Expression,
+
+    pub fn init(names: []const Identifier, value: Expression) Assignment {
+        return .{ .variable_names = names, .value = value };
+    }
+};
+
+/// Expression statement - expression used as statement
+pub const ExpressionStatement = struct {
+    location: SourceLocation = .none,
+    expression: Expression,
+
+    pub fn init(expr: Expression) ExpressionStatement {
+        return .{ .expression = expr };
+    }
+};
+
+/// Block - scoped list of statements
+pub const Block = struct {
+    location: SourceLocation = .none,
+    statements: []const Statement,
+
+    pub fn init(stmts: []const Statement) Block {
+        return .{ .statements = stmts };
+    }
+
+    pub fn empty() Block {
+        return .{ .statements = &.{} };
+    }
+};
+
+/// If statement (no else in Yul)
+pub const If = struct {
+    location: SourceLocation = .none,
+    condition: Expression,
+    body: Block,
+
+    pub fn init(cond: Expression, body: Block) If {
+        return .{ .condition = cond, .body = body };
+    }
+};
+
+/// Switch case
+pub const Case = struct {
+    location: SourceLocation = .none,
+    value: ?Literal, // null for default case
+    body: Block,
+
+    pub fn init(value: Literal, body: Block) Case {
+        return .{ .value = value, .body = body };
+    }
+
+    pub fn default(body: Block) Case {
+        return .{ .value = null, .body = body };
+    }
+};
+
+/// Switch statement
+pub const Switch = struct {
+    location: SourceLocation = .none,
+    expression: Expression,
+    cases: []const Case,
+
+    pub fn init(expr: Expression, cases: []const Case) Switch {
+        return .{ .expression = expr, .cases = cases };
+    }
+};
+
+/// For loop: for { init } cond { post } { body }
+pub const ForLoop = struct {
+    location: SourceLocation = .none,
+    pre: Block, // Initialization block
+    condition: Expression,
+    post: Block, // Post-iteration block
+    body: Block,
+
+    pub fn init(pre: Block, cond: Expression, post: Block, body: Block) ForLoop {
+        return .{ .pre = pre, .condition = cond, .post = post, .body = body };
+    }
+};
+
+/// Function definition
+pub const FunctionDefinition = struct {
+    location: SourceLocation = .none,
+    name: YulName,
+    parameters: []const TypedName,
+    return_variables: []const TypedName,
+    body: Block,
+
+    pub fn init(
+        name: YulName,
+        params: []const TypedName,
+        returns: []const TypedName,
+        body: Block,
+    ) FunctionDefinition {
+        return .{
+            .name = name,
+            .parameters = params,
+            .return_variables = returns,
+            .body = body,
+        };
+    }
+};
+
+/// Break statement
+pub const Break = struct {
+    location: SourceLocation = .none,
+};
+
+/// Continue statement
+pub const Continue = struct {
+    location: SourceLocation = .none,
+};
+
+/// Leave statement (return from function)
+pub const Leave = struct {
+    location: SourceLocation = .none,
+};
+
+/// Statement - all possible statement types
+pub const Statement = union(enum) {
+    expression_statement: ExpressionStatement,
+    variable_declaration: VariableDeclaration,
+    assignment: Assignment,
+    block: Block,
+    if_statement: If,
+    switch_statement: Switch,
+    for_loop: ForLoop,
+    function_definition: FunctionDefinition,
+    break_statement: Break,
+    continue_statement: Continue,
+    leave_statement: Leave,
+
+    pub fn getLocation(self: Statement) SourceLocation {
+        return switch (self) {
+            .expression_statement => |s| s.location,
+            .variable_declaration => |s| s.location,
+            .assignment => |s| s.location,
+            .block => |s| s.location,
+            .if_statement => |s| s.location,
+            .switch_statement => |s| s.location,
+            .for_loop => |s| s.location,
+            .function_definition => |s| s.location,
+            .break_statement => |s| s.location,
+            .continue_statement => |s| s.location,
+            .leave_statement => |s| s.location,
+        };
+    }
+
+    // Convenience constructors
+    pub fn expr(e: Expression) Statement {
+        return .{ .expression_statement = ExpressionStatement.init(e) };
+    }
+
+    pub fn varDecl(vars: []const TypedName, value: ?Expression) Statement {
+        return .{ .variable_declaration = VariableDeclaration.init(vars, value) };
+    }
+
+    pub fn assign(names: []const Identifier, value: Expression) Statement {
+        return .{ .assignment = Assignment.init(names, value) };
+    }
+
+    pub fn blockStmt(stmts: []const Statement) Statement {
+        return .{ .block = Block.init(stmts) };
+    }
+
+    pub fn ifStmt(cond: Expression, body: Block) Statement {
+        return .{ .if_statement = If.init(cond, body) };
+    }
+
+    pub fn switchStmt(e: Expression, cases: []const Case) Statement {
+        return .{ .switch_statement = Switch.init(e, cases) };
+    }
+
+    pub fn forStmt(pre: Block, cond: Expression, post: Block, body: Block) Statement {
+        return .{ .for_loop = ForLoop.init(pre, cond, post, body) };
+    }
+
+    pub fn funcDef(name: YulName, params: []const TypedName, returns: []const TypedName, body: Block) Statement {
+        return .{ .function_definition = FunctionDefinition.init(name, params, returns, body) };
+    }
+
+    pub fn breakStmt() Statement {
+        return .{ .break_statement = .{} };
+    }
+
+    pub fn continueStmt() Statement {
+        return .{ .continue_statement = .{} };
+    }
+
+    pub fn leaveStmt() Statement {
+        return .{ .leave_statement = .{} };
+    }
+};
+
+/// Data section in Yul object
+pub const DataSection = struct {
+    location: SourceLocation = .none,
+    name: YulName,
+    data: DataValue,
+
+    pub const DataValue = union(enum) {
+        hex: []const u8,
+        string: []const u8,
+    };
+
+    pub fn hex(name: YulName, data: []const u8) DataSection {
+        return .{ .name = name, .data = .{ .hex = data } };
+    }
+
+    pub fn string(name: YulName, data: []const u8) DataSection {
+        return .{ .name = name, .data = .{ .string = data } };
+    }
+};
+
+/// Yul Object - top-level container
+pub const Object = struct {
+    location: SourceLocation = .none,
+    name: YulName,
+    code: Block,
+    sub_objects: []const Object,
+    data_sections: []const DataSection,
+
+    pub fn init(
+        name: YulName,
+        code: Block,
+        sub_objects: []const Object,
+        data_sections: []const DataSection,
+    ) Object {
+        return .{
+            .name = name,
+            .code = code,
+            .sub_objects = sub_objects,
+            .data_sections = data_sections,
+        };
+    }
+};
+
+/// The complete Yul AST
+pub const AST = struct {
+    root: Object,
+
+    pub fn init(root: Object) AST {
+        return .{ .root = root };
+    }
+};
+
+// =============================================================================
+// AST Builder - helps construct AST nodes with memory management
+// =============================================================================
+
+pub const AstBuilder = struct {
+    allocator: Allocator,
+
+    // Memory tracking for cleanup
+    expressions: std.ArrayList([]const Expression),
+    statements: std.ArrayList([]const Statement),
+    typed_names: std.ArrayList([]const TypedName),
+    identifiers: std.ArrayList([]const Identifier),
+    cases: std.ArrayList([]const Case),
+    objects: std.ArrayList([]const Object),
+    data_sections: std.ArrayList([]const DataSection),
+
+    pub fn init(allocator: Allocator) AstBuilder {
+        return .{
+            .allocator = allocator,
+            .expressions = .empty,
+            .statements = .empty,
+            .typed_names = .empty,
+            .identifiers = .empty,
+            .cases = .empty,
+            .objects = .empty,
+            .data_sections = .empty,
+        };
+    }
+
+    pub fn deinit(self: *AstBuilder) void {
+        for (self.expressions.items) |s| self.allocator.free(s);
+        for (self.statements.items) |s| self.allocator.free(s);
+        for (self.typed_names.items) |s| self.allocator.free(s);
+        for (self.identifiers.items) |s| self.allocator.free(s);
+        for (self.cases.items) |s| self.allocator.free(s);
+        for (self.objects.items) |s| self.allocator.free(s);
+        for (self.data_sections.items) |s| self.allocator.free(s);
+
+        self.expressions.deinit(self.allocator);
+        self.statements.deinit(self.allocator);
+        self.typed_names.deinit(self.allocator);
+        self.identifiers.deinit(self.allocator);
+        self.cases.deinit(self.allocator);
+        self.objects.deinit(self.allocator);
+        self.data_sections.deinit(self.allocator);
+    }
+
+    // Allocation helpers
+    pub fn dupeExpressions(self: *AstBuilder, items: []const Expression) ![]const Expression {
+        const copy = try self.allocator.dupe(Expression, items);
+        if (copy.len > 0) try self.expressions.append(self.allocator, copy);
+        return copy;
+    }
+
+    pub fn dupeStatements(self: *AstBuilder, items: []const Statement) ![]const Statement {
+        const copy = try self.allocator.dupe(Statement, items);
+        if (copy.len > 0) try self.statements.append(self.allocator, copy);
+        return copy;
+    }
+
+    pub fn dupeTypedNames(self: *AstBuilder, items: []const TypedName) ![]const TypedName {
+        const copy = try self.allocator.dupe(TypedName, items);
+        if (copy.len > 0) try self.typed_names.append(self.allocator, copy);
+        return copy;
+    }
+
+    pub fn dupeIdentifiers(self: *AstBuilder, items: []const Identifier) ![]const Identifier {
+        const copy = try self.allocator.dupe(Identifier, items);
+        if (copy.len > 0) try self.identifiers.append(self.allocator, copy);
+        return copy;
+    }
+
+    pub fn dupeCases(self: *AstBuilder, items: []const Case) ![]const Case {
+        const copy = try self.allocator.dupe(Case, items);
+        if (copy.len > 0) try self.cases.append(self.allocator, copy);
+        return copy;
+    }
+
+    pub fn dupeObjects(self: *AstBuilder, items: []const Object) ![]const Object {
+        const copy = try self.allocator.dupe(Object, items);
+        if (copy.len > 0) try self.objects.append(self.allocator, copy);
+        return copy;
+    }
+
+    pub fn dupeDataSections(self: *AstBuilder, items: []const DataSection) ![]const DataSection {
+        const copy = try self.allocator.dupe(DataSection, items);
+        if (copy.len > 0) try self.data_sections.append(self.allocator, copy);
+        return copy;
+    }
+
+    // High-level builders
+
+    /// Create a function call expression
+    pub fn call(self: *AstBuilder, name: YulName, args: []const Expression) !Expression {
+        return Expression.call(name, try self.dupeExpressions(args));
+    }
+
+    /// Create a variable declaration
+    pub fn varDecl(self: *AstBuilder, names: []const []const u8, value: ?Expression) !Statement {
+        var typed: [16]TypedName = undefined;
+        for (names, 0..) |n, i| {
+            typed[i] = TypedName.init(n);
+        }
+        return Statement.varDecl(try self.dupeTypedNames(typed[0..names.len]), value);
+    }
+
+    /// Create an assignment
+    pub fn assign(self: *AstBuilder, names: []const []const u8, value: Expression) !Statement {
+        var ids: [16]Identifier = undefined;
+        for (names, 0..) |n, i| {
+            ids[i] = Identifier.init(n);
+        }
+        return Statement.assign(try self.dupeIdentifiers(ids[0..names.len]), value);
+    }
+
+    /// Create a block
+    pub fn block(self: *AstBuilder, stmts: []const Statement) !Block {
+        return Block.init(try self.dupeStatements(stmts));
+    }
+
+    /// Create a function definition
+    pub fn funcDef(
+        self: *AstBuilder,
+        name: YulName,
+        params: []const []const u8,
+        returns: []const []const u8,
+        body: Block,
+    ) !Statement {
+        var param_typed: [16]TypedName = undefined;
+        for (params, 0..) |p, i| {
+            param_typed[i] = TypedName.init(p);
+        }
+
+        var return_typed: [16]TypedName = undefined;
+        for (returns, 0..) |r, i| {
+            return_typed[i] = TypedName.init(r);
+        }
+
+        return Statement.funcDef(
+            name,
+            try self.dupeTypedNames(param_typed[0..params.len]),
+            try self.dupeTypedNames(return_typed[0..returns.len]),
+            body,
+        );
+    }
+
+    /// Create a switch statement
+    pub fn switchStmt(self: *AstBuilder, expr: Expression, cases: []const Case) !Statement {
+        return Statement.switchStmt(expr, try self.dupeCases(cases));
+    }
+
+    /// Create an if statement
+    pub fn ifStmt(_: *AstBuilder, cond: Expression, body: Block) Statement {
+        return Statement.ifStmt(cond, body);
+    }
+
+    /// Create a for loop
+    pub fn forLoop(self: *AstBuilder, pre: Block, cond: Expression, post: Block, body: Block) Statement {
+        _ = self;
+        return Statement.forStmt(pre, cond, post, body);
+    }
+
+    /// Create an object
+    pub fn object(
+        self: *AstBuilder,
+        name: YulName,
+        code: Block,
+        sub_objects: []const Object,
+        data: []const DataSection,
+    ) !Object {
+        return Object.init(
+            name,
+            code,
+            try self.dupeObjects(sub_objects),
+            try self.dupeDataSections(data),
+        );
+    }
+};
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+test "create literal expression" {
+    const lit = Literal.number(42);
+    try std.testing.expectEqual(LiteralKind.number, lit.kind);
+    try std.testing.expectEqual(@as(u256, 42), lit.value.number);
+}
+
+test "create function call" {
+    const call_expr = Expression.call("add", &.{
+        Expression.lit(Literal.number(1)),
+        Expression.lit(Literal.number(2)),
+    });
+
+    try std.testing.expect(call_expr == .function_call);
+    try std.testing.expectEqualStrings("add", call_expr.function_call.function_name);
+    try std.testing.expectEqual(@as(usize, 2), call_expr.function_call.arguments.len);
+}
+
+test "create variable declaration" {
+    const var_decl = Statement.varDecl(
+        &.{TypedName.init("x")},
+        Expression.lit(Literal.number(42)),
+    );
+
+    try std.testing.expect(var_decl == .variable_declaration);
+    try std.testing.expectEqualStrings("x", var_decl.variable_declaration.variables[0].name);
+}
+
+test "AstBuilder creates function" {
+    const allocator = std.testing.allocator;
+    var builder = AstBuilder.init(allocator);
+    defer builder.deinit();
+
+    const body = try builder.block(&.{
+        Statement.leaveStmt(),
+    });
+
+    const func = try builder.funcDef("myFunc", &.{"a"}, &.{"result"}, body);
+
+    try std.testing.expect(func == .function_definition);
+    try std.testing.expectEqualStrings("myFunc", func.function_definition.name);
+    try std.testing.expectEqual(@as(usize, 1), func.function_definition.parameters.len);
+    try std.testing.expectEqual(@as(usize, 1), func.function_definition.return_variables.len);
+}
