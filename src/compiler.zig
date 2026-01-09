@@ -581,9 +581,7 @@ pub const Compiler = struct {
             if (var_decl.init_node.unwrap()) |init_idx| {
                 if (self.isStructInitTag(p.getNodeTag(init_idx))) {
                     if (try self.structInitTypeNameLegacy(init_idx)) |type_name| {
-                        const key = try self.allocator.dupe(u8, name);
-                        const val = try self.allocator.dupe(u8, type_name);
-                        try self.local_struct_vars.put(key, val);
+                        try self.setLocalStructVarLegacy(name, type_name);
                     }
                 }
                 value = try self.translateExpression(init_idx);
@@ -608,9 +606,7 @@ pub const Compiler = struct {
         if (target_tag == .identifier and self.isStructInitTag(value_tag)) {
             const target_name = p.getNodeSource(target_node);
             if (try self.structInitTypeNameLegacy(value_node)) |type_name| {
-                const key = try self.allocator.dupe(u8, target_name);
-                const val = try self.allocator.dupe(u8, type_name);
-                try self.local_struct_vars.put(key, val);
+                try self.setLocalStructVarLegacy(target_name, type_name);
             }
         }
 
@@ -1536,6 +1532,17 @@ pub const Compiler = struct {
             len += 1;
         }
         return try std.fmt.allocPrint(self.allocator, "{s}", .{buf[0..len]});
+    }
+
+    fn setLocalStructVarLegacy(self: *Self, name: []const u8, type_name: []const u8) !void {
+        if (self.local_struct_vars.getEntry(name)) |entry| {
+            self.allocator.free(entry.value_ptr.*);
+            entry.value_ptr.* = try self.allocator.dupe(u8, type_name);
+            return;
+        }
+        const key = try self.allocator.dupe(u8, name);
+        const val = try self.allocator.dupe(u8, type_name);
+        try self.local_struct_vars.put(key, val);
     }
 
     /// Generate complete Yul object
