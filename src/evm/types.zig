@@ -174,6 +174,9 @@ pub const TypeMapper = struct {
     pub fn deinit(self: *Self) void {
         var it = self.type_cache.iterator();
         while (it.next()) |entry| {
+            // Free the duped key string
+            self.allocator.free(entry.key_ptr.*);
+            // Free the EvmType value
             self.allocator.destroy(entry.value_ptr.*);
         }
         self.type_cache.deinit();

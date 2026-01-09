@@ -109,7 +109,12 @@ fn printUsage() !void {
     var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
     const stdout = &stdout_writer.interface;
 
-    try stdout.writeAll(
+    try printUsageTo(stdout);
+    try stdout.flush();
+}
+
+fn printUsageTo(writer: anytype) !void {
+    try writer.writeAll(
         \\zig-to-yul - Compile Zig smart contracts to Yul
         \\
         \\USAGE:
@@ -128,7 +133,6 @@ fn printUsage() !void {
         \\    solc --strict-assembly token.yul --bin
         \\
     );
-    try stdout.flush();
 }
 
 fn printVersion() !void {
@@ -136,11 +140,15 @@ fn printVersion() !void {
     var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
     const stdout = &stdout_writer.interface;
 
-    try stdout.writeAll("zig-to-yul 0.1.0\n");
+    try printVersionTo(stdout);
     try stdout.flush();
 }
 
+fn printVersionTo(writer: anytype) !void {
+    try writer.writeAll("zig-to-yul 0.1.0\n");
+}
+
 test "cli help" {
-    // Just ensure the function compiles
-    try printUsage();
+    // Avoid stdout in tests so `zig build test` can run with --listen.
+    try printUsageTo(std.io.null_writer);
 }

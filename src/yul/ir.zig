@@ -116,9 +116,39 @@ pub const Object = struct {
 /// Builder for constructing Yul IR
 pub const Builder = struct {
     allocator: Allocator,
+    // Use arena-style allocation tracking - store raw byte slices
+    alloc_exprs: std.ArrayList([]const Expression),
+    alloc_stmts: std.ArrayList([]const Statement),
+    alloc_strs: std.ArrayList([]const []const u8),
+    alloc_cases: std.ArrayList([]const Statement.SwitchStatement.Case),
+    alloc_objs: std.ArrayList([]const Object),
+    alloc_data: std.ArrayList([]const DataSection),
 
     pub fn init(allocator: Allocator) Builder {
-        return .{ .allocator = allocator };
+        return .{
+            .allocator = allocator,
+            .alloc_exprs = .empty,
+            .alloc_stmts = .empty,
+            .alloc_strs = .empty,
+            .alloc_cases = .empty,
+            .alloc_objs = .empty,
+            .alloc_data = .empty,
+        };
+    }
+
+    pub fn deinit(self: *Builder) void {
+        for (self.alloc_exprs.items) |s| self.allocator.free(s);
+        for (self.alloc_stmts.items) |s| self.allocator.free(s);
+        for (self.alloc_strs.items) |s| self.allocator.free(s);
+        for (self.alloc_cases.items) |s| self.allocator.free(s);
+        for (self.alloc_objs.items) |s| self.allocator.free(s);
+        for (self.alloc_data.items) |s| self.allocator.free(s);
+        self.alloc_exprs.deinit(self.allocator);
+        self.alloc_stmts.deinit(self.allocator);
+        self.alloc_strs.deinit(self.allocator);
+        self.alloc_cases.deinit(self.allocator);
+        self.alloc_objs.deinit(self.allocator);
+        self.alloc_data.deinit(self.allocator);
     }
 
     // Expression builders
@@ -144,6 +174,7 @@ pub const Builder = struct {
 
     pub fn call(self: *Builder, name: []const u8, args: []const Expression) !Expression {
         const args_copy = try self.allocator.dupe(Expression, args);
+        if (args_copy.len > 0) try self.alloc_exprs.append(self.allocator, args_copy);
         return .{ .function_call = .{
             .name = name,
             .arguments = args_copy,
@@ -153,6 +184,7 @@ pub const Builder = struct {
     // Statement builders
     pub fn variable(self: *Builder, names: []const []const u8, value: ?Expression) !Statement {
         const names_copy = try self.allocator.dupe([]const u8, names);
+        if (names_copy.len > 0) try self.alloc_strs.append(self.allocator, names_copy);
         return .{ .variable_decl = .{
             .names = names_copy,
             .value = value,
@@ -161,6 +193,7 @@ pub const Builder = struct {
 
     pub fn assign(self: *Builder, targets: []const []const u8, value: Expression) !Statement {
         const targets_copy = try self.allocator.dupe([]const u8, targets);
+        if (targets_copy.len > 0) try self.alloc_strs.append(self.allocator, targets_copy);
         return .{ .assignment = .{
             .targets = targets_copy,
             .value = value,
@@ -169,6 +202,7 @@ pub const Builder = struct {
 
     pub fn if_stmt(self: *Builder, condition: Expression, body: []const Statement) !Statement {
         const body_copy = try self.allocator.dupe(Statement, body);
+        if (body_copy.len > 0) try self.alloc_stmts.append(self.allocator, body_copy);
         return .{ .if_stmt = .{
             .condition = condition,
             .body = body_copy,
@@ -182,7 +216,12 @@ pub const Builder = struct {
         default: ?[]const Statement,
     ) !Statement {
         const cases_copy = try self.allocator.dupe(Statement.SwitchStatement.Case, cases);
-        const default_copy = if (default) |d| try self.allocator.dupe(Statement, d) else null;
+        if (cases_copy.len > 0) try self.alloc_cases.append(self.allocator, cases_copy);
+        const default_copy = if (default) |d| blk: {
+            const copy = try self.allocator.dupe(Statement, d);
+            if (copy.len > 0) try self.alloc_stmts.append(self.allocator, copy);
+            break :blk copy;
+        } else null;
         return .{ .switch_stmt = .{
             .expression = expr,
             .cases = cases_copy,
@@ -197,11 +236,17 @@ pub const Builder = struct {
         post: []const Statement,
         body: []const Statement,
     ) !Statement {
+        const init_copy = try self.allocator.dupe(Statement, init_stmts);
+        if (init_copy.len > 0) try self.alloc_stmts.append(self.allocator, init_copy);
+        const post_copy = try self.allocator.dupe(Statement, post);
+        if (post_copy.len > 0) try self.alloc_stmts.append(self.allocator, post_copy);
+        const body_copy = try self.allocator.dupe(Statement, body);
+        if (body_copy.len > 0) try self.alloc_stmts.append(self.allocator, body_copy);
         return .{ .for_loop = .{
-            .init = try self.allocator.dupe(Statement, init_stmts),
+            .init = init_copy,
             .condition = condition,
-            .post = try self.allocator.dupe(Statement, post),
-            .body = try self.allocator.dupe(Statement, body),
+            .post = post_copy,
+            .body = body_copy,
         } };
     }
 
@@ -212,17 +257,25 @@ pub const Builder = struct {
         returns: []const []const u8,
         body: []const Statement,
     ) !Statement {
+        const params_copy = try self.allocator.dupe([]const u8, params);
+        if (params_copy.len > 0) try self.alloc_strs.append(self.allocator, params_copy);
+        const returns_copy = try self.allocator.dupe([]const u8, returns);
+        if (returns_copy.len > 0) try self.alloc_strs.append(self.allocator, returns_copy);
+        const body_copy = try self.allocator.dupe(Statement, body);
+        if (body_copy.len > 0) try self.alloc_stmts.append(self.allocator, body_copy);
         return .{ .function_def = .{
             .name = name,
-            .parameters = try self.allocator.dupe([]const u8, params),
-            .returns = try self.allocator.dupe([]const u8, returns),
-            .body = try self.allocator.dupe(Statement, body),
+            .parameters = params_copy,
+            .returns = returns_copy,
+            .body = body_copy,
         } };
     }
 
     pub fn block(self: *Builder, stmts: []const Statement) !Statement {
+        const stmts_copy = try self.allocator.dupe(Statement, stmts);
+        if (stmts_copy.len > 0) try self.alloc_stmts.append(self.allocator, stmts_copy);
         return .{ .block = .{
-            .statements = try self.allocator.dupe(Statement, stmts),
+            .statements = stmts_copy,
         } };
     }
 
@@ -233,11 +286,17 @@ pub const Builder = struct {
         sub_objects: []const Object,
         data: []const DataSection,
     ) !Object {
+        const code_copy = try self.allocator.dupe(Statement, code);
+        if (code_copy.len > 0) try self.alloc_stmts.append(self.allocator, code_copy);
+        const sub_copy = try self.allocator.dupe(Object, sub_objects);
+        if (sub_copy.len > 0) try self.alloc_objs.append(self.allocator, sub_copy);
+        const data_copy = try self.allocator.dupe(DataSection, data);
+        if (data_copy.len > 0) try self.alloc_data.append(self.allocator, data_copy);
         return .{
             .name = name,
-            .code = try self.allocator.dupe(Statement, code),
-            .sub_objects = try self.allocator.dupe(Object, sub_objects),
-            .data_sections = try self.allocator.dupe(DataSection, data),
+            .code = code_copy,
+            .sub_objects = sub_copy,
+            .data_sections = data_copy,
         };
     }
 };
@@ -245,6 +304,7 @@ pub const Builder = struct {
 test "build simple expression" {
     const allocator = std.testing.allocator;
     var builder = Builder.init(allocator);
+    defer builder.deinit();
 
     const expr = try builder.call("add", &.{
         builder.literal_num(1),
@@ -254,6 +314,4 @@ test "build simple expression" {
     try std.testing.expect(expr == .function_call);
     try std.testing.expectEqualStrings("add", expr.function_call.name);
     try std.testing.expectEqual(@as(usize, 2), expr.function_call.arguments.len);
-
-    allocator.free(expr.function_call.arguments);
 }

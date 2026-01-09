@@ -289,6 +289,7 @@ pub const CodeGenerator = struct {
 test "generate simple object" {
     const allocator = std.testing.allocator;
     var builder = ir.Builder.init(allocator);
+    defer builder.deinit();
 
     // Build: object "Test" { code { let x := 42 } }
     const stmt = try builder.variable(&.{"x"}, builder.literal_num(42));
@@ -303,13 +304,12 @@ test "generate simple object" {
 
     try std.testing.expect(std.mem.indexOf(u8, code, "object \"Test\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, code, "let x := 42") != null);
-
-    allocator.free(stmt.variable_decl.names);
 }
 
 test "generate function" {
     const allocator = std.testing.allocator;
     var builder = ir.Builder.init(allocator);
+    defer builder.deinit();
 
     // Build: function add(a, b) -> result { result := add(a, b) }
     const add_call = try builder.call("add", &.{
@@ -327,12 +327,4 @@ test "generate function" {
     defer allocator.free(code);
 
     try std.testing.expect(std.mem.indexOf(u8, code, "function myAdd(a, b) -> result") != null);
-
-    // Cleanup
-    allocator.free(add_call.function_call.arguments);
-    allocator.free(assign.assignment.targets);
-    allocator.free(func.function_def.parameters);
-    allocator.free(func.function_def.returns);
-    allocator.free(func.function_def.body);
-    allocator.free(obj.code);
 }

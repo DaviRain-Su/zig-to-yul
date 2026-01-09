@@ -25,6 +25,9 @@ pub const Compiler = struct {
     functions: std.ArrayList(yul_ir.Statement),
     storage_vars: std.ArrayList(StorageVar),
 
+    // Track allocated strings for cleanup
+    temp_strings: std.ArrayList([]const u8),
+
     const Self = @This();
 
     pub const StorageVar = struct {
@@ -57,6 +60,7 @@ pub const Compiler = struct {
             .current_contract = null,
             .functions = .empty,
             .storage_vars = .empty,
+            .temp_strings = .empty,
         };
     }
 
@@ -66,9 +70,16 @@ pub const Compiler = struct {
         }
         self.symbol_table.deinit();
         self.type_mapper.deinit();
+        self.ir_builder.deinit();
         self.errors.deinit(self.allocator);
         self.functions.deinit(self.allocator);
         self.storage_vars.deinit(self.allocator);
+
+        // Free all temporary strings
+        for (self.temp_strings.items) |s| {
+            self.allocator.free(s);
+        }
+        self.temp_strings.deinit(self.allocator);
     }
 
     /// Compile Zig source to Yul
@@ -521,6 +532,7 @@ pub const Compiler = struct {
 
         // Create deployed object
         const deployed_name = try std.fmt.allocPrint(self.allocator, "{s}_deployed", .{name});
+        try self.temp_strings.append(self.allocator, deployed_name);
         const deployed_obj = try self.ir_builder.object(
             deployed_name,
             deployed_code.items,
@@ -602,10 +614,6 @@ test "compile simple contract" {
     defer compiler.deinit();
 
     const result = compiler.compile(source_z) catch |err| {
-        std.debug.print("Compile error: {}\n", .{err});
-        for (compiler.getErrors()) |e| {
-            std.debug.print("  {s} at {}:{}\n", .{ e.message, e.line, e.column });
-        }
         return err;
     };
     defer allocator.free(result);
