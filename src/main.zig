@@ -31,6 +31,8 @@ pub fn main() !void {
         try runBuild(allocator, args[2..]);
     } else if (std.mem.eql(u8, command, "decode-event")) {
         try runDecodeEvent(allocator, args[2..]);
+    } else if (std.mem.eql(u8, command, "decode-abi")) {
+        try runDecodeAbi(allocator, args[2..]);
     } else if (std.mem.eql(u8, command, "version") or std.mem.eql(u8, command, "--version") or std.mem.eql(u8, command, "-v")) {
         printVersionStdout();
     } else if (std.mem.eql(u8, command, "help") or std.mem.eql(u8, command, "--help") or std.mem.eql(u8, command, "-h")) {
@@ -232,6 +234,17 @@ const DecodeEventOptions = struct {
     }
 };
 
+const DecodeAbiOptions = struct {
+    types: std.ArrayList([]const u8) = .empty,
+    data: ?[]const u8 = null,
+    calldata: bool = false,
+
+    pub fn deinit(self: *DecodeAbiOptions, allocator: std.mem.Allocator) void {
+        self.types.deinit(allocator);
+        if (self.data) |d| allocator.free(d);
+    }
+};
+
 fn runDecodeEvent(allocator: std.mem.Allocator, args: []const []const u8) !void {
     var opts = DecodeEventOptions{};
     defer opts.deinit(allocator);
@@ -287,6 +300,55 @@ fn runDecodeEvent(allocator: std.mem.Allocator, args: []const []const u8) !void 
         try writer.print("- {s} ({s})", .{ field.name, field.abi_type });
         if (field.indexed) try writer.writeAll(" indexed");
         try writer.writeAll(": ");
+        try event_decode.writeValue(writer, field.value);
+        try writer.writeAll("\n");
+    }
+    stdout.writeAll(stream.getWritten()) catch {};
+}
+
+fn runDecodeAbi(allocator: std.mem.Allocator, args: []const []const u8) !void {
+    var opts = DecodeAbiOptions{};
+    defer opts.deinit(allocator);
+
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
+            printDecodeAbiUsageStderr();
+            return;
+        } else if (std.mem.eql(u8, arg, "--type")) {
+            i += 1;
+            if (i >= args.len) return invalidDecodeAbi();
+            try opts.types.append(allocator, args[i]);
+        } else if (std.mem.eql(u8, arg, "--data")) {
+            i += 1;
+            if (i >= args.len) return invalidDecodeAbi();
+            if (opts.data != null) return invalidDecodeAbi();
+            opts.data = parseHexAlloc(allocator, args[i]) catch return invalidDecodeAbi();
+        } else if (std.mem.eql(u8, arg, "--calldata")) {
+            opts.calldata = true;
+        } else {
+            return invalidDecodeAbi();
+        }
+    }
+
+    if (opts.data == null or opts.types.items.len == 0) {
+        return invalidDecodeAbi();
+    }
+
+    const decoded = if (opts.calldata)
+        try event_decode.decodeCalldata(allocator, opts.types.items, opts.data.?)
+    else
+        try event_decode.decodeAbi(allocator, opts.types.items, opts.data.?);
+    defer decoded.deinit(allocator);
+
+    const stdout = std.fs.File.stdout();
+    var buf: [4096]u8 = undefined;
+    var stream = std.io.fixedBufferStream(&buf);
+    const writer = stream.writer();
+
+    for (decoded.fields, 0..) |field, idx| {
+        try writer.print("- arg{d} ({s}): ", .{ idx, field.abi_type });
         try event_decode.writeValue(writer, field.value);
         try writer.writeAll("\n");
     }
@@ -363,6 +425,11 @@ fn hexNibble(c: u8) !u8 {
 
 fn invalidDecodeEvent() !void {
     printDecodeEventUsageStderr();
+    std.process.exit(1);
+}
+
+fn invalidDecodeAbi() !void {
+    printDecodeAbiUsageStderr();
     std.process.exit(1);
 }
 
@@ -585,6 +652,7 @@ fn printUsageStderr() void {
         \\    compile     Compile Zig to Yul intermediate language
         \\    build       Compile Zig to EVM bytecode (requires solc)
         \\    decode-event Decode EVM event logs
+        \\    decode-abi  Decode ABI-encoded data
         \\    version     Print version information
         \\    help        Print this help message
         \\
@@ -633,6 +701,23 @@ fn printDecodeEventUsageStderr() void {
     , .{});
 }
 
+fn printDecodeAbiUsageStderr() void {
+    std.debug.print(
+        \\USAGE: zig-to-yul decode-abi [options]
+        \\
+        \\OPTIONS:
+        \\    --type <abi>           ABI type (repeatable)
+        \\    --data <hex>           ABI data hex
+        \\    --calldata             Data includes 4-byte selector
+        \\    -h, --help             Print help
+        \\
+        \\EXAMPLE:
+        \\    zig-to-yul decode-abi --type uint256 --type string --data 0x...
+        \\    zig-to-yul decode-abi --type address --calldata --data 0x...
+        \\
+    , .{});
+}
+
 fn printBuildUsageStderr() void {
     std.debug.print(
         \\USAGE: zig-to-yul build [options] <input.zig>
@@ -664,6 +749,7 @@ fn printUsageTo(writer: anytype) !void {
         \\    compile     Compile Zig to Yul intermediate language
         \\    build       Compile Zig to EVM bytecode (requires solc)
         \\    decode-event Decode EVM event logs
+        \\    decode-abi  Decode ABI-encoded data
         \\    version     Print version information
         \\    help        Print this help message
         \\
@@ -690,6 +776,9 @@ fn printUsageTo(writer: anytype) !void {
         \\    # Decode an event log
         \\    zig-to-yul decode-event --event Transfer --param from:address:indexed \\
         \\      --param to:address:indexed --param value:uint256 --topic 0x... --data 0x...
+        \\
+        \\    # Decode ABI data
+        \\    zig-to-yul decode-abi --type uint256 --type string --data 0x...
         \\
         \\For more information, visit: https://github.com/example/zig-to-yul
         \\

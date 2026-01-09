@@ -26,6 +26,33 @@ pub const Event = struct {
     anonymous: bool = false,
 };
 
+pub fn decodeAbi(allocator: Allocator, abi_types: []const []const u8, data: []const u8) DecodeErrorSet!DecodedEvent {
+    const params = try allocator.alloc(EventParam, abi_types.len);
+    defer allocator.free(params);
+
+    for (abi_types, 0..) |t, i| {
+        params[i] = .{
+            .name = "arg",
+            .abi_type = t,
+            .indexed = false,
+            .indexed_data = null,
+        };
+    }
+
+    const event = Event{
+        .name = "abi",
+        .params = params,
+        .anonymous = true,
+    };
+
+    return decodeEvent(allocator, event, &.{}, data);
+}
+
+pub fn decodeCalldata(allocator: Allocator, abi_types: []const []const u8, calldata: []const u8) DecodeErrorSet!DecodedEvent {
+    if (calldata.len < 4) return error.InvalidData;
+    return decodeAbi(allocator, abi_types, calldata[4..]);
+}
+
 pub fn eventSignatureHash(allocator: Allocator, event: Event) ![32]u8 {
     var sig_buf: std.ArrayList(u8) = .empty;
     defer sig_buf.deinit(allocator);
@@ -1076,6 +1103,33 @@ test "decode indexed string with preimage" {
 
     const value = decoded.fields[0].value;
     try std.testing.expect(std.mem.eql(u8, value.string, "hi"));
+}
+
+test "decode abi parameters" {
+    const allocator = std.testing.allocator;
+
+    const abi_types = &.{ "uint256", "string" };
+    var data: [96]u8 = undefined;
+    @memset(&data, 0);
+    writeU256Be(data[0..32], 7);
+    writeU256Be(data[32..64], 64);
+    writeU256Be(data[64..96], 3);
+
+    var extra: [32]u8 = undefined;
+    @memset(&extra, 0);
+    extra[0] = 'f';
+    extra[1] = 'o';
+    extra[2] = 'o';
+
+    var full: [128]u8 = undefined;
+    @memcpy(full[0..96], data[0..96]);
+    @memcpy(full[96..128], extra[0..]);
+
+    const decoded = try decodeAbi(allocator, abi_types, full[0..]);
+    defer decoded.deinit(allocator);
+    try std.testing.expect(decoded.fields.len == 2);
+    try std.testing.expect(decoded.fields[0].value.uint256 == 7);
+    try std.testing.expect(std.mem.eql(u8, decoded.fields[1].value.string, "foo"));
 }
 
 test "event signature validation" {

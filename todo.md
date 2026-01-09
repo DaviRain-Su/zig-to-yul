@@ -1,7 +1,6 @@
 • 目前的 TODO 清单（汇总自 docs/libyul-comparison.md 的未完成/部分实现项）：
 
 - 预编译合约封装未实现（5.2：0x01-0x0a）
-- ABI 解码部分实现（5.3）
 - Gas 估算仅静态估算（5.3）
 - Yul 优化器仅 peephole 基础实现（5.3）
 - for 循环仅部分支持（6.3）
