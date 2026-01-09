@@ -609,8 +609,12 @@ pub const Transformer = struct {
         const p = &self.zig_parser.?;
         const token = p.getMainToken(index);
         const loc = p.ast.tokens.get(token);
-        try self.addError(msg, .{ .start = loc.start, .end = loc.start + 1 }, .type_error);
-        _ = err;
+        // Include error name in message
+        const full_msg = std.fmt.allocPrint(self.allocator, "{s}: {s}", .{ msg, @errorName(err) }) catch msg;
+        if (full_msg.ptr != msg.ptr) {
+            try self.temp_strings.append(self.allocator, full_msg);
+        }
+        try self.addError(full_msg, .{ .start = loc.start, .end = loc.start + 1 }, .type_error);
     }
 
     fn reportUnsupportedExpr(self: *Self, index: ZigAst.Node.Index) !void {

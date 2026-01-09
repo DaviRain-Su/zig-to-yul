@@ -658,8 +658,12 @@ pub const Compiler = struct {
         const p = &self.zig_parser.?;
         const token = p.getMainToken(index);
         const loc = p.getLocation(p.ast.tokens.get(token).start);
-        try self.addError(msg, loc.line, loc.column, .type_error);
-        _ = err;
+        // Include error name in message
+        const full_msg = std.fmt.allocPrint(self.allocator, "{s}: {s}", .{ msg, @errorName(err) }) catch msg;
+        if (full_msg.ptr != msg.ptr) {
+            try self.temp_strings.append(self.allocator, full_msg);
+        }
+        try self.addError(full_msg, loc.line, loc.column, .type_error);
     }
 
     fn reportUnsupportedExprLegacy(self: *Self, index: Ast.Node.Index) !void {

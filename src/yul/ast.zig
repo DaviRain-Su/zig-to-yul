@@ -54,6 +54,7 @@ pub const EvmFeature = enum {
     blobhash, // Cancun+
     blobbasefee, // Cancun+
     mcopy, // Cancun+
+    tload_tstore, // Cancun+ (transient storage)
 
     pub fn minVersion(self: EvmFeature) EvmVersion {
         return switch (self) {
@@ -63,7 +64,7 @@ pub const EvmFeature = enum {
             .basefee => .london,
             .prevrandao => .paris,
             .push0 => .shanghai,
-            .blobhash, .blobbasefee, .mcopy => .cancun,
+            .blobhash, .blobbasefee, .mcopy, .tload_tstore => .cancun,
         };
     }
 };
@@ -117,6 +118,9 @@ pub const Dialect = struct {
         }
         if (std.mem.eql(u8, name, "mcopy")) {
             return self.evm_version.hasFeature(.mcopy);
+        }
+        if (std.mem.eql(u8, name, "tload") or std.mem.eql(u8, name, "tstore")) {
+            return self.evm_version.hasFeature(.tload_tstore);
         }
 
         // All other builtins are always available
@@ -239,40 +243,59 @@ pub const BuiltinName = struct {
     }
 
     /// Check if a name is a known EVM builtin
+    /// Based on libyul EVMDialect and Solidity Yul specification
     pub fn isBuiltin(name: YulName) bool {
         const builtins = [_][]const u8{
-            // Arithmetic
-            "add", "sub", "mul", "div", "sdiv", "mod", "smod", "exp",
-            "not", "lt", "gt", "slt", "sgt", "eq", "iszero",
-            "and", "or", "xor", "byte", "shl", "shr", "sar",
-            "addmod", "mulmod", "signextend", "keccak256",
+            // Arithmetic (all EVM versions)
+            "add",       "sub",       "mul",       "div",       "sdiv",
+            "mod",       "smod",      "exp",       "not",       "lt",
+            "gt",        "slt",       "sgt",       "eq",        "iszero",
+            "and",       "or",        "xor",       "byte",      "addmod",
+            "mulmod",    "signextend", "keccak256",
+            // Bitwise shifts (Constantinople+)
+            "shl",       "shr",       "sar",
             // Memory
-            "mload", "mstore", "mstore8", "msize",
+            "mload",     "mstore",    "mstore8",   "msize",
+            "mcopy", // Cancun+
             // Storage
-            "sload", "sstore",
+            "sload",     "sstore",
+            // Transient storage (Cancun+)
+            "tload",     "tstore",
             // Call data
             "calldataload", "calldatasize", "calldatacopy",
             // Code
-            "codesize", "codecopy", "extcodesize", "extcodecopy", "extcodehash",
-            // Return data
+            "codesize",  "codecopy",  "extcodesize", "extcodecopy", "extcodehash",
+            // Return data (Byzantium+)
             "returndatasize", "returndatacopy",
             // Block info
-            "blockhash", "coinbase", "timestamp", "number", "prevrandao", "gaslimit",
-            "chainid", "selfbalance", "basefee", "blobhash", "blobbasefee",
+            "blockhash", "coinbase",  "timestamp", "number",    "gaslimit",
+            "difficulty", // Pre-Paris (deprecated but valid for older EVM)
+            "prevrandao", // Paris+ (replaces difficulty)
+            "chainid", // Istanbul+
+            "selfbalance", // Istanbul+
+            "basefee", // London+
+            "blobhash", // Cancun+
+            "blobbasefee", // Cancun+
             // Transaction
-            "origin", "gasprice", "gas",
+            "origin",    "gasprice",  "gas",
             // Account
-            "balance", "address", "caller", "callvalue",
+            "balance",   "address",   "caller",    "callvalue",
             // Control flow
-            "stop", "return", "revert", "invalid", "selfdestruct",
-            // Calls
-            "call", "callcode", "delegatecall", "staticcall", "create", "create2",
+            "stop",      "return",    "revert",    "invalid",   "selfdestruct",
+            // External calls
+            "call",      "callcode",  "delegatecall",
+            "staticcall", // Byzantium+
+            "create",    "create2", // Constantinople+
             // Logging
-            "log0", "log1", "log2", "log3", "log4",
-            // Data
-            "datasize", "dataoffset", "datacopy",
-            // Misc
-            "pop", "dup1", "swap1", "verbatim",
+            "log0",      "log1",      "log2",      "log3",      "log4",
+            // Yul object data
+            "datasize",  "dataoffset", "datacopy",
+            // Yul-specific helpers
+            "memoryguard", // Yul memory guard for optimizer
+            "loadimmutable", "setimmutable", // Yul immutable support
+            "linkersymbol", // Linker placeholder
+            // Stack operations (limited in Yul)
+            "pop",
         };
 
         for (builtins) |b| {
@@ -682,20 +705,20 @@ pub const AstBuilder = struct {
 
     /// Create a variable declaration
     pub fn varDecl(self: *AstBuilder, names: []const []const u8, value: ?Expression) !Statement {
-        var typed: [16]TypedName = undefined;
+        const typed = try self.allocator.alloc(TypedName, names.len);
         for (names, 0..) |n, i| {
             typed[i] = TypedName.init(n);
         }
-        return Statement.varDecl(try self.dupeTypedNames(typed[0..names.len]), value);
+        return Statement.varDecl(typed, value);
     }
 
     /// Create an assignment
     pub fn assign(self: *AstBuilder, names: []const []const u8, value: Expression) !Statement {
-        var ids: [16]Identifier = undefined;
+        const ids = try self.allocator.alloc(Identifier, names.len);
         for (names, 0..) |n, i| {
             ids[i] = Identifier.init(n);
         }
-        return Statement.assign(try self.dupeIdentifiers(ids[0..names.len]), value);
+        return Statement.assign(ids, value);
     }
 
     /// Create a block
@@ -711,22 +734,17 @@ pub const AstBuilder = struct {
         returns: []const []const u8,
         body: Block,
     ) !Statement {
-        var param_typed: [16]TypedName = undefined;
+        const param_typed = try self.allocator.alloc(TypedName, params.len);
         for (params, 0..) |p, i| {
             param_typed[i] = TypedName.init(p);
         }
 
-        var return_typed: [16]TypedName = undefined;
+        const return_typed = try self.allocator.alloc(TypedName, returns.len);
         for (returns, 0..) |r, i| {
             return_typed[i] = TypedName.init(r);
         }
 
-        return Statement.funcDef(
-            name,
-            try self.dupeTypedNames(param_typed[0..params.len]),
-            try self.dupeTypedNames(return_typed[0..returns.len]),
-            body,
-        );
+        return Statement.funcDef(name, param_typed, return_typed, body);
     }
 
     /// Create a switch statement
