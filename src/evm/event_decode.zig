@@ -36,6 +36,7 @@ pub const Value = union(enum) {
     bytes_dynamic: []const u8,
     string: []const u8,
     array: []const Value,
+    tuple: []const Value,
     indexed_hash: [32]u8,
 };
 
@@ -92,6 +93,14 @@ pub fn writeValue(writer: anytype, value: Value) !void {
             }
             try writer.writeAll("]");
         },
+        .tuple => |items| {
+            try writer.writeAll("(");
+            for (items, 0..) |elem, i| {
+                if (i > 0) try writer.writeAll(", ");
+                try writeValue(writer, elem);
+            }
+            try writer.writeAll(")");
+        },
     }
 }
 
@@ -116,6 +125,7 @@ const BaseKind = enum {
     bytes_fixed,
     bytes_dynamic,
     string,
+    tuple,
 };
 
 const ParsedType = struct {
@@ -124,6 +134,17 @@ const ParsedType = struct {
     bytes_len: u8 = 0,
     array: ArrayKind = .none,
     array_len: usize = 0,
+    tuple_items: ?[]ParsedType = null,
+
+    pub fn deinit(self: *ParsedType, allocator: Allocator) void {
+        if (self.tuple_items) |items| {
+            for (items) |*item| {
+                item.deinit(allocator);
+            }
+            allocator.free(items);
+            self.tuple_items = null;
+        }
+    }
 };
 
 pub fn decodeEvent(
@@ -177,41 +198,18 @@ fn countIndexed(params: []const EventParam) usize {
 }
 
 fn decodeIndexed(abi_type: []const u8, word: [32]u8) !Value {
-    const parsed = try parseAbiType(abi_type);
-    if (parsed.array != .none or isDynamicBase(parsed.base)) {
+    var parsed = try parseAbiTypeAlloc(std.heap.page_allocator, abi_type);
+    defer parsed.deinit(std.heap.page_allocator);
+    if (parsed.array != .none or isDynamicParsed(parsed)) {
         return .{ .indexed_hash = word };
     }
     return decodeWordStatic(parsed, word);
 }
 
 fn decodeFromData(allocator: Allocator, abi_type: []const u8, data: []const u8, head_offset: usize) !Value {
-    if (head_offset + 32 > data.len) return error.MissingData;
-    const word = readWord(data, head_offset);
-
-    const parsed = try parseAbiType(abi_type);
-    if (parsed.array != .none) {
-        return decodeArrayFromData(allocator, parsed, word, data, head_offset);
-    }
-
-    if (isDynamicBase(parsed.base)) {
-        const offset = u256ToUsize(u256FromBe(word[0..])) orelse return error.InvalidData;
-        if (offset + 32 > data.len) return error.InvalidData;
-
-        const len_word = readWord(data, offset);
-        const len = u256ToUsize(u256FromBe(len_word[0..])) orelse return error.InvalidData;
-        const start = offset + 32;
-        const end = start + len;
-        if (end > data.len) return error.InvalidData;
-
-        const payload = try allocator.dupe(u8, data[start..end]);
-        return switch (parsed.base) {
-            .string => .{ .string = payload },
-            .bytes_dynamic => .{ .bytes_dynamic = payload },
-            else => error.UnsupportedType,
-        };
-    }
-
-    return decodeWordStatic(parsed, word);
+    var parsed = try parseAbiTypeAlloc(allocator, abi_type);
+    defer parsed.deinit(allocator);
+    return decodeFromHead(allocator, parsed, data, 0, head_offset);
 }
 
 fn decodeWordStatic(parsed: ParsedType, word: [32]u8) !Value {
@@ -227,77 +225,123 @@ fn decodeWordStatic(parsed: ParsedType, word: [32]u8) !Value {
     };
 }
 
-fn decodeArrayFromData(
+fn decodeArrayFromHead(
     allocator: Allocator,
     parsed: ParsedType,
-    word: [32]u8,
     data: []const u8,
+    base_start: usize,
     head_offset: usize,
 ) !Value {
-    var start: usize = undefined;
-    var length: usize = undefined;
+    if (parsed.base == .tuple) return error.UnsupportedType;
 
     switch (parsed.array) {
         .dynamic => {
-            const offset = u256ToUsize(u256FromBe(word[0..])) orelse return error.InvalidData;
-            if (offset + 32 > data.len) return error.InvalidData;
-            const len_word = readWord(data, offset);
+            const offset = u256ToUsize(u256FromBe(readWord(data, head_offset)[0..])) orelse return error.InvalidData;
+            const start = base_start + offset;
+            return decodeArrayFromStart(allocator, parsed, data, start);
+        },
+        .fixed => {
+            return decodeArrayFromStart(allocator, parsed, data, head_offset);
+        },
+        .none => return error.UnsupportedType,
+    }
+}
+
+fn decodeArrayFromStart(
+    allocator: Allocator,
+    parsed: ParsedType,
+    data: []const u8,
+    start: usize,
+) !Value {
+    var length: usize = undefined;
+    var head_start: usize = undefined;
+
+    switch (parsed.array) {
+        .dynamic => {
+            if (start + 32 > data.len) return error.InvalidData;
+            const len_word = readWord(data, start);
             length = u256ToUsize(u256FromBe(len_word[0..])) orelse return error.InvalidData;
-            start = offset + 32;
+            head_start = start + 32;
         },
         .fixed => {
             length = parsed.array_len;
-            start = head_offset;
+            head_start = start;
         },
         .none => return error.UnsupportedType,
     }
 
     if (isStaticBase(parsed.base)) {
         const total_bytes = length * 32;
-        if (start + total_bytes > data.len) return error.InvalidData;
-
+        if (head_start + total_bytes > data.len) return error.InvalidData;
         var values = try allocator.alloc(Value, length);
         errdefer allocator.free(values);
-
         var i: usize = 0;
         while (i < length) : (i += 1) {
-            const elem_word = readWord(data, start + i * 32);
+            const elem_word = readWord(data, head_start + i * 32);
             values[i] = try decodeWordStatic(parsed, elem_word);
         }
-
         return .{ .array = values };
     }
 
     if (isDynamicBase(parsed.base)) {
         const offsets_bytes = length * 32;
-        if (start + offsets_bytes > data.len) return error.InvalidData;
-
+        if (head_start + offsets_bytes > data.len) return error.InvalidData;
         var values = try allocator.alloc(Value, length);
         errdefer allocator.free(values);
-
         var i: usize = 0;
         while (i < length) : (i += 1) {
-            const off_word = readWord(data, start + i * 32);
+            const off_word = readWord(data, head_start + i * 32);
             const rel = u256ToUsize(u256FromBe(off_word[0..])) orelse return error.InvalidData;
-            const elem_start = start + rel;
+            const elem_start = head_start + rel;
             values[i] = try decodeDynamicAt(allocator, parsed.base, data, elem_start);
         }
-
         return .{ .array = values };
     }
 
     return error.UnsupportedType;
 }
 
-fn parseAbiType(abi_type: []const u8) !ParsedType {
-    var base = abi_type;
+fn parseAbiTypeAlloc(allocator: Allocator, abi_type: []const u8) !ParsedType {
+    if (std.mem.startsWith(u8, abi_type, "tuple(") or std.mem.startsWith(u8, abi_type, "struct(")) {
+        const prefix_len: usize = if (std.mem.startsWith(u8, abi_type, "tuple(")) 6 else 7;
+        var depth: usize = 1;
+        var end: ?usize = null;
+        var i: usize = prefix_len;
+        while (i < abi_type.len) : (i += 1) {
+            const c = abi_type[i];
+            if (c == '(') depth += 1;
+            if (c == ')') {
+                depth -= 1;
+                if (depth == 0) {
+                    end = i;
+                    break;
+                }
+            }
+        }
+        const close = end orelse return error.UnsupportedType;
+        const inner = abi_type[prefix_len..close];
+        const items = try parseTupleItems(allocator, inner);
+        var out: ParsedType = .{
+            .base = .tuple,
+            .tuple_items = items,
+        };
+        if (close + 1 < abi_type.len) {
+            const suffix = abi_type[close + 1 ..];
+            const array = try parseArraySuffix(suffix);
+            out.array = array.kind;
+            out.array_len = array.len;
+        }
+        return out;
+    }
+
+    var base_slice = abi_type;
     var array_kind: ArrayKind = .none;
     var array_len: usize = 0;
 
     if (std.mem.lastIndexOfScalar(u8, abi_type, '[')) |idx| {
         if (abi_type[abi_type.len - 1] != ']') return error.UnsupportedType;
         if (idx == 0) return error.UnsupportedType;
-        base = abi_type[0..idx];
+        base_slice = abi_type[0..idx];
         const suffix = abi_type[idx + 1 .. abi_type.len - 1];
         if (suffix.len == 0) {
             array_kind = .dynamic;
@@ -306,10 +350,10 @@ fn parseAbiType(abi_type: []const u8) !ParsedType {
             array_len = try parseDecimal(usize, suffix);
         }
 
-        if (std.mem.indexOfScalar(u8, base, '[') != null) return error.UnsupportedType;
+        if (std.mem.indexOfScalar(u8, base_slice, '[') != null) return error.UnsupportedType;
     }
 
-    const base_parsed = try parseBaseType(base);
+    const base_parsed = try parseBaseType(base_slice);
     return .{
         .base = base_parsed.base,
         .bits = base_parsed.bits,
@@ -376,11 +420,9 @@ fn isStaticBase(base: BaseKind) bool {
 }
 
 fn headSizeForParam(abi_type: []const u8) !usize {
-    const parsed = try parseAbiType(abi_type);
-    if (parsed.array == .fixed and (isStaticBase(parsed.base) or isDynamicBase(parsed.base))) {
-        return parsed.array_len * 32;
-    }
-    return 32;
+    var parsed = try parseAbiTypeAlloc(std.heap.page_allocator, abi_type);
+    defer parsed.deinit(std.heap.page_allocator);
+    return headSizeForParsed(parsed);
 }
 
 fn parseBytesLength(abi_type: []const u8) ?u8 {
@@ -462,6 +504,12 @@ fn freeValue(allocator: Allocator, value: Value) void {
             }
             allocator.free(arr);
         },
+        .tuple => |items| {
+            for (items) |elem| {
+                freeValue(allocator, elem);
+            }
+            allocator.free(items);
+        },
         else => {},
     }
 }
@@ -480,6 +528,164 @@ fn decodeDynamicAt(allocator: Allocator, base: BaseKind, data: []const u8, start
         .bytes_dynamic => .{ .bytes_dynamic = payload },
         else => error.UnsupportedType,
     };
+}
+
+fn decodeFromHead(
+    allocator: Allocator,
+    parsed: ParsedType,
+    data: []const u8,
+    base_start: usize,
+    head_offset: usize,
+) !Value {
+    if (head_offset + 32 > data.len) return error.MissingData;
+
+    if (parsed.array != .none) {
+        return decodeArrayFromHead(allocator, parsed, data, base_start, head_offset);
+    }
+
+    if (parsed.base == .tuple) {
+        if (parsed.tuple_items == null) return error.UnsupportedType;
+        if (isDynamicParsed(parsed)) {
+            const offset = u256ToUsize(u256FromBe(readWord(data, head_offset)[0..])) orelse return error.InvalidData;
+            const tuple_start = base_start + offset;
+            return decodeTupleAt(allocator, parsed.tuple_items.?, data, tuple_start);
+        }
+        return decodeTupleAt(allocator, parsed.tuple_items.?, data, head_offset);
+    }
+
+    if (isDynamicBase(parsed.base)) {
+        const offset = u256ToUsize(u256FromBe(readWord(data, head_offset)[0..])) orelse return error.InvalidData;
+        const start = base_start + offset;
+        return decodeDynamicAt(allocator, parsed.base, data, start);
+    }
+
+    return decodeWordStatic(parsed, readWord(data, head_offset));
+}
+
+fn decodeFromStart(
+    allocator: Allocator,
+    parsed: ParsedType,
+    data: []const u8,
+    start: usize,
+) !Value {
+    if (parsed.array != .none) {
+        return decodeArrayFromStart(allocator, parsed, data, start);
+    }
+    if (parsed.base == .tuple) {
+        if (parsed.tuple_items == null) return error.UnsupportedType;
+        return decodeTupleAt(allocator, parsed.tuple_items.?, data, start);
+    }
+    if (isDynamicBase(parsed.base)) {
+        return decodeDynamicAt(allocator, parsed.base, data, start);
+    }
+    return decodeWordStatic(parsed, readWord(data, start));
+}
+
+fn decodeTupleAt(
+    allocator: Allocator,
+    items: []const ParsedType,
+    data: []const u8,
+    tuple_start: usize,
+) !Value {
+    var values = try allocator.alloc(Value, items.len);
+    errdefer allocator.free(values);
+
+    var head_offset = tuple_start;
+    var i: usize = 0;
+    while (i < items.len) : (i += 1) {
+        const item = items[i];
+        if (isDynamicParsed(item)) {
+            const offset = u256ToUsize(u256FromBe(readWord(data, head_offset)[0..])) orelse return error.InvalidData;
+            const item_start = tuple_start + offset;
+            values[i] = try decodeFromStart(allocator, item, data, item_start);
+            head_offset += 32;
+        } else {
+            values[i] = try decodeFromStart(allocator, item, data, head_offset);
+            head_offset += headSizeForParsed(item);
+        }
+    }
+
+    return .{ .tuple = values };
+}
+
+fn headSizeForParsed(parsed: ParsedType) usize {
+    if (parsed.array == .fixed) {
+        return parsed.array_len * 32;
+    }
+    if (parsed.base == .tuple and parsed.tuple_items != null and !tupleHasDynamic(parsed.tuple_items.?)) {
+        return tupleStaticSize(parsed.tuple_items.?);
+    }
+    return 32;
+}
+
+fn tupleStaticSize(items: []const ParsedType) usize {
+    var total: usize = 0;
+    for (items) |item| {
+        total += headSizeForParsed(item);
+    }
+    return total;
+}
+
+fn tupleHasDynamic(items: []const ParsedType) bool {
+    for (items) |item| {
+        if (isDynamicParsed(item)) return true;
+    }
+    return false;
+}
+
+fn isDynamicParsed(parsed: ParsedType) bool {
+    if (parsed.array == .dynamic) return true;
+    if (parsed.array == .fixed and (isDynamicBase(parsed.base) or parsed.base == .tuple)) return true;
+    if (parsed.base == .tuple and parsed.tuple_items != null) {
+        return tupleHasDynamic(parsed.tuple_items.?);
+    }
+    return isDynamicBase(parsed.base);
+}
+
+fn parseArraySuffix(suffix: []const u8) !struct { kind: ArrayKind, len: usize } {
+    if (suffix.len < 2) return error.UnsupportedType;
+    if (suffix[0] != '[' or suffix[suffix.len - 1] != ']') return error.UnsupportedType;
+    const inner = suffix[1 .. suffix.len - 1];
+    if (inner.len == 0) {
+        return .{ .kind = .dynamic, .len = 0 };
+    }
+    return .{ .kind = .fixed, .len = try parseDecimal(usize, inner) };
+}
+
+fn parseTupleItems(allocator: Allocator, inner: []const u8) ![]ParsedType {
+    var items = std.ArrayList(ParsedType).empty;
+    errdefer {
+        for (items.items) |*item| {
+            item.deinit(allocator);
+        }
+        items.deinit(allocator);
+    }
+
+    var depth: usize = 0;
+    var start: usize = 0;
+    var i: usize = 0;
+    while (i <= inner.len) : (i += 1) {
+        const at_end = i == inner.len;
+        const c = if (at_end) ',' else inner[i];
+        if (!at_end) {
+            if (c == '(') depth += 1;
+            if (c == ')') {
+                if (depth == 0) return error.UnsupportedType;
+                depth -= 1;
+            }
+        }
+
+        if (at_end or (c == ',' and depth == 0)) {
+            const slice = std.mem.trim(u8, inner[start..i], " \t\n");
+            if (slice.len == 0) return error.UnsupportedType;
+            const parsed = try parseAbiTypeAlloc(allocator, slice);
+            try items.append(allocator, parsed);
+            start = i + 1;
+        }
+    }
+
+    if (depth != 0) return error.UnsupportedType;
+    return items.toOwnedSlice(allocator);
 }
 
 fn writeHex(writer: anytype, bytes: []const u8) !void {
@@ -663,4 +869,64 @@ test "decode dynamic string array event" {
     try std.testing.expect(arr.len == 2);
     try std.testing.expect(std.mem.eql(u8, arr[0].string, "hi"));
     try std.testing.expect(std.mem.eql(u8, arr[1].string, "bye"));
+}
+
+test "decode tuple event (static)" {
+    const allocator = std.testing.allocator;
+
+    const event = Event{
+        .name = "Pair",
+        .params = &.{
+            .{ .name = "pair", .abi_type = "tuple(uint256,bool)", .indexed = false },
+        },
+    };
+
+    var data: [64]u8 = undefined;
+    @memset(&data, 0);
+    writeU256Be(data[0..32], 7);
+    writeU256Be(data[32..64], 1);
+
+    const topics: [1][32]u8 = .{.{0} ** 32};
+    const decoded = try decodeEvent(allocator, event, topics[0..], data[0..]);
+    defer decoded.deinit(allocator);
+
+    const tup = decoded.fields[0].value.tuple;
+    try std.testing.expect(tup.len == 2);
+    try std.testing.expect(tup[0].uint256 == 7);
+    try std.testing.expect(tup[1].bool);
+}
+
+test "decode tuple event (dynamic)" {
+    const allocator = std.testing.allocator;
+
+    const event = Event{
+        .name = "TupleDyn",
+        .params = &.{
+            .{ .name = "data", .abi_type = "tuple(string,uint256)", .indexed = false },
+        },
+    };
+
+    var data: [160]u8 = undefined;
+    @memset(&data, 0);
+
+    // top-level head: offset to tuple payload
+    writeU256Be(data[0..32], 32);
+    // tuple payload at offset 32:
+    // tuple head: offset to string (64), uint256 value
+    writeU256Be(data[32..64], 64);
+    writeU256Be(data[64..96], 9);
+    // string payload at tuple_start + 64 = 96
+    writeU256Be(data[96..128], 3);
+    data[128] = 'f';
+    data[129] = 'o';
+    data[130] = 'o';
+
+    const topics: [1][32]u8 = .{.{0} ** 32};
+    const decoded = try decodeEvent(allocator, event, topics[0..], data[0..]);
+    defer decoded.deinit(allocator);
+
+    const tup = decoded.fields[0].value.tuple;
+    try std.testing.expect(tup.len == 2);
+    try std.testing.expect(std.mem.eql(u8, tup[0].string, "foo"));
+    try std.testing.expect(tup[1].uint256 == 9);
 }
