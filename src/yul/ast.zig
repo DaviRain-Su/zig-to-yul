@@ -300,16 +300,29 @@ pub const FunctionCall = struct {
     }
 };
 
-/// Expression - can be literal, identifier, or function call
+/// Builtin function call expression (EVM opcodes)
+pub const BuiltinCall = struct {
+    location: SourceLocation = .none,
+    builtin_name: BuiltinName,
+    arguments: []const Expression,
+
+    pub fn init(name: YulName, args: []const Expression) BuiltinCall {
+        return .{ .builtin_name = BuiltinName.init(name), .arguments = args };
+    }
+};
+
+/// Expression - can be literal, identifier, builtin call, or function call
 pub const Expression = union(enum) {
     literal: Literal,
     identifier: Identifier,
+    builtin_call: BuiltinCall,
     function_call: FunctionCall,
 
     pub fn getLocation(self: Expression) SourceLocation {
         return switch (self) {
             .literal => |l| l.location,
             .identifier => |i| i.location,
+            .builtin_call => |b| b.location,
             .function_call => |f| f.location,
         };
     }
@@ -321,6 +334,10 @@ pub const Expression = union(enum) {
 
     pub fn id(name: YulName) Expression {
         return .{ .identifier = Identifier.init(name) };
+    }
+
+    pub fn builtinCall(name: YulName, args: []const Expression) Expression {
+        return .{ .builtin_call = BuiltinCall.init(name, args) };
     }
 
     pub fn call(name: YulName, args: []const Expression) Expression {
@@ -685,6 +702,11 @@ pub const AstBuilder = struct {
     /// Create a function call expression
     pub fn call(self: *AstBuilder, name: YulName, args: []const Expression) !Expression {
         return Expression.call(name, try self.dupeExpressions(args));
+    }
+
+    /// Create a builtin call expression
+    pub fn builtinCall(self: *AstBuilder, name: YulName, args: []const Expression) !Expression {
+        return Expression.builtinCall(name, try self.dupeExpressions(args));
     }
 
     /// Create a variable declaration

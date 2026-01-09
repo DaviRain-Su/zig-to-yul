@@ -300,12 +300,21 @@ fn tokenLength(tag: std.zig.Token.Tag, source: []const u8) u32 {
         },
         .number_literal => {
             var len: u32 = 0;
-            for (source) |c| {
-                if (std.ascii.isAlphanumeric(c) or c == '_' or c == '.') {
+            var i: usize = 0;
+            while (i < source.len) : (i += 1) {
+                const c = source[i];
+                if (std.ascii.isAlphanumeric(c) or c == '_') {
                     len += 1;
-                } else {
-                    break;
+                    continue;
                 }
+                if (c == '.') {
+                    if (i + 1 < source.len and source[i + 1] == '.') {
+                        break;
+                    }
+                    len += 1;
+                    continue;
+                }
+                break;
             }
             return len;
         },

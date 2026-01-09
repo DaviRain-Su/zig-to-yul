@@ -207,8 +207,19 @@ pub const Printer = struct {
         switch (expr) {
             .literal => |l| try self.printLiteral(l),
             .identifier => |i| try self.write(i.name),
+            .builtin_call => |b| try self.printBuiltinCall(b),
             .function_call => |f| try self.printFunctionCall(f),
         }
+    }
+
+    fn printBuiltinCall(self: *Self, call: ast.BuiltinCall) Error!void {
+        try self.write(call.builtin_name.name);
+        try self.write("(");
+        for (call.arguments, 0..) |arg, i| {
+            if (i > 0) try self.write(", ");
+            try self.printExpression(arg);
+        }
+        try self.write(")");
     }
 
     fn printLiteral(self: *Self, lit: ast.Literal) Error!void {

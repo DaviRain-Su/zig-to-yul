@@ -29,7 +29,13 @@ pub const Literal = union(enum) {
 pub const Expression = union(enum) {
     literal: Literal,
     identifier: []const u8,
+    builtin_call: BuiltinCall,
     function_call: FunctionCall,
+
+    pub const BuiltinCall = struct {
+        name: []const u8,
+        arguments: []const Expression,
+    };
 
     pub const FunctionCall = struct {
         name: []const u8,
@@ -183,6 +189,15 @@ pub const Builder = struct {
         const args_copy = try self.allocator.dupe(Expression, args);
         if (args_copy.len > 0) try self.alloc_exprs.append(self.allocator, args_copy);
         return .{ .function_call = .{
+            .name = name,
+            .arguments = args_copy,
+        } };
+    }
+
+    pub fn builtin_call(self: *Builder, name: []const u8, args: []const Expression) !Expression {
+        const args_copy = try self.allocator.dupe(Expression, args);
+        if (args_copy.len > 0) try self.alloc_exprs.append(self.allocator, args_copy);
+        return .{ .builtin_call = .{
             .name = name,
             .arguments = args_copy,
         } };

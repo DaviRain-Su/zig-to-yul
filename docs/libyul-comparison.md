@@ -353,20 +353,20 @@ Zig 源代码 → [zig-to-yul] → Yul 代码 → [solc] → EVM 字节码
 
 | 问题 | libyul 行为 | 当前实现 | 影响 |
 |------|-------------|----------|------|
-| **BuiltinCall 区分** | 区分 `BuiltinCall` 和 `FunctionCall` 两种节点 | 仅用 `FunctionCall` + name 字符串 | 缺少语义区分 |
+| **BuiltinCall 区分** | 区分 `BuiltinCall` 和 `FunctionCall` 两种节点 | Builtin/Function 已区分 | ✅ 已对齐 |
 | **Typed 节点** | 严格区分 builtin/identifier/typed | 统一处理 | 类型信息丢失 |
 
-### 6.2 Dialect 验证缺失
+### 6.2 Dialect 验证缺失 (已修复)
 
 ```zig
 // ast.zig:87 - 定义了 hasBuiltin()
 pub fn hasBuiltin(self: Dialect, name: []const u8) bool { ... }
 
-// 但在 transformer.zig 和 compiler.zig 中从未调用！
-// 结果：EVM 版本检查仅是定义，不是运行时强制执行
+// 现在在 transformer.zig 和 compiler.zig 中调用
+// 结果：EVM 版本检查会在解析 evm.* 内建时强制执行
 ```
 
-**影响**: 使用 Cancun 特性（如 `mcopy`）时不会检查目标 EVM 版本，可能生成不兼容代码。
+**影响**: 使用 Cancun 特性（如 `mcopy`）时会检查目标 EVM 版本，避免生成不兼容代码。
 
 ### 6.3 Zig→Yul 语义覆盖 (子集)
 
@@ -377,7 +377,7 @@ pub fn hasBuiltin(self: Dialect, name: []const u8) bool { ... }
 | 函数定义 | ✅ | `pub fn name()` |
 | 变量声明 | ✅ | `var x = ...` |
 | 赋值语句 | ✅ | `x = value` |
-| if 语句 | ✅ | 基础 if (无 else) |
+| if 语句 | ✅ | if/else |
 | 函数调用 | ✅ | `func(args)` |
 | 字段访问 | ✅ | `self.field` |
 | 二元运算 | ✅ | `+`, `-`, `*`, `/`, `<`, `>`, `==` |
@@ -387,12 +387,12 @@ pub fn hasBuiltin(self: Dialect, name: []const u8) bool { ... }
 
 | 节点类型 | 状态 | Yul 对应 |
 |----------|------|----------|
-| for 循环 | ❌ | `for { } cond { } { }` |
-| while 循环 | ❌ | `for { } cond { } { }` |
-| switch 语句 | ❌ | `switch expr { case ... }` |
-| break | ❌ | `break` |
-| continue | ❌ | `continue` |
-| if-else | ⚠️ 部分 | 需要 `iszero` 翻转 |
+| for 循环 | ⚠️ 部分 | 仅支持 `for (start..end) |i| {}` |
+| while 循环 | ✅ | `for { } cond { } { }` |
+| switch 语句 | ⚠️ 部分 | 仅支持字面量 case |
+| break | ✅ | 不支持 label/value |
+| continue | ✅ | 不支持 label/value |
+| if-else | ✅ | 通过 `iszero` 翻转 |
 | 复杂表达式 | ❌ | 嵌套调用、链式操作 |
 | 数组索引 | ❌ | 内存/存储计算 |
 | 结构体字面量 | ❌ | 内存布局 |
@@ -499,10 +499,10 @@ pub const SourceLocation = struct {
 
 | 类别 | 覆盖率 | 状态 | 备注 |
 |------|--------|------|------|
-| Yul AST 节点类型 | 15/15 | ⚠️ 结构差异 | 缺少 BuiltinCall/FunctionCall 区分 |
+| Yul AST 节点类型 | 15/15 | ✅ | Builtin/Function 已区分 |
 | Object 模型 | 3/5 (60%) | ✅ 核心完整 | |
 | EVM 操作码定义 | 73/73 | ✅ 列表完整 | 但缺少版本强制检查 |
-| Dialect 版本追踪 | 13/13 | ⚠️ 仅定义 | `hasBuiltin()` 未被调用 |
+| Dialect 版本追踪 | 13/13 | ✅ | `hasBuiltin()` 已强制检查 |
 | EOF 特性 (Prague) | 0/14 (0%) | ❌ 未实现 | |
 
 ### 9.3 完整性评估 (按功能领域)
@@ -510,25 +510,27 @@ pub const SourceLocation = struct {
 | 领域 | 覆盖率 | 说明 |
 |------|--------|------|
 | **Yul AST 结构** | ~80% | 节点类型完整，但语义区分不足 |
-| **EVM Builtin** | ~90% | 操作码列表完整，版本检查缺失 |
-| **Zig→Yul 翻译** | ~40% | 仅基础节点，缺少循环/switch/复杂表达式 |
+| **EVM Builtin** | ~90% | 操作码列表完整，版本检查已补齐 |
+| **Zig→Yul 翻译** | ~60% | 支持循环/switch/break/continue，缺少复杂表达式 |
 | **ABI 编解码** | ~30% | 仅静态类型单返回值 |
 | **开发工具** | ~20% | 基本编译，无源码映射/调试 |
 
 ### 9.4 当前可用场景
 
-- ✅ 简单合约：纯函数、基础 if、简单存储读写
+- ✅ 简单合约：纯函数、if/else、简单存储读写
+- ✅ 循环逻辑：while 循环、for 范围循环 (0..n)
+- ✅ 控制流：switch 语句、break、continue
 - ✅ 基础分发器：静态参数函数路由
-- ⚠️ 复杂合约：需要手动处理循环、复杂 ABI
+- ⚠️ 复杂合约：需要手动处理动态 ABI、数组索引
 
 ### 9.5 优先修复路线
 
 | 优先级 | 任务 | 影响 |
 |--------|------|------|
-| **P0** | 添加 Dialect 版本强制检查 | 防止生成不兼容代码 |
-| **P0** | 实现 for/while 循环翻译 | 支持迭代逻辑 |
-| **P1** | 区分 BuiltinCall/FunctionCall | 对齐 libyul 语义 |
-| **P1** | 实现 switch/break/continue | 完整控制流 |
+| **P0** | 添加 Dialect 版本强制检查 | ✅ 已完成 |
+| **P0** | 实现 for/while 循环翻译 | ✅ 已完成 (for 支持 range) |
+| **P1** | 区分 BuiltinCall/FunctionCall | ✅ 已完成 |
+| **P1** | 实现 switch/break/continue | ⚠️ 部分完成 (仅字面量 case, 无 label/value) |
 | **P1** | 动态 ABI 类型支持 | 实际合约需要 |
 | **P2** | 填充 SourceLocation | 调试能力 |
 | **P2** | 多返回值 ABI | 复杂接口 |

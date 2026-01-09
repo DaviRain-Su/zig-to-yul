@@ -262,6 +262,7 @@ pub const CodeGenerator = struct {
         switch (expr) {
             .literal => |lit| try self.emitLiteral(lit),
             .identifier => |id| try self.write(id),
+            .builtin_call => |call| try self.emitBuiltinCall(call),
             .function_call => |call| try self.emitFunctionCall(call),
         }
     }
@@ -277,6 +278,16 @@ pub const CodeGenerator = struct {
     }
 
     fn emitFunctionCall(self: *Self, call: ir.Expression.FunctionCall) EmitError!void {
+        try self.write(call.name);
+        try self.write("(");
+        for (call.arguments, 0..) |arg, i| {
+            if (i > 0) try self.write(", ");
+            try self.emitExpression(arg);
+        }
+        try self.write(")");
+    }
+
+    fn emitBuiltinCall(self: *Self, call: ir.Expression.BuiltinCall) EmitError!void {
         try self.write(call.name);
         try self.write("(");
         for (call.arguments, 0..) |arg, i| {

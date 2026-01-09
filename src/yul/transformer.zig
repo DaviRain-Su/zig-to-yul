@@ -916,7 +916,7 @@ pub const Transformer = struct {
                     }
                     try self.addError(msg, self.nodeLocation(call_info.ast.fn_expr), .unsupported_feature);
                 }
-                return try self.builder.call(b.yul_name, args.items);
+                return try self.builder.builtinCall(b.yul_name, args.items);
             }
         }
 

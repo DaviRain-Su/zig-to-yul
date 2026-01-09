@@ -961,7 +961,7 @@ pub const Compiler = struct {
                     const loc = p.getLocation(p.ast.tokens.get(token).start);
                     try self.addError(msg, loc.line, loc.column, .unsupported_feature);
                 }
-                return try self.ir_builder.call(b.yul_name, args.items);
+                return try self.ir_builder.builtin_call(b.yul_name, args.items);
             }
         }
 
