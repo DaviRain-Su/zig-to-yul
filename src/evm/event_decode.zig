@@ -283,6 +283,42 @@ fn decodeArrayFromStart(
         return .{ .array = values };
     }
 
+    if (parsed.base == .tuple) {
+        if (parsed.tuple_items == null) return error.UnsupportedType;
+        if (!tupleHasDynamic(parsed.tuple_items.?)) {
+            const elem_size = tupleStaticSize(parsed.tuple_items.?);
+            const total_bytes = length * elem_size;
+            if (head_start + total_bytes > data.len) return error.InvalidData;
+
+            var values = try allocator.alloc(Value, length);
+            errdefer allocator.free(values);
+
+            var i: usize = 0;
+            while (i < length) : (i += 1) {
+                const elem_start = head_start + i * elem_size;
+                values[i] = try decodeTupleAt(allocator, parsed.tuple_items.?, data, elem_start);
+            }
+
+            return .{ .array = values };
+        } else {
+            const offsets_bytes = length * 32;
+            if (head_start + offsets_bytes > data.len) return error.InvalidData;
+
+            var values = try allocator.alloc(Value, length);
+            errdefer allocator.free(values);
+
+            var i: usize = 0;
+            while (i < length) : (i += 1) {
+                const off_word = readWord(data, head_start + i * 32);
+                const rel = u256ToUsize(u256FromBe(off_word[0..])) orelse return error.InvalidData;
+                const elem_start = head_start + rel;
+                values[i] = try decodeTupleAt(allocator, parsed.tuple_items.?, data, elem_start);
+            }
+
+            return .{ .array = values };
+        }
+    }
+
     if (isDynamicBase(parsed.base)) {
         const offsets_bytes = length * 32;
         if (head_start + offsets_bytes > data.len) return error.InvalidData;
@@ -610,6 +646,9 @@ fn decodeTupleAt(
 
 fn headSizeForParsed(parsed: ParsedType) usize {
     if (parsed.array == .fixed) {
+        if (parsed.base == .tuple and parsed.tuple_items != null and !tupleHasDynamic(parsed.tuple_items.?)) {
+            return parsed.array_len * tupleStaticSize(parsed.tuple_items.?);
+        }
         return parsed.array_len * 32;
     }
     if (parsed.base == .tuple and parsed.tuple_items != null and !tupleHasDynamic(parsed.tuple_items.?)) {
@@ -929,4 +968,41 @@ test "decode tuple event (dynamic)" {
     try std.testing.expect(tup.len == 2);
     try std.testing.expect(std.mem.eql(u8, tup[0].string, "foo"));
     try std.testing.expect(tup[1].uint256 == 9);
+}
+
+test "decode tuple array event" {
+    const allocator = std.testing.allocator;
+
+    const event = Event{
+        .name = "TupleArray",
+        .params = &.{
+            .{ .name = "pairs", .abi_type = "tuple(uint256,bool)[]", .indexed = false },
+        },
+    };
+
+    var data: [192]u8 = undefined;
+    @memset(&data, 0);
+
+    // head: offset to array payload
+    writeU256Be(data[0..32], 32);
+    // array payload at offset 32:
+    // length = 2
+    writeU256Be(data[32..64], 2);
+    // element 0 (uint256, bool)
+    writeU256Be(data[64..96], 7);
+    writeU256Be(data[96..128], 1);
+    // element 1 (uint256, bool)
+    writeU256Be(data[128..160], 2);
+    writeU256Be(data[160..192], 0);
+
+    const topics: [1][32]u8 = .{.{0} ** 32};
+    const decoded = try decodeEvent(allocator, event, topics[0..], data[0..]);
+    defer decoded.deinit(allocator);
+
+    const arr = decoded.fields[0].value.array;
+    try std.testing.expect(arr.len == 2);
+    try std.testing.expect(arr[0].tuple[0].uint256 == 7);
+    try std.testing.expect(arr[0].tuple[1].bool);
+    try std.testing.expect(arr[1].tuple[0].uint256 == 2);
+    try std.testing.expect(!arr[1].tuple[1].bool);
 }
