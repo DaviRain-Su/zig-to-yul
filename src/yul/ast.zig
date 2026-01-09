@@ -251,64 +251,16 @@ pub const BuiltinName = struct {
         return .{ .name = name };
     }
 
+const builtins = @import("../evm/builtins.zig");
+
+// ...
+
     /// Check if a name is a known EVM builtin
     /// Based on libyul EVMDialect and Solidity Yul specification
     pub fn isBuiltin(name: YulName) bool {
-        const builtins = [_][]const u8{
-            // Arithmetic (all EVM versions)
-            "add",       "sub",       "mul",       "div",       "sdiv",
-            "mod",       "smod",      "exp",       "not",       "lt",
-            "gt",        "slt",       "sgt",       "eq",        "iszero",
-            "and",       "or",        "xor",       "byte",      "addmod",
-            "mulmod",    "signextend", "keccak256",
-            // Bitwise shifts (Constantinople+)
-            "shl",       "shr",       "sar",
-            // Memory
-            "mload",     "mstore",    "mstore8",   "msize",
-            "mcopy", // Cancun+
-            // Storage
-            "sload",     "sstore",
-            // Transient storage (Cancun+)
-            "tload",     "tstore",
-            // Call data
-            "calldataload", "calldatasize", "calldatacopy",
-            // Code
-            "codesize",  "codecopy",  "extcodesize", "extcodecopy", "extcodehash",
-            // Return data (Byzantium+)
-            "returndatasize", "returndatacopy",
-            // Block info
-            "blockhash", "coinbase",  "timestamp", "number",    "gaslimit",
-            "difficulty", // Pre-Paris (deprecated but valid for older EVM)
-            "prevrandao", // Paris+ (replaces difficulty)
-            "chainid", // Istanbul+
-            "selfbalance", // Istanbul+
-            "basefee", // London+
-            "blobhash", // Cancun+
-            "blobbasefee", // Cancun+
-            // Transaction
-            "origin",    "gasprice",  "gas",
-            // Account
-            "balance",   "address",   "caller",    "callvalue",
-            // Control flow
-            "stop",      "return",    "revert",    "invalid",   "selfdestruct",
-            // External calls
-            "call",      "callcode",  "delegatecall",
-            "staticcall", // Byzantium+
-            "create",    "create2", // Constantinople+
-            // Logging
-            "log0",      "log1",      "log2",      "log3",      "log4",
-            // Yul object data
-            "datasize",  "dataoffset", "datacopy",
-            // Yul-specific helpers
-            "memoryguard", // Yul memory guard for optimizer
-            "loadimmutable", "setimmutable", // Yul immutable support
-            "linkersymbol", // Linker placeholder
-            // Stack operations (limited in Yul)
-            "pop",
-        };
-
-        for (builtins) |b| {
-            if (std.mem.eql(u8, name, b)) return true;
+        // Check against centralized EVM builtins list
+        if (builtins.getBuiltin(name)) |_| {
+            return true;
         }
 
         // Check for verbatim_<N>i_<M>o family (e.g., verbatim_1i_1o, verbatim_2i_0o)
