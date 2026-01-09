@@ -686,11 +686,8 @@ pub const Compiler = struct {
 
         const range = p.ast.nodeData(input).node_and_opt_node;
         const start_expr = try self.translateExpression(range[0]);
-        const end_node = range[1].unwrap() orelse {
-            try self.reportUnsupportedStmtLegacy(input, "open-ended ranges are not supported");
-            return;
-        };
-        const end_expr = try self.translateExpression(end_node);
+        const end_node = range[1].unwrap();
+        const end_expr = if (end_node) |node| try self.translateExpression(node) else null;
 
         var payload_token = for_info.payload_token;
         if (p.getTokenTag(payload_token) == .asterisk) {
@@ -712,17 +709,22 @@ pub const Compiler = struct {
             }
         }
 
-        const payload_name = p.getIdentifier(payload_token);
+        var payload_name = p.getIdentifier(payload_token);
+        if (std.mem.eql(u8, payload_name, "_")) {
+            payload_name = try std.fmt.allocPrint(self.allocator, "$zig2yul$for$idx${d}", .{self.temp_counter});
+            self.temp_counter += 1;
+            try self.temp_strings.append(self.allocator, payload_name);
+        }
 
         var init_stmts: std.ArrayList(yul_ir.Statement) = .empty;
         defer init_stmts.deinit(self.allocator);
         const init_decl = try self.ir_builder.variable(&.{payload_name}, start_expr);
         try init_stmts.append(self.allocator, init_decl);
 
-        const cond = try self.ir_builder.builtin_call("lt", &.{
-            self.ir_builder.identifier(payload_name),
-            end_expr,
-        });
+        const cond = if (end_expr) |end_val|
+            try self.ir_builder.builtin_call("lt", &.{ self.ir_builder.identifier(payload_name), end_val })
+        else
+            self.ir_builder.literal_num(@as(evm_types.U256, 1));
 
         var post_stmts: std.ArrayList(yul_ir.Statement) = .empty;
         defer post_stmts.deinit(self.allocator);

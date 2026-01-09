@@ -638,11 +638,8 @@ pub const Transformer = struct {
 
         const range = p.ast.nodeData(input).node_and_opt_node;
         const start_expr = try self.translateExpression(range[0]);
-        const end_node = range[1].unwrap() orelse {
-            try self.addError("open-ended ranges are not supported", self.nodeLocation(input), .unsupported_feature);
-            return;
-        };
-        const end_expr = try self.translateExpression(end_node);
+        const end_node = range[1].unwrap();
+        const end_expr = if (end_node) |node| try self.translateExpression(node) else null;
 
         var payload_token = for_info.payload_token;
         if (p.getTokenTag(payload_token) == .asterisk) {
@@ -664,17 +661,22 @@ pub const Transformer = struct {
             }
         }
 
-        const payload_name = p.getIdentifier(payload_token);
+        var payload_name = p.getIdentifier(payload_token);
+        if (std.mem.eql(u8, payload_name, "_")) {
+            payload_name = try std.fmt.allocPrint(self.allocator, "$zig2yul$for$idx${d}", .{self.temp_counter});
+            self.temp_counter += 1;
+            try self.temp_strings.append(self.allocator, payload_name);
+        }
 
         var init_stmts: std.ArrayList(ast.Statement) = .empty;
         defer init_stmts.deinit(self.allocator);
         const init_decl = try self.builder.varDecl(&.{payload_name}, start_expr);
         try init_stmts.append(self.allocator, init_decl);
 
-        const cond = try self.builder.builtinCall("lt", &.{
-            ast.Expression.id(payload_name),
-            end_expr,
-        });
+        const cond = if (end_expr) |end_val|
+            try self.builder.builtinCall("lt", &.{ ast.Expression.id(payload_name), end_val })
+        else
+            ast.Expression.lit(ast.Literal.number(@as(ast.U256, 1)));
 
         var post_stmts: std.ArrayList(ast.Statement) = .empty;
         defer post_stmts.deinit(self.allocator);
@@ -1415,6 +1417,10 @@ test "transform loops and control flow" {
         \\
         \\        for (0..2) |j| {
         \\            i = i + j;
+        \\        }
+        \\
+        \\        for (0..) |_| {
+        \\            break;
         \\        }
         \\    }
         \\};
