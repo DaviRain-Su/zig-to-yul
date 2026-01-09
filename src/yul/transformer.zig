@@ -888,24 +888,42 @@ pub const Transformer = struct {
         }
 
         if (for_info.ast.inputs.len == 0 or for_info.ast.inputs.len > 2) {
-            try self.addError("for requires one or two range inputs", self.nodeLocation(index), .unsupported_feature);
+            try self.addError("for requires one or two inputs", self.nodeLocation(index), .unsupported_feature);
             return;
         }
 
-        const input0 = for_info.ast.inputs[0];
-        var input1: ?ZigAst.Node.Index = null;
-        if (for_info.ast.inputs.len == 2) {
-            input1 = for_info.ast.inputs[1];
-            if (p.getNodeTag(input1.?) != .for_range) {
-                try self.addError("for index must use range syntax (start..end)", self.nodeLocation(input1.?), .unsupported_feature);
-                return;
-            }
-        }
-
-        const is_range0 = p.getNodeTag(input0) == .for_range;
         var start_expr: ?ast.Expression = null;
         var end_expr: ?ast.Expression = null;
-        if (is_range0) {
+        var step_expr: ?ast.Expression = null;
+        const input0 = for_info.ast.inputs[0];
+        var range_step_input = false;
+        var range_step_loc: ?ast.SourceLocation = null;
+        {
+            var call_buf: [1]ZigAst.Node.Index = undefined;
+            if (p.ast.fullCall(&call_buf, input0)) |call_info| {
+                const callee_src = p.getNodeSource(call_info.ast.fn_expr);
+                if (std.mem.eql(u8, callee_src, "range_step") or std.mem.endsWith(u8, callee_src, ".range_step")) {
+                    if (call_info.ast.params.len != 3) {
+                        try self.addError("range_step requires three arguments (start, end, step)", self.nodeLocation(input0), .unsupported_feature);
+                        return;
+                    }
+                    start_expr = try self.translateExpression(call_info.ast.params[0]);
+                    end_expr = try self.translateExpression(call_info.ast.params[1]);
+                    step_expr = try self.translateExpression(call_info.ast.params[2]);
+                    range_step_input = true;
+                    range_step_loc = self.nodeLocation(input0);
+                }
+            }
+        }
+        var input1: ?ZigAst.Node.Index = null;
+        var input1_is_range = false;
+        if (for_info.ast.inputs.len == 2) {
+            input1 = for_info.ast.inputs[1];
+            input1_is_range = p.getNodeTag(input1.?) == .for_range;
+        }
+
+        const is_range0 = range_step_input or p.getNodeTag(input0) == .for_range;
+        if (!range_step_input and is_range0) {
             const range0 = p.ast.nodeData(input0).node_and_opt_node;
             start_expr = try self.translateExpression(range0[0]);
             const end_node = range0[1].unwrap();
@@ -914,20 +932,53 @@ pub const Transformer = struct {
 
         var index_start_expr: ?ast.Expression = null;
         var index_end_expr: ?ast.Expression = null;
-        if (input1) |range_node| {
-            const range1 = p.ast.nodeData(range_node).node_and_opt_node;
-            index_start_expr = try self.translateExpression(range1[0]);
-            const idx_end_node = range1[1].unwrap();
-            index_end_expr = if (idx_end_node) |node| try self.translateExpression(node) else null;
+        if (input1) |input_node| {
+            if (input1_is_range) {
+                const range1 = p.ast.nodeData(input_node).node_and_opt_node;
+                index_start_expr = try self.translateExpression(range1[0]);
+                const idx_end_node = range1[1].unwrap();
+                index_end_expr = if (idx_end_node) |node| try self.translateExpression(node) else null;
+            } else {
+                if (!is_range0) {
+                    try self.addError("for step input requires a range input", self.nodeLocation(input_node), .unsupported_feature);
+                    return;
+                }
+                step_expr = try self.translateExpression(input_node);
+            }
         }
 
         const payloads = try self.collectForPayloads(for_info.payload_token, for_info.ast.then_expr, index);
         if (payloads.len == 0) {
             return;
         }
-        if (payloads.len == 2 and input1 == null) {
+        if (range_step_input) {
+            if (input1 != null) {
+                const loc = range_step_loc orelse self.nodeLocation(index);
+                try self.addError("range_step cannot be combined with a second for input", loc, .unsupported_feature);
+                return;
+            }
+            if (payloads.len != 1) {
+                const loc = range_step_loc orelse self.nodeLocation(index);
+                try self.addError("range_step requires a single payload", loc, .unsupported_feature);
+                return;
+            }
+        }
+        if (payloads.len == 2 and (input1 == null or !input1_is_range)) {
             try self.addError("for with index payload requires a second range input", self.nodeLocation(index), .unsupported_feature);
             return;
+        }
+        if (payloads.len == 2 and step_expr != null) {
+            try self.addError("for step input does not support index payloads", self.nodeLocation(index), .unsupported_feature);
+            return;
+        }
+        if (input1_is_range and payloads.len == 1) {
+            if (!is_range0) {
+                try self.addError("for step input requires a range input", self.nodeLocation(input1.?), .unsupported_feature);
+                return;
+            }
+            step_expr = index_start_expr;
+            index_start_expr = null;
+            index_end_expr = null;
         }
 
         if (!is_range0) {
@@ -992,10 +1043,27 @@ pub const Transformer = struct {
             const idx_decl = try self.builder.varDecl(&.{idx_name}, idx_start);
             try init_stmts.append(self.allocator, idx_decl);
         }
+        var step_name: ?[]const u8 = null;
+        if (step_expr) |step_value| {
+            const tmp = try self.makeTemp("for_step");
+            step_name = tmp;
+            const step_decl = try self.builder.varDecl(&.{tmp}, step_value);
+            try init_stmts.append(self.allocator, step_decl);
+        }
 
         var cond: ast.Expression = ast.Expression.lit(ast.Literal.number(@as(ast.U256, 1)));
         if (end_expr) |end_val| {
-            cond = try self.builder.builtinCall("lt", &.{ ast.Expression.id(value_name), end_val });
+            if (step_name) |step_id| {
+                const zero_lit = ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0)));
+                const step_neg = try self.builder.builtinCall("slt", &.{ ast.Expression.id(step_id), zero_lit });
+                const pos_cond = try self.builder.builtinCall("lt", &.{ ast.Expression.id(value_name), end_val });
+                const neg_cond = try self.builder.builtinCall("gt", &.{ ast.Expression.id(value_name), end_val });
+                const pos_guard = try self.builder.builtinCall("and", &.{ try self.builder.builtinCall("iszero", &.{step_neg}), pos_cond });
+                const neg_guard = try self.builder.builtinCall("and", &.{ step_neg, neg_cond });
+                cond = try self.builder.builtinCall("or", &.{ pos_guard, neg_guard });
+            } else {
+                cond = try self.builder.builtinCall("lt", &.{ ast.Expression.id(value_name), end_val });
+            }
         }
         if (index_name) |idx_name| {
             if (index_end_expr) |idx_end| {
@@ -1010,9 +1078,10 @@ pub const Transformer = struct {
 
         var post_stmts: std.ArrayList(ast.Statement) = .empty;
         defer post_stmts.deinit(self.allocator);
+        const step_value = if (step_name) |step_id| ast.Expression.id(step_id) else ast.Expression.lit(ast.Literal.number(@as(ast.U256, 1)));
         const inc_call = try self.builder.builtinCall("add", &.{
             ast.Expression.id(value_name),
-            ast.Expression.lit(ast.Literal.number(@as(ast.U256, 1))),
+            step_value,
         });
         const inc_stmt = try self.builder.assign(&.{value_name}, inc_call);
         try post_stmts.append(self.allocator, inc_stmt);
@@ -2595,6 +2664,8 @@ test "transform contract with function" {
     const allocator = std.testing.allocator;
 
     const source =
+        \\const zig2yul = @import("zig2yul.zig");
+        \\
         \\pub const Counter = struct {
         \\    count: u256,
         \\
@@ -2947,6 +3018,14 @@ test "transform loops and control flow" {
         \\            i = i + val;
         \\        }
         \\
+        \\        for (zig2yul.range_step(0, 6, 2)) |step_val| {
+        \\            i = i + step_val;
+        \\        }
+        \\
+        \\        for (zig2yul.range_step(6, 0, 0 - 1)) |rev_val| {
+        \\            i = i + rev_val;
+        \\        }
+        \\
         \\        for (data, 0..3) |val2, idx2| {
         \\            i = i + val2 + idx2;
         \\        }
@@ -2989,6 +3068,7 @@ test "transform loops and control flow" {
     try std.testing.expect(std.mem.indexOf(u8, output, "let j") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "let val") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "let idx") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "for_step") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "let val2") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "let idx2") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "for_break") != null);
