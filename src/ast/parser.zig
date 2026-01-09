@@ -158,6 +158,7 @@ pub const Parser = struct {
     }
 
     /// Get function prototype info
+    /// Note: Does NOT store FnProto directly to avoid dangling buffer references
     pub fn getFnProto(self: *const Self, index: Ast.Node.Index) ?FnProtoInfo {
         const tag = self.getNodeTag(index);
         if (tag != .fn_decl) return null;
@@ -172,7 +173,7 @@ pub const Parser = struct {
 
         return .{
             .name_token = fn_info.name_token,
-            .fn_proto = fn_info,
+            .proto_node = proto_node, // Store node index, not FnProto struct
             .return_type = fn_info.ast.return_type,
             .body_node = body_node,
         };
@@ -185,9 +186,14 @@ pub const Parser = struct {
     };
 
     /// Get function parameters as a list of names
-    pub fn getFnParams(self: *const Self, allocator: Allocator, fn_proto: Ast.full.FnProto) ![]ParamInfo {
+    /// Takes proto_node index and creates FnProto with fresh buffer to avoid dangling references
+    pub fn getFnParams(self: *const Self, allocator: Allocator, proto_node: Ast.Node.Index) ![]ParamInfo {
         var params: std.ArrayList(ParamInfo) = .empty;
         errdefer params.deinit(allocator);
+
+        // Create FnProto with local buffer - buffer stays valid during iteration
+        var buf: [1]Ast.Node.Index = undefined;
+        const fn_proto = self.ast.fullFnProto(&buf, proto_node) orelse return params.toOwnedSlice(allocator);
 
         var it = fn_proto.iterate(&self.ast);
         while (it.next()) |param| {
@@ -203,7 +209,7 @@ pub const Parser = struct {
 
     pub const FnProtoInfo = struct {
         name_token: ?Ast.TokenIndex,
-        fn_proto: Ast.full.FnProto,
+        proto_node: Ast.Node.Index, // Store node index instead of FnProto to avoid buffer lifetime issues
         return_type: Ast.Node.OptionalIndex,
         body_node: Ast.Node.Index,
     };

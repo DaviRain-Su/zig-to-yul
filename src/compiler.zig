@@ -339,7 +339,7 @@ pub const Compiler = struct {
             var param_types: std.ArrayList([]const u8) = .empty;
             defer param_types.deinit(self.allocator);
 
-            const param_infos = try p.getFnParams(self.allocator, proto.fn_proto);
+            const param_infos = try p.getFnParams(self.allocator, proto.proto_node);
             defer self.allocator.free(param_infos);
 
             for (param_infos) |param_info| {
