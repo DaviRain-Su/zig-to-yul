@@ -11,13 +11,13 @@ pub const ScopeId = u32;
 
 /// Symbol kinds
 pub const SymbolKind = enum {
-    variable,       // Local variable
-    parameter,      // Function parameter
-    storage_var,    // Contract storage variable
-    function,       // Function declaration
-    struct_type,    // Struct/contract type
-    constant,       // Compile-time constant
-    builtin,        // Built-in (e.g., evm.caller)
+    variable, // Local variable
+    parameter, // Function parameter
+    storage_var, // Contract storage variable
+    function, // Function declaration
+    struct_type, // Struct/contract type
+    constant, // Compile-time constant
+    builtin, // Built-in (e.g., evm.caller)
 };
 
 /// Symbol information
