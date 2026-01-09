@@ -2071,6 +2071,7 @@ pub const Transformer = struct {
         });
         try stmts.append(self.allocator, ast.Statement.expr(reserve));
 
+        var head_offset: ast.U256 = 0;
         for (fields, 0..) |field, idx| {
             const field_slot = try self.builder.builtinCall("add", &.{
                 ast.Expression.id(mem_name),
@@ -2078,7 +2079,7 @@ pub const Transformer = struct {
             });
             const head_slot = try self.builder.builtinCall("add", &.{
                 head_expr,
-                ast.Expression.lit(ast.Literal.number(@as(ast.U256, @intCast(idx * 32)))),
+                ast.Expression.lit(ast.Literal.number(head_offset)),
             });
 
             if (self.struct_defs.get(field.type_name)) |nested| {
@@ -2095,9 +2096,9 @@ pub const Transformer = struct {
                     const store_ptr = try self.builder.builtinCall("mstore", &.{field_slot, nested_ptr});
                     try stmts.append(self.allocator, ast.Statement.expr(store_ptr));
                 } else {
-                    const val = try self.builder.builtinCall("calldataload", &.{head_slot});
-                    const store = try self.builder.builtinCall("mstore", &.{field_slot, val});
-                    try stmts.append(self.allocator, ast.Statement.expr(store));
+                    const nested_ptr = try self.decodeStructFromHead(nested, head_slot, stmts);
+                    const store_ptr = try self.builder.builtinCall("mstore", &.{field_slot, nested_ptr});
+                    try stmts.append(self.allocator, ast.Statement.expr(store_ptr));
                 }
             } else if (isDynamicAbiType(mapZigTypeToAbi(field.type_name))) {
                 const rel_name = try self.makeTemp("field_off");
@@ -2173,9 +2174,28 @@ pub const Transformer = struct {
                 const store = try self.builder.builtinCall("mstore", &.{field_slot, val});
                 try stmts.append(self.allocator, ast.Statement.expr(store));
             }
+
+            head_offset += @as(ast.U256, @intCast(self.fieldHeadSlots(field) * 32));
         }
 
         return ast.Expression.id(mem_name);
+    }
+
+    fn fieldHeadSlots(self: *Self, field: StructFieldDef) usize {
+        if (self.struct_defs.get(field.type_name)) |nested| {
+            if (self.structHasDynamicField(nested)) return 1;
+            return self.structStaticSlots(nested);
+        }
+        if (isDynamicAbiType(mapZigTypeToAbi(field.type_name))) return 1;
+        return 1;
+    }
+
+    fn structStaticSlots(self: *Self, fields: []const StructFieldDef) usize {
+        var total: usize = 0;
+        for (fields) |field| {
+            total += self.fieldHeadSlots(field);
+        }
+        return total;
     }
 
     pub fn hasErrors(self: *const Self) bool {
@@ -2502,6 +2522,42 @@ test "dispatcher with nested dynamic struct param" {
     defer allocator.free(output);
 
     try std.testing.expect(std.mem.indexOf(u8, output, "calldataload(add(") != null);
+}
+
+test "dispatcher with nested static struct param" {
+    const allocator = std.testing.allocator;
+    const printer = @import("printer.zig");
+
+    const source =
+        \\const Inner = struct {
+        \\    a: u256,
+        \\    b: u256,
+        \\};
+        \\
+        \\const Outer = struct {
+        \\    inner: Inner,
+        \\    x: u256,
+        \\};
+        \\
+        \\pub const Box = struct {
+        \\    pub fn take(self: *Box, p: Outer) u256 {
+        \\        return p.x;
+        \\    }
+        \\};
+    ;
+
+    const source_z = try allocator.dupeZ(u8, source);
+    defer allocator.free(source_z);
+
+    var transformer = Transformer.init(allocator);
+    defer transformer.deinit();
+
+    const yul_ast = try transformer.transform(source_z);
+    const output = try printer.format(allocator, yul_ast);
+    defer allocator.free(output);
+
+    try std.testing.expect(std.mem.indexOf(u8, output, "calldataload(add(4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "calldataload(add(4, 64))") != null);
 }
 
 test "transform loops and control flow" {

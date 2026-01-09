@@ -405,7 +405,7 @@ pub fn hasBuiltin(self: Dialect, name: []const u8) bool { ... }
 | 单返回值 | ✅ | `mstore(0, result); return(0, 32)` |
 | 动态类型 (string, bytes) | ✅ | 偏移量解码 + 长度前缀 |
 | 动态数组 | ✅ | 偏移量解码 + `len*32` |
-| 结构体参数 | ⚠️ 部分 | 支持嵌套动态字段，静态嵌套结构体按单槽处理 |
+| 结构体参数 | ✅ | 支持静态与动态嵌套字段 |
 | 多返回值 | ✅ | 结构体返回会连续 `mstore` |
 | 事件编码 | ⚠️ 部分 | log0-log4 存在，无高级封装 |
 

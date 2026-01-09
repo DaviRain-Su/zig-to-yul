@@ -2105,6 +2105,7 @@ pub const Compiler = struct {
         });
         try stmts.append(self.allocator, .{ .expression = reserve });
 
+        var head_offset: evm_types.U256 = 0;
         for (fields, 0..) |field, idx| {
             const field_slot = try self.ir_builder.builtin_call("add", &.{
                 self.ir_builder.identifier(mem_name),
@@ -2112,7 +2113,7 @@ pub const Compiler = struct {
             });
             const head_slot = try self.ir_builder.builtin_call("add", &.{
                 head_expr,
-                self.ir_builder.literal_num(@as(evm_types.U256, @intCast(idx * 32))),
+                self.ir_builder.literal_num(head_offset),
             });
 
             if (self.struct_defs.get(field.type_name)) |nested| {
@@ -2129,9 +2130,9 @@ pub const Compiler = struct {
                     const store_ptr = try self.ir_builder.builtin_call("mstore", &.{field_slot, nested_ptr});
                     try stmts.append(self.allocator, .{ .expression = store_ptr });
                 } else {
-                    const val = try self.ir_builder.builtin_call("calldataload", &.{head_slot});
-                    const store = try self.ir_builder.builtin_call("mstore", &.{field_slot, val});
-                    try stmts.append(self.allocator, .{ .expression = store });
+                    const nested_ptr = try self.decodeStructFromHeadLegacy(nested, head_slot, stmts);
+                    const store_ptr = try self.ir_builder.builtin_call("mstore", &.{field_slot, nested_ptr});
+                    try stmts.append(self.allocator, .{ .expression = store_ptr });
                 }
             } else if (isDynamicAbiType(mapZigTypeToAbi(field.type_name))) {
                 const rel_name = try self.makeTempLegacy("field_off");
@@ -2207,9 +2208,28 @@ pub const Compiler = struct {
                 const store = try self.ir_builder.builtin_call("mstore", &.{field_slot, val});
                 try stmts.append(self.allocator, .{ .expression = store });
             }
+
+            head_offset += @as(evm_types.U256, @intCast(self.fieldHeadSlotsLegacy(field) * 32));
         }
 
         return self.ir_builder.identifier(mem_name);
+    }
+
+    fn fieldHeadSlotsLegacy(self: *Self, field: StructFieldDef) usize {
+        if (self.struct_defs.get(field.type_name)) |nested| {
+            if (self.structHasDynamicFieldLegacy(nested)) return 1;
+            return self.structStaticSlotsLegacy(nested);
+        }
+        if (isDynamicAbiType(mapZigTypeToAbi(field.type_name))) return 1;
+        return 1;
+    }
+
+    fn structStaticSlotsLegacy(self: *Self, fields: []const StructFieldDef) usize {
+        var total: usize = 0;
+        for (fields) |field| {
+            total += self.fieldHeadSlotsLegacy(field);
+        }
+        return total;
     }
 
     pub fn hasErrors(self: *const Self) bool {
@@ -2393,6 +2413,42 @@ test "compile nested dynamic struct param (legacy)" {
     defer allocator.free(result);
 
     try std.testing.expect(std.mem.indexOf(u8, result, "calldataload(add(") != null);
+}
+
+test "compile nested static struct param (legacy)" {
+    const allocator = std.testing.allocator;
+
+    const source =
+        \\const Inner = struct {
+        \\    a: u256,
+        \\    b: u256,
+        \\};
+        \\
+        \\const Outer = struct {
+        \\    inner: Inner,
+        \\    x: u256,
+        \\};
+        \\
+        \\pub const Box = struct {
+        \\    pub fn take(self: *Box, p: Outer) u256 {
+        \\        return p.x;
+        \\    }
+        \\};
+    ;
+
+    const source_z = try allocator.dupeZ(u8, source);
+    defer allocator.free(source_z);
+
+    var compiler = Compiler.init(allocator);
+    defer compiler.deinit();
+
+    const result = compiler.compile(source_z) catch |err| {
+        return err;
+    };
+    defer allocator.free(result);
+
+    try std.testing.expect(std.mem.indexOf(u8, result, "calldataload(add(4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "calldataload(add(4, 64))") != null);
 }
 
 test "compile simple contract (AST-based)" {
