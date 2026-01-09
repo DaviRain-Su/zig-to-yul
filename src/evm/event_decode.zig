@@ -35,6 +35,7 @@ pub const Value = union(enum) {
     bytes_fixed: BytesValue,
     bytes_dynamic: []const u8,
     string: []const u8,
+    array: []const Value,
     indexed_hash: [32]u8,
 };
 
@@ -51,21 +52,78 @@ pub const DecodedEvent = struct {
 
     pub fn deinit(self: *const DecodedEvent, allocator: Allocator) void {
         for (self.fields) |field| {
-            switch (field.value) {
-                .bytes_dynamic => |b| allocator.free(b),
-                .string => |s| allocator.free(s),
-                else => {},
-            }
+            freeValue(allocator, field.value);
         }
         allocator.free(self.fields);
     }
 };
+
+pub fn writeValue(writer: anytype, value: Value) !void {
+    switch (value) {
+        .uint256 => |v| try writer.print("0x{x}", .{v}),
+        .int256 => |v| try writer.print("{d}", .{v}),
+        .bool => |v| try writer.writeAll(if (v) "true" else "false"),
+        .address => |v| {
+            try writer.writeAll("0x");
+            try writeHex(writer, addressToBytes(v)[0..]);
+        },
+        .bytes_fixed => |b| {
+            try writer.writeAll("0x");
+            try writeHex(writer, b.data[0..b.len]);
+        },
+        .bytes_dynamic => |b| {
+            try writer.writeAll("0x");
+            try writeHex(writer, b);
+        },
+        .string => |s| {
+            try writer.writeAll("\"");
+            try writer.writeAll(s);
+            try writer.writeAll("\"");
+        },
+        .indexed_hash => |h| {
+            try writer.writeAll("0x");
+            try writeHex(writer, h[0..]);
+        },
+        .array => |arr| {
+            try writer.writeAll("[");
+            for (arr, 0..) |elem, i| {
+                if (i > 0) try writer.writeAll(", ");
+                try writeValue(writer, elem);
+            }
+            try writer.writeAll("]");
+        },
+    }
+}
 
 pub const DecodeError = error{
     MissingTopics,
     MissingData,
     UnsupportedType,
     InvalidData,
+};
+
+const ArrayKind = enum {
+    none,
+    dynamic,
+    fixed,
+};
+
+const BaseKind = enum {
+    uint,
+    int,
+    bool,
+    address,
+    bytes_fixed,
+    bytes_dynamic,
+    string,
+};
+
+const ParsedType = struct {
+    base: BaseKind,
+    bits: u16 = 256,
+    bytes_len: u8 = 0,
+    array: ArrayKind = .none,
+    array_len: usize = 0,
 };
 
 pub fn decodeEvent(
@@ -92,7 +150,7 @@ pub fn decodeEvent(
             break :blk try decodeIndexed(param.abi_type, topic_word);
         } else blk: {
             const v = try decodeFromData(allocator, param.abi_type, data, head_offset);
-            head_offset += 32;
+            head_offset += try headSizeForParam(param.abi_type);
             break :blk v;
         };
 
@@ -119,17 +177,23 @@ fn countIndexed(params: []const EventParam) usize {
 }
 
 fn decodeIndexed(abi_type: []const u8, word: [32]u8) !Value {
-    if (isDynamicType(abi_type)) {
+    const parsed = try parseAbiType(abi_type);
+    if (parsed.array != .none or isDynamicBase(parsed.base)) {
         return .{ .indexed_hash = word };
     }
-    return decodeWordStatic(abi_type, word);
+    return decodeWordStatic(parsed, word);
 }
 
 fn decodeFromData(allocator: Allocator, abi_type: []const u8, data: []const u8, head_offset: usize) !Value {
     if (head_offset + 32 > data.len) return error.MissingData;
     const word = readWord(data, head_offset);
 
-    if (isDynamicType(abi_type)) {
+    const parsed = try parseAbiType(abi_type);
+    if (parsed.array != .none) {
+        return decodeArrayFromData(allocator, parsed, word, data, head_offset);
+    }
+
+    if (isDynamicBase(parsed.base)) {
         const offset = u256ToUsize(u256FromBe(word[0..])) orelse return error.InvalidData;
         if (offset + 32 > data.len) return error.InvalidData;
 
@@ -140,44 +204,163 @@ fn decodeFromData(allocator: Allocator, abi_type: []const u8, data: []const u8, 
         if (end > data.len) return error.InvalidData;
 
         const payload = try allocator.dupe(u8, data[start..end]);
-        if (std.mem.eql(u8, abi_type, "string")) {
-            return .{ .string = payload };
-        }
-        return .{ .bytes_dynamic = payload };
+        return switch (parsed.base) {
+            .string => .{ .string = payload },
+            .bytes_dynamic => .{ .bytes_dynamic = payload },
+            else => error.UnsupportedType,
+        };
     }
 
-    return decodeWordStatic(abi_type, word);
+    return decodeWordStatic(parsed, word);
 }
 
-fn decodeWordStatic(abi_type: []const u8, word: [32]u8) !Value {
-    if (std.mem.eql(u8, abi_type, "uint256") or std.mem.eql(u8, abi_type, "uint")) {
-        return .{ .uint256 = u256FromBe(word[0..]) };
+fn decodeWordStatic(parsed: ParsedType, word: [32]u8) !Value {
+    return switch (parsed.base) {
+        .uint => .{ .uint256 = u256FromBe(word[0..]) },
+        .int => .{
+            .int256 = @as(I256, @bitCast(u256FromBe(word[0..]))),
+        },
+        .bool => .{ .bool = u256FromBe(word[0..]) != 0 },
+        .address => .{ .address = addressFromWord(word) },
+        .bytes_fixed => .{ .bytes_fixed = .{ .data = word, .len = parsed.bytes_len } },
+        else => error.UnsupportedType,
+    };
+}
+
+fn decodeArrayFromData(
+    allocator: Allocator,
+    parsed: ParsedType,
+    word: [32]u8,
+    data: []const u8,
+    head_offset: usize,
+) !Value {
+    if (!isStaticBase(parsed.base)) return error.UnsupportedType;
+
+    var start: usize = undefined;
+    var length: usize = undefined;
+
+    switch (parsed.array) {
+        .dynamic => {
+            const offset = u256ToUsize(u256FromBe(word[0..])) orelse return error.InvalidData;
+            if (offset + 32 > data.len) return error.InvalidData;
+            const len_word = readWord(data, offset);
+            length = u256ToUsize(u256FromBe(len_word[0..])) orelse return error.InvalidData;
+            start = offset + 32;
+        },
+        .fixed => {
+            length = parsed.array_len;
+            start = head_offset;
+        },
+        .none => return error.UnsupportedType,
     }
-    if (std.mem.eql(u8, abi_type, "int256") or std.mem.eql(u8, abi_type, "int")) {
-        const u = u256FromBe(word[0..]);
-        return .{ .int256 = @as(I256, @bitCast(u)) };
+
+    const total_bytes = length * 32;
+    if (start + total_bytes > data.len) return error.InvalidData;
+
+    var values = try allocator.alloc(Value, length);
+    errdefer allocator.free(values);
+
+    var i: usize = 0;
+    while (i < length) : (i += 1) {
+        const elem_word = readWord(data, start + i * 32);
+        values[i] = try decodeWordStatic(parsed, elem_word);
     }
-    if (std.mem.eql(u8, abi_type, "bool")) {
-        return .{ .bool = u256FromBe(word[0..]) != 0 };
+
+    return .{ .array = values };
+}
+
+fn parseAbiType(abi_type: []const u8) !ParsedType {
+    var base = abi_type;
+    var array_kind: ArrayKind = .none;
+    var array_len: usize = 0;
+
+    if (std.mem.lastIndexOfScalar(u8, abi_type, '[')) |idx| {
+        if (abi_type[abi_type.len - 1] != ']') return error.UnsupportedType;
+        if (idx == 0) return error.UnsupportedType;
+        base = abi_type[0..idx];
+        const suffix = abi_type[idx + 1 .. abi_type.len - 1];
+        if (suffix.len == 0) {
+            array_kind = .dynamic;
+        } else {
+            array_kind = .fixed;
+            array_len = try parseDecimal(usize, suffix);
+        }
+
+        if (std.mem.indexOfScalar(u8, base, '[') != null) return error.UnsupportedType;
     }
-    if (std.mem.eql(u8, abi_type, "address")) {
-        return .{ .address = addressFromWord(word) };
+
+    const base_parsed = try parseBaseType(base);
+    return .{
+        .base = base_parsed.base,
+        .bits = base_parsed.bits,
+        .bytes_len = base_parsed.bytes_len,
+        .array = array_kind,
+        .array_len = array_len,
+    };
+}
+
+fn parseBaseType(base: []const u8) !ParsedType {
+    if (std.mem.eql(u8, base, "uint")) {
+        return .{ .base = .uint, .bits = 256 };
     }
-    if (std.mem.eql(u8, abi_type, "bytes32")) {
-        return .{ .bytes_fixed = .{ .data = word, .len = 32 } };
+    if (std.mem.startsWith(u8, base, "uint")) {
+        const bits = try parseDecimal(u16, base[4..]);
+        return .{ .base = .uint, .bits = bits };
     }
-    if (std.mem.startsWith(u8, abi_type, "bytes")) {
-        const len = parseBytesLength(abi_type) orelse return error.UnsupportedType;
+    if (std.mem.eql(u8, base, "int")) {
+        return .{ .base = .int, .bits = 256 };
+    }
+    if (std.mem.startsWith(u8, base, "int")) {
+        const bits = try parseDecimal(u16, base[3..]);
+        return .{ .base = .int, .bits = bits };
+    }
+    if (std.mem.eql(u8, base, "bool")) {
+        return .{ .base = .bool };
+    }
+    if (std.mem.eql(u8, base, "address")) {
+        return .{ .base = .address };
+    }
+    if (std.mem.eql(u8, base, "string")) {
+        return .{ .base = .string };
+    }
+    if (std.mem.eql(u8, base, "bytes")) {
+        return .{ .base = .bytes_dynamic };
+    }
+    if (std.mem.startsWith(u8, base, "bytes")) {
+        const len = try parseDecimal(u8, base[5..]);
         if (len < 1 or len > 32) return error.UnsupportedType;
-        var out: [32]u8 = undefined;
-        @memcpy(out[0..], word[0..]);
-        return .{ .bytes_fixed = .{ .data = out, .len = len } };
+        return .{ .base = .bytes_fixed, .bytes_len = len };
     }
     return error.UnsupportedType;
 }
 
-fn isDynamicType(abi_type: []const u8) bool {
-    return std.mem.eql(u8, abi_type, "bytes") or std.mem.eql(u8, abi_type, "string");
+fn parseDecimal(comptime T: type, text: []const u8) !T {
+    if (text.len == 0) return error.UnsupportedType;
+    var value: T = 0;
+    for (text) |c| {
+        if (c < '0' or c > '9') return error.UnsupportedType;
+        value = value * 10 + @as(T, c - '0');
+    }
+    return value;
+}
+
+fn isDynamicBase(base: BaseKind) bool {
+    return base == .bytes_dynamic or base == .string;
+}
+
+fn isStaticBase(base: BaseKind) bool {
+    return switch (base) {
+        .uint, .int, .bool, .address, .bytes_fixed => true,
+        else => false,
+    };
+}
+
+fn headSizeForParam(abi_type: []const u8) !usize {
+    const parsed = try parseAbiType(abi_type);
+    if (parsed.array == .fixed and isStaticBase(parsed.base)) {
+        return parsed.array_len * 32;
+    }
+    return 32;
 }
 
 fn parseBytesLength(abi_type: []const u8) ?u8 {
@@ -235,6 +418,37 @@ fn writeAddressWord(word: *[32]u8, addr: Address) void {
     while (i < 20) : (i += 1) {
         word.*[31 - i] = @intCast(tmp & 0xff);
         tmp >>= 8;
+    }
+}
+
+fn addressToBytes(addr: Address) [20]u8 {
+    var out: [20]u8 = undefined;
+    var tmp = addr;
+    var i: usize = 0;
+    while (i < 20) : (i += 1) {
+        out[19 - i] = @intCast(tmp & 0xff);
+        tmp >>= 8;
+    }
+    return out;
+}
+
+fn freeValue(allocator: Allocator, value: Value) void {
+    switch (value) {
+        .bytes_dynamic => |b| allocator.free(b),
+        .string => |s| allocator.free(s),
+        .array => |arr| {
+            for (arr) |elem| {
+                freeValue(allocator, elem);
+            }
+            allocator.free(arr);
+        },
+        else => {},
+    }
+}
+
+fn writeHex(writer: anytype, bytes: []const u8) !void {
+    for (bytes) |b| {
+        try writer.print("{x:0>2}", .{b});
     }
 }
 
@@ -306,4 +520,70 @@ test "decode string event data" {
     try std.testing.expect(decoded.fields.len == 2);
     try std.testing.expect(decoded.fields[0].value.address == from_addr);
     try std.testing.expect(std.mem.eql(u8, decoded.fields[1].value.string, "hi"));
+}
+
+test "decode dynamic uint array event" {
+    const allocator = std.testing.allocator;
+
+    const event = Event{
+        .name = "Values",
+        .params = &.{
+            .{ .name = "values", .abi_type = "uint256[]", .indexed = false },
+        },
+    };
+
+    var data: [96]u8 = undefined;
+    @memset(&data, 0);
+    writeU256Be(data[0..32], 32); // offset
+    writeU256Be(data[32..64], 2); // length
+    writeU256Be(data[64..96], 10);
+
+    var more: [32]u8 = undefined;
+    @memset(&more, 0);
+    writeU256Be(more[0..], 20);
+
+    var full: [128]u8 = undefined;
+    @memcpy(full[0..96], data[0..96]);
+    @memcpy(full[96..128], more[0..]);
+
+    const topics: [1][32]u8 = .{.{0} ** 32};
+    const decoded = try decodeEvent(allocator, event, topics[0..], full[0..]);
+    defer decoded.deinit(allocator);
+
+    try std.testing.expect(decoded.fields.len == 1);
+    const arr = decoded.fields[0].value.array;
+    try std.testing.expect(arr.len == 2);
+    try std.testing.expect(arr[0].uint256 == 10);
+    try std.testing.expect(arr[1].uint256 == 20);
+}
+
+test "decode fixed address array event" {
+    const allocator = std.testing.allocator;
+
+    const event = Event{
+        .name = "Owners",
+        .params = &.{
+            .{ .name = "owners", .abi_type = "address[2]", .indexed = false },
+        },
+    };
+
+    var data: [64]u8 = undefined;
+    @memset(&data, 0);
+    const a0: Address = 0x0102030405060708090a0b0c0d0e0f1011121314;
+    const a1: Address = 0x1111111111111111111111111111111111111111;
+    var word0: [32]u8 = undefined;
+    var word1: [32]u8 = undefined;
+    writeAddressWord(&word0, a0);
+    writeAddressWord(&word1, a1);
+    @memcpy(data[0..32], word0[0..]);
+    @memcpy(data[32..64], word1[0..]);
+
+    const topics: [1][32]u8 = .{.{0} ** 32};
+    const decoded = try decodeEvent(allocator, event, topics[0..], data[0..]);
+    defer decoded.deinit(allocator);
+
+    const arr = decoded.fields[0].value.array;
+    try std.testing.expect(arr.len == 2);
+    try std.testing.expect(arr[0].address == a0);
+    try std.testing.expect(arr[1].address == a1);
 }

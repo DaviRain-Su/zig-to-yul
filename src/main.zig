@@ -5,6 +5,7 @@ const std = @import("std");
 const Compiler = @import("compiler.zig").Compiler;
 const Transformer = @import("yul/transformer.zig").Transformer;
 const printer = @import("yul/printer.zig");
+const event_decode = @import("evm/event_decode.zig");
 
 const version = "0.1.0";
 
@@ -27,6 +28,8 @@ pub fn main() !void {
         try runCompile(allocator, args[2..]);
     } else if (std.mem.eql(u8, command, "build")) {
         try runBuild(allocator, args[2..]);
+    } else if (std.mem.eql(u8, command, "decode-event")) {
+        try runDecodeEvent(allocator, args[2..]);
     } else if (std.mem.eql(u8, command, "version") or std.mem.eql(u8, command, "--version") or std.mem.eql(u8, command, "-v")) {
         printVersionStdout();
     } else if (std.mem.eql(u8, command, "help") or std.mem.eql(u8, command, "--help") or std.mem.eql(u8, command, "-h")) {
@@ -197,6 +200,136 @@ fn runCompileLegacy(allocator: std.mem.Allocator, args: []const []const u8) !voi
     defer allocator.free(yul_code);
 
     try writeOutput(yul_code, output_file);
+}
+
+const DecodeEventOptions = struct {
+    event_name: ?[]const u8 = null,
+    params: std.ArrayList(event_decode.EventParam) = .empty,
+    topics: std.ArrayList([32]u8) = .empty,
+    data: ?[]const u8 = null,
+
+    pub fn deinit(self: *DecodeEventOptions, allocator: std.mem.Allocator) void {
+        self.params.deinit(allocator);
+        self.topics.deinit(allocator);
+        if (self.data) |d| allocator.free(d);
+    }
+};
+
+fn runDecodeEvent(allocator: std.mem.Allocator, args: []const []const u8) !void {
+    var opts = DecodeEventOptions{};
+    defer opts.deinit(allocator);
+
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
+            printDecodeEventUsageStderr();
+            return;
+        } else if (std.mem.eql(u8, arg, "--event")) {
+            i += 1;
+            if (i >= args.len) return invalidDecodeEvent();
+            opts.event_name = args[i];
+        } else if (std.mem.eql(u8, arg, "--param")) {
+            i += 1;
+            if (i >= args.len) return invalidDecodeEvent();
+            const param = parseEventParam(args[i]) catch return invalidDecodeEvent();
+            try opts.params.append(allocator, param);
+        } else if (std.mem.eql(u8, arg, "--topic")) {
+            i += 1;
+            if (i >= args.len) return invalidDecodeEvent();
+            const topic = parseHex32(args[i]) catch return invalidDecodeEvent();
+            try opts.topics.append(allocator, topic);
+        } else if (std.mem.eql(u8, arg, "--data")) {
+            i += 1;
+            if (i >= args.len) return invalidDecodeEvent();
+            if (opts.data != null) return invalidDecodeEvent();
+            opts.data = parseHexAlloc(allocator, args[i]) catch return invalidDecodeEvent();
+        } else {
+            return invalidDecodeEvent();
+        }
+    }
+
+    if (opts.event_name == null or opts.data == null) {
+        return invalidDecodeEvent();
+    }
+
+    const event = event_decode.Event{
+        .name = opts.event_name.?,
+        .params = opts.params.items,
+    };
+
+    const decoded = try event_decode.decodeEvent(allocator, event, opts.topics.items, opts.data.?);
+    defer decoded.deinit(allocator);
+
+    const stdout = std.fs.File.stdout();
+    var buf: [4096]u8 = undefined;
+    var stream = std.io.fixedBufferStream(&buf);
+    const writer = stream.writer();
+    try writer.print("event {s}\n", .{decoded.name});
+    for (decoded.fields) |field| {
+        try writer.print("- {s} ({s})", .{ field.name, field.abi_type });
+        if (field.indexed) try writer.writeAll(" indexed");
+        try writer.writeAll(": ");
+        try event_decode.writeValue(writer, field.value);
+        try writer.writeAll("\n");
+    }
+    stdout.writeAll(stream.getWritten()) catch {};
+}
+
+fn parseEventParam(text: []const u8) !event_decode.EventParam {
+    var parts = std.mem.splitScalar(u8, text, ':');
+    const name = parts.next() orelse return error.InvalidArgument;
+    const abi_type = parts.next() orelse return error.InvalidArgument;
+    const flag = parts.next();
+    const indexed = if (flag) |f| std.mem.eql(u8, f, "indexed") else false;
+    if (parts.next() != null) return error.InvalidArgument;
+    return .{ .name = name, .abi_type = abi_type, .indexed = indexed };
+}
+
+fn parseHexAlloc(allocator: std.mem.Allocator, text: []const u8) ![]const u8 {
+    const hex = trimHexPrefix(text);
+    if (hex.len % 2 != 0) return error.InvalidArgument;
+    var out = try allocator.alloc(u8, hex.len / 2);
+    errdefer allocator.free(out);
+    var i: usize = 0;
+    while (i < hex.len) : (i += 2) {
+        out[i / 2] = try parseHexByte(hex[i], hex[i + 1]);
+    }
+    return out;
+}
+
+fn parseHex32(text: []const u8) ![32]u8 {
+    const hex = trimHexPrefix(text);
+    if (hex.len != 64) return error.InvalidArgument;
+    var out: [32]u8 = undefined;
+    var i: usize = 0;
+    while (i < hex.len) : (i += 2) {
+        out[i / 2] = try parseHexByte(hex[i], hex[i + 1]);
+    }
+    return out;
+}
+
+fn trimHexPrefix(text: []const u8) []const u8 {
+    if (std.mem.startsWith(u8, text, "0x") or std.mem.startsWith(u8, text, "0X")) {
+        return text[2..];
+    }
+    return text;
+}
+
+fn parseHexByte(a: u8, b: u8) !u8 {
+    return (try hexNibble(a)) << 4 | try hexNibble(b);
+}
+
+fn hexNibble(c: u8) !u8 {
+    if (c >= '0' and c <= '9') return c - '0';
+    if (c >= 'a' and c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' and c <= 'F') return c - 'A' + 10;
+    return error.InvalidArgument;
+}
+
+fn invalidDecodeEvent() !void {
+    printDecodeEventUsageStderr();
+    std.process.exit(1);
 }
 
 const Options = struct {
@@ -414,6 +547,7 @@ fn printUsageStderr() void {
         \\COMMANDS:
         \\    compile     Compile Zig to Yul intermediate language
         \\    build       Compile Zig to EVM bytecode (requires solc)
+        \\    decode-event Decode EVM event logs
         \\    version     Print version information
         \\    help        Print this help message
         \\
@@ -434,6 +568,26 @@ fn printCompileUsageStderr() void {
         \\    -o, --output <file>    Write Yul output to <file>
         \\    --sourcemap           Write a .map file next to output
         \\    -h, --help             Print help
+        \\
+    , .{});
+}
+
+fn printDecodeEventUsageStderr() void {
+    std.debug.print(
+        \\USAGE: zig-to-yul decode-event [options]
+        \\
+        \\OPTIONS:
+        \\    --event <name>         Event name
+        \\    --param <name:type[:indexed]>  Event parameter definition
+        \\    --topic <hex>          32-byte topic hex
+        \\    --data <hex>           Data hex (non-indexed ABI payload)
+        \\    -h, --help             Print help
+        \\
+        \\EXAMPLE:
+        \\    zig-to-yul decode-event --event Transfer \\
+        \\      --param from:address:indexed --param to:address:indexed \\
+        \\      --param value:uint256 --topic 0x... --topic 0x... --topic 0x... \\
+        \\      --data 0x...
         \\
     , .{});
 }
@@ -468,6 +622,7 @@ fn printUsageTo(writer: anytype) !void {
         \\COMMANDS:
         \\    compile     Compile Zig to Yul intermediate language
         \\    build       Compile Zig to EVM bytecode (requires solc)
+        \\    decode-event Decode EVM event logs
         \\    version     Print version information
         \\    help        Print this help message
         \\
@@ -489,6 +644,10 @@ fn printUsageTo(writer: anytype) !void {
         \\
         \\    # Legacy mode (compile to Yul)
         \\    zig-to-yul token.zig -o token.yul
+        \\
+        \\    # Decode an event log
+        \\    zig-to-yul decode-event --event Transfer --param from:address:indexed \\
+        \\      --param to:address:indexed --param value:uint256 --topic 0x... --data 0x...
         \\
         \\For more information, visit: https://github.com/example/zig-to-yul
         \\
