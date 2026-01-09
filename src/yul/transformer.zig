@@ -25,6 +25,7 @@ pub const Transformer = struct {
     functions: std.ArrayList(ast.Statement),
     storage_vars: std.ArrayList(StorageVar),
     function_infos: std.ArrayList(FunctionInfo),
+    temp_counter: u32, // Counter for generating unique temp variable names
 
     // Track allocated strings for cleanup
     temp_strings: std.ArrayList([]const u8),
@@ -107,6 +108,7 @@ pub const Transformer = struct {
             .functions = .empty,
             .storage_vars = .empty,
             .function_infos = .empty,
+            .temp_counter = 0,
             .temp_strings = .empty,
         };
     }
@@ -154,6 +156,11 @@ pub const Transformer = struct {
         if (self.current_contract == null) {
             try self.addError("No contract struct found", .none, .invalid_contract);
             return error.NoContract;
+        }
+
+        // Abort if transformation errors occurred
+        if (self.errors.items.len > 0) {
+            return error.TransformError;
         }
 
         // Generate Yul AST
@@ -500,7 +507,28 @@ pub const Transformer = struct {
         // Use fullIf to properly extract condition and body
         const if_info = p.ast.fullIf(index) orelse return;
 
-        const cond = try self.translateExpression(if_info.ast.cond_expr);
+        const cond_expr = try self.translateExpression(if_info.ast.cond_expr);
+        const has_else = if_info.ast.else_expr.unwrap() != null;
+
+        // If there's an else branch, cache condition in temp to avoid double evaluation
+        // (condition may have side effects like function calls)
+        var cond_var_name: ?[]const u8 = null;
+        var cond: ast.Expression = cond_expr;
+
+        if (has_else) {
+            // Generate unique temp name
+            const temp_name = try std.fmt.allocPrint(self.allocator, "_cond_{d}", .{self.temp_counter});
+            self.temp_counter += 1;
+            try self.temp_strings.append(self.allocator, temp_name);
+            cond_var_name = temp_name;
+
+            // Emit: let _cond_N := <condition>
+            const var_decl = try self.builder.varDecl(&.{temp_name}, cond_expr);
+            try stmts.append(self.allocator, var_decl);
+
+            // Use the temp variable as condition
+            cond = ast.Expression.id(temp_name);
+        }
 
         // Process then branch
         var then_body: std.ArrayList(ast.Statement) = .empty;
@@ -529,6 +557,7 @@ pub const Transformer = struct {
 
             if (else_body.items.len > 0) {
                 const else_block = try self.builder.block(else_body.items);
+                // Use the cached temp variable for iszero
                 const negated_cond = try self.builder.call("iszero", &.{cond});
                 const else_stmt = self.builder.ifStmt(negated_cond, else_block);
                 try stmts.append(self.allocator, else_stmt);

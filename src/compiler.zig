@@ -34,6 +34,7 @@ pub const Compiler = struct {
     functions: std.ArrayList(yul_ir.Statement),
     storage_vars: std.ArrayList(StorageVar),
     function_infos: std.ArrayList(FunctionInfo),
+    temp_counter: u32, // Counter for generating unique temp variable names
 
     // Track allocated memory for cleanup
     temp_strings: std.ArrayList([]const u8),
@@ -116,6 +117,7 @@ pub const Compiler = struct {
             .functions = .empty,
             .storage_vars = .empty,
             .function_infos = .empty,
+            .temp_counter = 0,
             .temp_strings = .empty,
             .alloc_stmts = .empty,
             .alloc_cases = .empty,
@@ -177,6 +179,11 @@ pub const Compiler = struct {
         if (self.current_contract == null) {
             try self.addError("No contract struct found", 0, 0, .invalid_contract);
             return error.NoContract;
+        }
+
+        // Abort if compilation errors occurred
+        if (self.errors.items.len > 0) {
+            return error.CompileError;
         }
 
         // Generate Yul object
@@ -557,7 +564,26 @@ pub const Compiler = struct {
         // Use fullIf to properly extract condition and body
         const if_info = p.ast.fullIf(index) orelse return;
 
-        const cond = try self.translateExpression(if_info.ast.cond_expr);
+        const cond_expr = try self.translateExpression(if_info.ast.cond_expr);
+        const has_else = if_info.ast.else_expr.unwrap() != null;
+
+        // If there's an else branch, cache condition in temp to avoid double evaluation
+        // (condition may have side effects like function calls)
+        var cond: yul_ir.Expression = cond_expr;
+
+        if (has_else) {
+            // Generate unique temp name
+            const temp_name = try std.fmt.allocPrint(self.allocator, "_cond_{d}", .{self.temp_counter});
+            self.temp_counter += 1;
+            try self.temp_strings.append(self.allocator, temp_name);
+
+            // Emit: let _cond_N := <condition>
+            const var_decl = try self.ir_builder.variable(&.{temp_name}, cond_expr);
+            try stmts.append(self.allocator, var_decl);
+
+            // Use the temp variable as condition
+            cond = self.ir_builder.identifier(temp_name);
+        }
 
         // Process then branch
         var then_body: std.ArrayList(yul_ir.Statement) = .empty;
@@ -581,6 +607,7 @@ pub const Compiler = struct {
             }
 
             if (else_body.items.len > 0) {
+                // Use the cached temp variable for iszero
                 const negated_cond = try self.ir_builder.call("iszero", &.{cond});
                 const else_stmt = try self.ir_builder.if_stmt(negated_cond, else_body.items);
                 try stmts.append(self.allocator, else_stmt);

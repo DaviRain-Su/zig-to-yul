@@ -294,6 +294,7 @@ pub const BuiltinName = struct {
             "memoryguard", // Yul memory guard for optimizer
             "loadimmutable", "setimmutable", // Yul immutable support
             "linkersymbol", // Linker placeholder
+            "verbatim", // Raw bytecode insertion (verbatim_*i_*o family)
             // Stack operations (limited in Yul)
             "pop",
         };
@@ -709,6 +710,8 @@ pub const AstBuilder = struct {
         for (names, 0..) |n, i| {
             typed[i] = TypedName.init(n);
         }
+        // Track allocation for cleanup
+        try self.typed_names.append(self.allocator, typed);
         return Statement.varDecl(typed, value);
     }
 
@@ -718,6 +721,8 @@ pub const AstBuilder = struct {
         for (names, 0..) |n, i| {
             ids[i] = Identifier.init(n);
         }
+        // Track allocation for cleanup
+        try self.identifiers.append(self.allocator, ids);
         return Statement.assign(ids, value);
     }
 
@@ -738,11 +743,15 @@ pub const AstBuilder = struct {
         for (params, 0..) |p, i| {
             param_typed[i] = TypedName.init(p);
         }
+        // Track allocation for cleanup
+        try self.typed_names.append(self.allocator, param_typed);
 
         const return_typed = try self.allocator.alloc(TypedName, returns.len);
         for (returns, 0..) |r, i| {
             return_typed[i] = TypedName.init(r);
         }
+        // Track allocation for cleanup
+        try self.typed_names.append(self.allocator, return_typed);
 
         return Statement.funcDef(name, param_typed, return_typed, body);
     }
