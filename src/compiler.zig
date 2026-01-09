@@ -60,6 +60,9 @@ pub const Compiler = struct {
         has_return: bool,
         is_public: bool,
         selector: u32,
+        return_abi: ?[]const u8,
+        return_struct_len: usize,
+        return_is_dynamic: bool,
 
         /// Calculate function selector using keccak256
         pub fn calculateSelector(allocator: Allocator, name: []const u8, param_types: []const []const u8) !u32 {
@@ -171,6 +174,7 @@ pub const Compiler = struct {
         for (self.function_infos.items) |fi| {
             self.allocator.free(fi.params);
             self.allocator.free(fi.param_types);
+            if (fi.return_abi) |ret| self.allocator.free(ret);
         }
         self.function_infos.deinit(self.allocator);
 
@@ -418,10 +422,21 @@ pub const Compiler = struct {
             }
 
             // Check if function has a return value (not void)
+            var return_abi: ?[]const u8 = null;
+            var return_struct_len: usize = 0;
+            var return_is_dynamic = false;
             const has_return = blk: {
                 if (proto.return_type.unwrap()) |ret_type| {
                     const ret_src = p.getNodeSource(ret_type);
-                    break :blk !std.mem.eql(u8, ret_src, "void");
+                    if (std.mem.eql(u8, ret_src, "void")) break :blk false;
+                    if (self.struct_defs.get(ret_src)) |fields| {
+                        return_struct_len = fields.len;
+                    } else {
+                        const abi = mapZigTypeToAbi(ret_src);
+                        return_abi = try self.allocator.dupe(u8, abi);
+                        return_is_dynamic = isDynamicAbiType(abi);
+                    }
+                    break :blk true;
                 }
                 break :blk false;
             };
@@ -443,6 +458,9 @@ pub const Compiler = struct {
                     .has_return = has_return,
                     .is_public = true,
                     .selector = selector,
+                    .return_abi = return_abi,
+                    .return_struct_len = return_struct_len,
+                    .return_is_dynamic = return_is_dynamic,
                 });
             }
 
@@ -461,7 +479,20 @@ pub const Compiler = struct {
         if (std.mem.eql(u8, zig_type, "Address") or std.mem.eql(u8, zig_type, "evm.Address")) return "address";
         if (std.mem.eql(u8, zig_type, "[20]u8")) return "address";
         if (std.mem.eql(u8, zig_type, "[32]u8")) return "bytes32";
+        if (std.mem.eql(u8, zig_type, "[]u8")) return "bytes";
+        if (std.mem.eql(u8, zig_type, "[]const u8")) return "string";
+        if (std.mem.startsWith(u8, zig_type, "[]")) {
+            return "uint256[]";
+        }
         return "uint256";
+    }
+
+    fn isDynamicAbiType(abi: []const u8) bool {
+        return std.mem.eql(u8, abi, "bytes") or std.mem.eql(u8, abi, "string") or std.mem.endsWith(u8, abi, "[]");
+    }
+
+    fn isDynamicArrayAbiType(abi: []const u8) bool {
+        return std.mem.endsWith(u8, abi, "[]");
     }
 
     fn generateFunction(
@@ -1622,12 +1653,86 @@ pub const Compiler = struct {
 
             for (fi.params, 0..) |param_name, i| {
                 const offset: evm_types.U256 = 4 + @as(evm_types.U256, @intCast(i)) * 32;
-                const load_call = try self.ir_builder.builtin_call("calldataload", &.{
-                    self.ir_builder.literal_num(offset),
-                });
-                const var_decl = try self.ir_builder.variable(&.{param_name}, load_call);
-                try case_stmts.append(self.allocator, var_decl);
-                try call_args.append(self.allocator, self.ir_builder.identifier(param_name));
+                const abi_type = fi.param_types[i];
+                if (isDynamicAbiType(abi_type)) {
+                    const offset_name = try self.makeTempLegacy("offset");
+                    const head_name = try self.makeTempLegacy("head");
+                    const len_name = try self.makeTempLegacy("len");
+                    const mem_name = try self.makeTempLegacy("mem");
+                    const data_name = try self.makeTempLegacy("data");
+                    const size_name = try self.makeTempLegacy("size");
+
+                    const offset_expr = try self.ir_builder.builtin_call("calldataload", &.{
+                        self.ir_builder.literal_num(offset),
+                    });
+                    try case_stmts.append(self.allocator, try self.ir_builder.variable(&.{offset_name}, offset_expr));
+
+                    const head_expr = try self.ir_builder.builtin_call("add", &.{
+                        self.ir_builder.literal_num(@as(evm_types.U256, 4)),
+                        self.ir_builder.identifier(offset_name),
+                    });
+                    try case_stmts.append(self.allocator, try self.ir_builder.variable(&.{head_name}, head_expr));
+
+                    const len_expr = try self.ir_builder.builtin_call("calldataload", &.{self.ir_builder.identifier(head_name)});
+                    try case_stmts.append(self.allocator, try self.ir_builder.variable(&.{len_name}, len_expr));
+
+                    const mem_expr = try self.ir_builder.builtin_call("mload", &.{
+                        self.ir_builder.literal_num(@as(evm_types.U256, 0x40)),
+                    });
+                    try case_stmts.append(self.allocator, try self.ir_builder.variable(&.{mem_name}, mem_expr));
+
+                    const store_len = try self.ir_builder.builtin_call("mstore", &.{
+                        self.ir_builder.identifier(mem_name),
+                        self.ir_builder.identifier(len_name),
+                    });
+                    try case_stmts.append(self.allocator, .{ .expression = store_len });
+
+                    const data_expr = try self.ir_builder.builtin_call("add", &.{
+                        self.ir_builder.identifier(mem_name),
+                        self.ir_builder.literal_num(@as(evm_types.U256, 32)),
+                    });
+                    try case_stmts.append(self.allocator, try self.ir_builder.variable(&.{data_name}, data_expr));
+
+                    const size_expr = if (isDynamicArrayAbiType(abi_type))
+                        try self.ir_builder.builtin_call("mul", &.{
+                            self.ir_builder.identifier(len_name),
+                            self.ir_builder.literal_num(@as(evm_types.U256, 32)),
+                        })
+                    else
+                        try self.ir_builder.builtin_call("and", &.{
+                            try self.ir_builder.builtin_call("add", &.{
+                                self.ir_builder.identifier(len_name),
+                                self.ir_builder.literal_num(@as(evm_types.U256, 31)),
+                            }),
+                            try self.ir_builder.builtin_call("not", &.{self.ir_builder.literal_num(@as(evm_types.U256, 31))}),
+                        });
+                    try case_stmts.append(self.allocator, try self.ir_builder.variable(&.{size_name}, size_expr));
+
+                    const data_start = try self.ir_builder.builtin_call("add", &.{
+                        self.ir_builder.identifier(head_name),
+                        self.ir_builder.literal_num(@as(evm_types.U256, 32)),
+                    });
+                    try self.appendMemoryCopyLoopLegacy(&case_stmts, self.ir_builder.identifier(data_name), data_start, self.ir_builder.identifier(size_name));
+
+                    const update_free = try self.ir_builder.builtin_call("mstore", &.{
+                        self.ir_builder.literal_num(@as(evm_types.U256, 0x40)),
+                        try self.ir_builder.builtin_call("add", &.{
+                            self.ir_builder.identifier(data_name),
+                            self.ir_builder.identifier(size_name),
+                        }),
+                    });
+                    try case_stmts.append(self.allocator, .{ .expression = update_free });
+
+                    try case_stmts.append(self.allocator, try self.ir_builder.variable(&.{param_name}, self.ir_builder.identifier(mem_name)));
+                    try call_args.append(self.allocator, self.ir_builder.identifier(param_name));
+                } else {
+                    const load_call = try self.ir_builder.builtin_call("calldataload", &.{
+                        self.ir_builder.literal_num(offset),
+                    });
+                    const var_decl = try self.ir_builder.variable(&.{param_name}, load_call);
+                    try case_stmts.append(self.allocator, var_decl);
+                    try call_args.append(self.allocator, self.ir_builder.identifier(param_name));
+                }
             }
 
             const func_call = try self.ir_builder.call(fi.name, call_args.items);
@@ -1636,17 +1741,101 @@ pub const Compiler = struct {
                 const result_decl = try self.ir_builder.variable(&.{"_result"}, func_call);
                 try case_stmts.append(self.allocator, result_decl);
 
-                const mstore_call = try self.ir_builder.builtin_call("mstore", &.{
-                    self.ir_builder.literal_num(0),
-                    self.ir_builder.identifier("_result"),
-                });
-                try case_stmts.append(self.allocator, .{ .expression = mstore_call });
+                if (fi.return_struct_len > 0) {
+                    for (0..fi.return_struct_len) |idx| {
+                        const offset = self.ir_builder.literal_num(@as(evm_types.U256, @intCast(idx * 32)));
+                        const src = try self.ir_builder.builtin_call("add", &.{self.ir_builder.identifier("_result"), offset});
+                        const val = try self.ir_builder.builtin_call("mload", &.{src});
+                        const store = try self.ir_builder.builtin_call("mstore", &.{
+                            self.ir_builder.literal_num(@as(evm_types.U256, @intCast(idx * 32))),
+                            val,
+                        });
+                        try case_stmts.append(self.allocator, .{ .expression = store });
+                    }
+                    const size = self.ir_builder.literal_num(@as(evm_types.U256, @intCast(fi.return_struct_len * 32)));
+                    const return_call = try self.ir_builder.builtin_call("return", &.{
+                        self.ir_builder.literal_num(0),
+                        size,
+                    });
+                    try case_stmts.append(self.allocator, .{ .expression = return_call });
+                } else if (fi.return_is_dynamic) {
+                    const len_name = try self.makeTempLegacy("ret_len");
+                    const size_name = try self.makeTempLegacy("ret_size");
+                    const data_name = try self.makeTempLegacy("ret_data");
 
-                const return_call = try self.ir_builder.builtin_call("return", &.{
-                    self.ir_builder.literal_num(0),
-                    self.ir_builder.literal_num(32),
-                });
-                try case_stmts.append(self.allocator, .{ .expression = return_call });
+                    const len_expr = try self.ir_builder.builtin_call("mload", &.{self.ir_builder.identifier("_result")});
+                    try case_stmts.append(self.allocator, try self.ir_builder.variable(&.{len_name}, len_expr));
+
+                    const data_expr = try self.ir_builder.builtin_call("add", &.{
+                        self.ir_builder.identifier("_result"),
+                        self.ir_builder.literal_num(@as(evm_types.U256, 32)),
+                    });
+                    try case_stmts.append(self.allocator, try self.ir_builder.variable(&.{data_name}, data_expr));
+
+                    const size_expr = if (fi.return_abi) |abi| blk: {
+                        if (isDynamicArrayAbiType(abi)) {
+                            break :blk try self.ir_builder.builtin_call("mul", &.{
+                                self.ir_builder.identifier(len_name),
+                                self.ir_builder.literal_num(@as(evm_types.U256, 32)),
+                            });
+                        }
+                        break :blk try self.ir_builder.builtin_call("and", &.{
+                            try self.ir_builder.builtin_call("add", &.{
+                                self.ir_builder.identifier(len_name),
+                                self.ir_builder.literal_num(@as(evm_types.U256, 31)),
+                            }),
+                            try self.ir_builder.builtin_call("not", &.{self.ir_builder.literal_num(@as(evm_types.U256, 31))}),
+                        });
+                    } else try self.ir_builder.builtin_call("and", &.{
+                        try self.ir_builder.builtin_call("add", &.{
+                            self.ir_builder.identifier(len_name),
+                            self.ir_builder.literal_num(@as(evm_types.U256, 31)),
+                        }),
+                        try self.ir_builder.builtin_call("not", &.{self.ir_builder.literal_num(@as(evm_types.U256, 31))}),
+                    });
+                    try case_stmts.append(self.allocator, try self.ir_builder.variable(&.{size_name}, size_expr));
+
+                    const store_offset = try self.ir_builder.builtin_call("mstore", &.{
+                        self.ir_builder.literal_num(0),
+                        self.ir_builder.literal_num(@as(evm_types.U256, 32)),
+                    });
+                    try case_stmts.append(self.allocator, .{ .expression = store_offset });
+
+                    const store_len = try self.ir_builder.builtin_call("mstore", &.{
+                        self.ir_builder.literal_num(@as(evm_types.U256, 32)),
+                        self.ir_builder.identifier(len_name),
+                    });
+                    try case_stmts.append(self.allocator, .{ .expression = store_len });
+
+                    try self.appendMemoryCopyLoopLegacy(
+                        &case_stmts,
+                        self.ir_builder.literal_num(@as(evm_types.U256, 64)),
+                        self.ir_builder.identifier(data_name),
+                        self.ir_builder.identifier(size_name),
+                    );
+
+                    const total = try self.ir_builder.builtin_call("add", &.{
+                        self.ir_builder.literal_num(@as(evm_types.U256, 64)),
+                        self.ir_builder.identifier(size_name),
+                    });
+                    const return_call = try self.ir_builder.builtin_call("return", &.{
+                        self.ir_builder.literal_num(0),
+                        total,
+                    });
+                    try case_stmts.append(self.allocator, .{ .expression = return_call });
+                } else {
+                    const mstore_call = try self.ir_builder.builtin_call("mstore", &.{
+                        self.ir_builder.literal_num(0),
+                        self.ir_builder.identifier("_result"),
+                    });
+                    try case_stmts.append(self.allocator, .{ .expression = mstore_call });
+
+                    const return_call = try self.ir_builder.builtin_call("return", &.{
+                        self.ir_builder.literal_num(0),
+                        self.ir_builder.literal_num(32),
+                    });
+                    try case_stmts.append(self.allocator, .{ .expression = return_call });
+                }
             } else {
                 try case_stmts.append(self.allocator, .{ .expression = func_call });
                 const return_call = try self.ir_builder.builtin_call("return", &.{
@@ -1679,6 +1868,43 @@ pub const Compiler = struct {
         );
 
         try stmts.append(self.allocator, switch_stmt);
+    }
+
+    fn makeTempLegacy(self: *Self, label: []const u8) ![]const u8 {
+        const name = try std.fmt.allocPrint(self.allocator, "$zig2yul${s}${d}", .{ label, self.temp_counter });
+        self.temp_counter += 1;
+        try self.temp_strings.append(self.allocator, name);
+        return name;
+    }
+
+    fn appendMemoryCopyLoopLegacy(
+        self: *Self,
+        stmts: *std.ArrayList(yul_ir.Statement),
+        dest: yul_ir.Expression,
+        src: yul_ir.Expression,
+        size: yul_ir.Expression,
+    ) ProcessError!void {
+        const idx_name = try self.makeTempLegacy("copy_i");
+        const init_decl = try self.ir_builder.variable(&.{idx_name}, self.ir_builder.literal_num(@as(evm_types.U256, 0)));
+        const cond = try self.ir_builder.builtin_call("lt", &.{self.ir_builder.identifier(idx_name), size});
+        const post_expr = try self.ir_builder.builtin_call("add", &.{
+            self.ir_builder.identifier(idx_name),
+            self.ir_builder.literal_num(@as(evm_types.U256, 32)),
+        });
+        const post_stmt = try self.ir_builder.assign(&.{idx_name}, post_expr);
+
+        const src_addr = try self.ir_builder.builtin_call("add", &.{src, self.ir_builder.identifier(idx_name)});
+        const val = try self.ir_builder.builtin_call("mload", &.{src_addr});
+        const dst_addr = try self.ir_builder.builtin_call("add", &.{dest, self.ir_builder.identifier(idx_name)});
+        const store = try self.ir_builder.builtin_call("mstore", &.{dst_addr, val});
+
+        const loop_stmt = try self.ir_builder.for_loop(
+            &.{init_decl},
+            cond,
+            &.{post_stmt},
+            &.{.{ .expression = store }},
+        );
+        try stmts.append(self.allocator, loop_stmt);
     }
 
     pub fn hasErrors(self: *const Self) bool {

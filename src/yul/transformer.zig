@@ -49,6 +49,9 @@ pub const Transformer = struct {
         has_return: bool, // Track if function has non-void return
         is_public: bool,
         selector: u32, // First 4 bytes of keccak256(signature)
+        return_abi: ?[]const u8,
+        return_struct_len: usize,
+        return_is_dynamic: bool,
 
         /// Calculate function selector using keccak256
         /// Selector = first 4 bytes of keccak256("funcName(type1,type2,...)")
@@ -159,6 +162,7 @@ pub const Transformer = struct {
         for (self.function_infos.items) |fi| {
             self.allocator.free(fi.params);
             self.allocator.free(fi.param_types);
+            if (fi.return_abi) |ret| self.allocator.free(ret);
         }
         self.function_infos.deinit(self.allocator);
 
@@ -367,10 +371,21 @@ pub const Transformer = struct {
             }
 
             // Check if function has a return value (not void)
+            var return_abi: ?[]const u8 = null;
+            var return_struct_len: usize = 0;
+            var return_is_dynamic = false;
             const has_return = blk: {
                 if (proto.return_type.unwrap()) |ret_type| {
                     const ret_src = p.getNodeSource(ret_type);
-                    break :blk !std.mem.eql(u8, ret_src, "void");
+                    if (std.mem.eql(u8, ret_src, "void")) break :blk false;
+                    if (self.struct_defs.get(ret_src)) |fields| {
+                        return_struct_len = fields.len;
+                    } else {
+                        const abi = mapZigTypeToAbi(ret_src);
+                        return_abi = try self.allocator.dupe(u8, abi);
+                        return_is_dynamic = isDynamicAbiType(abi);
+                    }
+                    break :blk true;
                 }
                 break :blk false;
             };
@@ -392,6 +407,9 @@ pub const Transformer = struct {
                     .has_return = has_return,
                     .is_public = true,
                     .selector = selector,
+                    .return_abi = return_abi,
+                    .return_struct_len = return_struct_len,
+                    .return_is_dynamic = return_is_dynamic,
                 });
             }
 
@@ -410,8 +428,21 @@ pub const Transformer = struct {
         if (std.mem.eql(u8, zig_type, "Address") or std.mem.eql(u8, zig_type, "evm.Address")) return "address";
         if (std.mem.eql(u8, zig_type, "[20]u8")) return "address";
         if (std.mem.eql(u8, zig_type, "[32]u8")) return "bytes32";
+        if (std.mem.eql(u8, zig_type, "[]u8")) return "bytes";
+        if (std.mem.eql(u8, zig_type, "[]const u8")) return "string";
+        if (std.mem.startsWith(u8, zig_type, "[]")) {
+            return "uint256[]";
+        }
         // Default to uint256 for unknown types
         return "uint256";
+    }
+
+    fn isDynamicAbiType(abi: []const u8) bool {
+        return std.mem.eql(u8, abi, "bytes") or std.mem.eql(u8, abi, "string") or std.mem.endsWith(u8, abi, "[]");
+    }
+
+    fn isDynamicArrayAbiType(abi: []const u8) bool {
+        return std.mem.endsWith(u8, abi, "[]");
     }
 
     fn generateFunction(
@@ -1600,16 +1631,88 @@ pub const Transformer = struct {
         defer call_args.deinit(self.allocator);
 
         for (fi.params, 0..) |param_name, i| {
-            // let paramN := calldataload(4 + i*32)
             const offset: evm_types.U256 = 4 + @as(evm_types.U256, @intCast(i)) * 32;
-            const load_call = try self.builder.builtinCall("calldataload", &.{
-                ast.Expression.lit(ast.Literal.number(offset)),
-            });
-            const var_decl = try self.builder.varDecl(&.{param_name}, load_call);
-            try case_stmts.append(self.allocator, var_decl);
+            const abi_type = fi.param_types[i];
+            if (isDynamicAbiType(abi_type)) {
+                const offset_name = try self.makeTemp("offset");
+                const head_name = try self.makeTemp("head");
+                const len_name = try self.makeTemp("len");
+                const mem_name = try self.makeTemp("mem");
+                const data_name = try self.makeTemp("data");
+                const size_name = try self.makeTemp("size");
 
-            // Add to call arguments
-            try call_args.append(self.allocator, ast.Expression.id(param_name));
+                const offset_expr = try self.builder.builtinCall("calldataload", &.{
+                    ast.Expression.lit(ast.Literal.number(offset)),
+                });
+                try case_stmts.append(self.allocator, try self.builder.varDecl(&.{offset_name}, offset_expr));
+
+                const head_expr = try self.builder.builtinCall("add", &.{
+                    ast.Expression.lit(ast.Literal.number(@as(ast.U256, 4))),
+                    ast.Expression.id(offset_name),
+                });
+                try case_stmts.append(self.allocator, try self.builder.varDecl(&.{head_name}, head_expr));
+
+                const len_expr = try self.builder.builtinCall("calldataload", &.{ast.Expression.id(head_name)});
+                try case_stmts.append(self.allocator, try self.builder.varDecl(&.{len_name}, len_expr));
+
+                const mem_expr = try self.builder.builtinCall("mload", &.{
+                    ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0x40))),
+                });
+                try case_stmts.append(self.allocator, try self.builder.varDecl(&.{mem_name}, mem_expr));
+
+                const store_len = try self.builder.builtinCall("mstore", &.{
+                    ast.Expression.id(mem_name),
+                    ast.Expression.id(len_name),
+                });
+                try case_stmts.append(self.allocator, ast.Statement.expr(store_len));
+
+                const data_expr = try self.builder.builtinCall("add", &.{
+                    ast.Expression.id(mem_name),
+                    ast.Expression.lit(ast.Literal.number(@as(ast.U256, 32))),
+                });
+                try case_stmts.append(self.allocator, try self.builder.varDecl(&.{data_name}, data_expr));
+
+                const size_expr = if (isDynamicArrayAbiType(abi_type))
+                    try self.builder.builtinCall("mul", &.{
+                        ast.Expression.id(len_name),
+                        ast.Expression.lit(ast.Literal.number(@as(ast.U256, 32))),
+                    })
+                else
+                    try self.builder.builtinCall("and", &.{
+                        try self.builder.builtinCall("add", &.{
+                            ast.Expression.id(len_name),
+                            ast.Expression.lit(ast.Literal.number(@as(ast.U256, 31))),
+                        }),
+                        try self.builder.builtinCall("not", &.{ast.Expression.lit(ast.Literal.number(@as(ast.U256, 31)))}),
+                    });
+                try case_stmts.append(self.allocator, try self.builder.varDecl(&.{size_name}, size_expr));
+
+                const data_start = try self.builder.builtinCall("add", &.{
+                    ast.Expression.id(head_name),
+                    ast.Expression.lit(ast.Literal.number(@as(ast.U256, 32))),
+                });
+                try self.appendMemoryCopyLoop(&case_stmts, ast.Expression.id(data_name), data_start, ast.Expression.id(size_name));
+
+                const update_free = try self.builder.builtinCall("mstore", &.{
+                    ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0x40))),
+                    try self.builder.builtinCall("add", &.{
+                        ast.Expression.id(data_name),
+                        ast.Expression.id(size_name),
+                    }),
+                });
+                try case_stmts.append(self.allocator, ast.Statement.expr(update_free));
+
+                const var_decl = try self.builder.varDecl(&.{param_name}, ast.Expression.id(mem_name));
+                try case_stmts.append(self.allocator, var_decl);
+                try call_args.append(self.allocator, ast.Expression.id(param_name));
+            } else {
+                const load_call = try self.builder.builtinCall("calldataload", &.{
+                    ast.Expression.lit(ast.Literal.number(offset)),
+                });
+                const var_decl = try self.builder.varDecl(&.{param_name}, load_call);
+                try case_stmts.append(self.allocator, var_decl);
+                try call_args.append(self.allocator, ast.Expression.id(param_name));
+            }
         }
 
         const func_call = try self.builder.call(fi.name, call_args.items);
@@ -1621,18 +1724,99 @@ pub const Transformer = struct {
             // return(0, 32)
             const result_decl = try self.builder.varDecl(&.{"_result"}, func_call);
             try case_stmts.append(self.allocator, result_decl);
+            if (fi.return_struct_len > 0) {
+                const base = ast.Expression.id("_result");
+                for (0..fi.return_struct_len) |idx| {
+                    const offset = ast.Expression.lit(ast.Literal.number(@as(ast.U256, @intCast(idx * 32))));
+                    const src = try self.builder.builtinCall("add", &.{base, offset});
+                    const val = try self.builder.builtinCall("mload", &.{src});
+                    const store = try self.builder.builtinCall("mstore", &.{
+                        ast.Expression.lit(ast.Literal.number(@as(ast.U256, @intCast(idx * 32)))),
+                        val,
+                    });
+                    try case_stmts.append(self.allocator, ast.Statement.expr(store));
+                }
+                const size = ast.Expression.lit(ast.Literal.number(@as(ast.U256, @intCast(fi.return_struct_len * 32))));
+                const return_call = try self.builder.builtinCall("return", &.{
+                    ast.Expression.lit(ast.Literal.number(0)),
+                    size,
+                });
+                try case_stmts.append(self.allocator, ast.Statement.expr(return_call));
+            } else if (fi.return_is_dynamic) {
+                const ret_ptr = ast.Expression.id("_result");
+                const len_name = try self.makeTemp("ret_len");
+                const size_name = try self.makeTemp("ret_size");
+                const data_name = try self.makeTemp("ret_data");
 
-            const mstore_call = try self.builder.builtinCall("mstore", &.{
-                ast.Expression.lit(ast.Literal.number(0)),
-                ast.Expression.id("_result"),
-            });
-            try case_stmts.append(self.allocator, ast.Statement.expr(mstore_call));
+                const len_expr = try self.builder.builtinCall("mload", &.{ret_ptr});
+                try case_stmts.append(self.allocator, try self.builder.varDecl(&.{len_name}, len_expr));
 
-            const return_call = try self.builder.builtinCall("return", &.{
-                ast.Expression.lit(ast.Literal.number(0)),
-                ast.Expression.lit(ast.Literal.number(32)),
-            });
-            try case_stmts.append(self.allocator, ast.Statement.expr(return_call));
+                const data_expr = try self.builder.builtinCall("add", &.{
+                    ret_ptr,
+                    ast.Expression.lit(ast.Literal.number(@as(ast.U256, 32))),
+                });
+                try case_stmts.append(self.allocator, try self.builder.varDecl(&.{data_name}, data_expr));
+
+                const size_expr = if (fi.return_abi) |abi| blk: {
+                    if (isDynamicArrayAbiType(abi)) {
+                        break :blk try self.builder.builtinCall("mul", &.{
+                            ast.Expression.id(len_name),
+                            ast.Expression.lit(ast.Literal.number(@as(ast.U256, 32))),
+                        });
+                    }
+                    break :blk try self.builder.builtinCall("and", &.{
+                        try self.builder.builtinCall("add", &.{
+                            ast.Expression.id(len_name),
+                            ast.Expression.lit(ast.Literal.number(@as(ast.U256, 31))),
+                        }),
+                        try self.builder.builtinCall("not", &.{ast.Expression.lit(ast.Literal.number(@as(ast.U256, 31)))}),
+                    });
+                } else try self.builder.builtinCall("and", &.{
+                    try self.builder.builtinCall("add", &.{
+                        ast.Expression.id(len_name),
+                        ast.Expression.lit(ast.Literal.number(@as(ast.U256, 31))),
+                    }),
+                    try self.builder.builtinCall("not", &.{ast.Expression.lit(ast.Literal.number(@as(ast.U256, 31)))}),
+                });
+                try case_stmts.append(self.allocator, try self.builder.varDecl(&.{size_name}, size_expr));
+
+                const store_offset = try self.builder.builtinCall("mstore", &.{
+                    ast.Expression.lit(ast.Literal.number(0)),
+                    ast.Expression.lit(ast.Literal.number(@as(ast.U256, 32))),
+                });
+                try case_stmts.append(self.allocator, ast.Statement.expr(store_offset));
+
+                const store_len = try self.builder.builtinCall("mstore", &.{
+                    ast.Expression.lit(ast.Literal.number(@as(ast.U256, 32))),
+                    ast.Expression.id(len_name),
+                });
+                try case_stmts.append(self.allocator, ast.Statement.expr(store_len));
+
+                const dest = ast.Expression.lit(ast.Literal.number(@as(ast.U256, 64)));
+                try self.appendMemoryCopyLoop(&case_stmts, dest, ast.Expression.id(data_name), ast.Expression.id(size_name));
+
+                const total = try self.builder.builtinCall("add", &.{
+                    ast.Expression.lit(ast.Literal.number(@as(ast.U256, 64))),
+                    ast.Expression.id(size_name),
+                });
+                const return_call = try self.builder.builtinCall("return", &.{
+                    ast.Expression.lit(ast.Literal.number(0)),
+                    total,
+                });
+                try case_stmts.append(self.allocator, ast.Statement.expr(return_call));
+            } else {
+                const mstore_call = try self.builder.builtinCall("mstore", &.{
+                    ast.Expression.lit(ast.Literal.number(0)),
+                    ast.Expression.id("_result"),
+                });
+                try case_stmts.append(self.allocator, ast.Statement.expr(mstore_call));
+
+                const return_call = try self.builder.builtinCall("return", &.{
+                    ast.Expression.lit(ast.Literal.number(0)),
+                    ast.Expression.lit(ast.Literal.number(32)),
+                });
+                try case_stmts.append(self.allocator, ast.Statement.expr(return_call));
+            }
         } else {
             // For void functions:
             // funcName(args...)
@@ -1647,6 +1831,43 @@ pub const Transformer = struct {
         }
 
         return try self.builder.block(case_stmts.items);
+    }
+
+    fn makeTemp(self: *Self, label: []const u8) ![]const u8 {
+        const name = try std.fmt.allocPrint(self.allocator, "$zig2yul${s}${d}", .{ label, self.temp_counter });
+        self.temp_counter += 1;
+        try self.temp_strings.append(self.allocator, name);
+        return name;
+    }
+
+    fn appendMemoryCopyLoop(
+        self: *Self,
+        stmts: *std.ArrayList(ast.Statement),
+        dest: ast.Expression,
+        src: ast.Expression,
+        size: ast.Expression,
+    ) TransformProcessError!void {
+        const idx_name = try self.makeTemp("copy_i");
+        const init_decl = try self.builder.varDecl(&.{idx_name}, ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0))));
+        var init_block = try self.builder.block(&.{init_decl});
+
+        const cond = try self.builder.builtinCall("lt", &.{ast.Expression.id(idx_name), size});
+
+        const post_expr = try self.builder.builtinCall("add", &.{
+            ast.Expression.id(idx_name),
+            ast.Expression.lit(ast.Literal.number(@as(ast.U256, 32))),
+        });
+        const post_stmt = try self.builder.assign(&.{idx_name}, post_expr);
+        var post_block = try self.builder.block(&.{post_stmt});
+
+        const src_addr = try self.builder.builtinCall("add", &.{src, ast.Expression.id(idx_name)});
+        const val = try self.builder.builtinCall("mload", &.{src_addr});
+        const dst_addr = try self.builder.builtinCall("add", &.{dest, ast.Expression.id(idx_name)});
+        const store = try self.builder.builtinCall("mstore", &.{dst_addr, val});
+        var body_block = try self.builder.block(&.{ast.Statement.expr(store)});
+
+        const loop_stmt = self.builder.forLoop(init_block, cond, post_block, body_block);
+        try stmts.append(self.allocator, loop_stmt);
     }
 
     pub fn hasErrors(self: *const Self) bool {
