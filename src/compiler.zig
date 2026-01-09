@@ -1966,6 +1966,62 @@ test "compile simple contract (legacy)" {
     try std.testing.expect(std.mem.indexOf(u8, result, "object \"Token\"") != null);
 }
 
+test "compile dynamic abi (legacy)" {
+    const allocator = std.testing.allocator;
+
+    const source =
+        \\pub const Blob = struct {
+        \\    pub fn echo(self: *Blob, data: []u8, name: []const u8, values: []u256) []u8 {
+        \\        return data;
+        \\    }
+        \\};
+    ;
+
+    const source_z = try allocator.dupeZ(u8, source);
+    defer allocator.free(source_z);
+
+    var compiler = Compiler.init(allocator);
+    defer compiler.deinit();
+
+    const result = compiler.compile(source_z) catch |err| {
+        return err;
+    };
+    defer allocator.free(result);
+
+    try std.testing.expect(std.mem.indexOf(u8, result, "calldataload(4)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "calldataload(36)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "calldataload(68)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "mstore(0, 32)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "mstore(32,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "return(0, add(64") != null);
+}
+
+test "compile dynamic abi size rounding (legacy)" {
+    const allocator = std.testing.allocator;
+
+    const source =
+        \\pub const Blob = struct {
+        \\    pub fn mix(self: *Blob, data: []u8, name: []const u8, values: []u256) []u8 {
+        \\        return name;
+        \\    }
+        \\};
+    ;
+
+    const source_z = try allocator.dupeZ(u8, source);
+    defer allocator.free(source_z);
+
+    var compiler = Compiler.init(allocator);
+    defer compiler.deinit();
+
+    const result = compiler.compile(source_z) catch |err| {
+        return err;
+    };
+    defer allocator.free(result);
+
+    try std.testing.expect(std.mem.indexOf(u8, result, "and(add(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "mul(") != null);
+}
+
 test "compile simple contract (AST-based)" {
     const allocator = std.testing.allocator;
 

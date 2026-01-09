@@ -2065,6 +2065,66 @@ test "dispatcher with parameterized function" {
     try std.testing.expect(std.mem.indexOf(u8, output, "function transfer(to, amount)") != null);
 }
 
+test "dispatcher with dynamic params and return" {
+    const allocator = std.testing.allocator;
+    const printer = @import("printer.zig");
+
+    const source =
+        \\pub const Blob = struct {
+        \\    pub fn echo(self: *Blob, data: []u8, name: []const u8, values: []u256) []u8 {
+        \\        return data;
+        \\    }
+        \\};
+    ;
+
+    const source_z = try allocator.dupeZ(u8, source);
+    defer allocator.free(source_z);
+
+    var transformer = Transformer.init(allocator);
+    defer transformer.deinit();
+
+    const yul_ast = try transformer.transform(source_z);
+    const output = try printer.format(allocator, yul_ast);
+    defer allocator.free(output);
+
+    // Verify dynamic parameters decoded from calldata head
+    try std.testing.expect(std.mem.indexOf(u8, output, "calldataload(4)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "calldataload(36)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "calldataload(68)") != null);
+
+    // Verify dynamic return encoding (offset + length + data)
+    try std.testing.expect(std.mem.indexOf(u8, output, "mstore(0, 32)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "mstore(32,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "return(0, add(64") != null);
+}
+
+test "dispatcher dynamic abi size rounding" {
+    const allocator = std.testing.allocator;
+    const printer = @import("printer.zig");
+
+    const source =
+        \\pub const Blob = struct {
+        \\    pub fn mix(self: *Blob, data: []u8, name: []const u8, values: []u256) []u8 {
+        \\        return name;
+        \\    }
+        \\};
+    ;
+
+    const source_z = try allocator.dupeZ(u8, source);
+    defer allocator.free(source_z);
+
+    var transformer = Transformer.init(allocator);
+    defer transformer.deinit();
+
+    const yul_ast = try transformer.transform(source_z);
+    const output = try printer.format(allocator, yul_ast);
+    defer allocator.free(output);
+
+    // Bytes/string use word rounding; dynamic array uses mul(len, 32)
+    try std.testing.expect(std.mem.indexOf(u8, output, "and(add(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "mul(") != null);
+}
+
 test "transform loops and control flow" {
     const allocator = std.testing.allocator;
     const printer = @import("printer.zig");

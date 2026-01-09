@@ -219,10 +219,32 @@ pub const TypeMapper = struct {
 /// Compute storage slot for a mapping key
 pub fn computeMappingSlot(base_slot: U256, key: U256) U256 {
     // keccak256(abi.encode(key, base_slot))
-    // This is a placeholder - actual implementation needs keccak256
-    _ = base_slot;
-    _ = key;
-    return 0; // TODO: Implement keccak256
+    var input: [64]u8 = undefined;
+    writeU256Be(input[0..32], key);
+    writeU256Be(input[32..64], base_slot);
+
+    const Keccak256 = std.crypto.hash.sha3.Keccak256;
+    var hash: [32]u8 = undefined;
+    Keccak256.hash(&input, &hash, .{});
+
+    return u256FromBe(hash[0..]);
+}
+
+fn writeU256Be(dest: []u8, value: U256) void {
+    var tmp = value;
+    var i: usize = 0;
+    while (i < 32) : (i += 1) {
+        dest[31 - i] = @intCast(tmp & 0xff);
+        tmp >>= 8;
+    }
+}
+
+fn u256FromBe(src: []const u8) U256 {
+    var out: U256 = 0;
+    for (src) |b| {
+        out = (out << 8) | @as(U256, b);
+    }
+    return out;
 }
 
 /// Storage layout calculator
