@@ -389,7 +389,7 @@ pub fn hasBuiltin(self: Dialect, name: []const u8) bool { ... }
 |----------|------|----------|
 | for 循环 | ⚠️ 部分 | 仅支持 `for (start..end) |i| {}` |
 | while 循环 | ✅ | `for { } cond { } { }` |
-| switch 语句 | ⚠️ 部分 | 仅支持字面量 case |
+| switch 语句 | ✅ | range/表达式 case 会降级为 if 链 |
 | break | ✅ | 不支持 label/value |
 | continue | ✅ | 不支持 label/value |
 | if-else | ✅ | 通过 `iszero` 翻转 |
@@ -530,7 +530,7 @@ pub const SourceLocation = struct {
 | **P0** | 添加 Dialect 版本强制检查 | ✅ 已完成 |
 | **P0** | 实现 for/while 循环翻译 | ✅ 已完成 (for 支持 range) |
 | **P1** | 区分 BuiltinCall/FunctionCall | ✅ 已完成 |
-| **P1** | 实现 switch/break/continue | ⚠️ 部分完成 (仅字面量 case, 无 label/value) |
+| **P1** | 实现 switch/break/continue | ✅ 已完成 (range/表达式 case 通过 if 链; break/continue 无 label/value) |
 | **P1** | 动态 ABI 类型支持 | 实际合约需要 |
 | **P2** | 填充 SourceLocation | 调试能力 |
 | **P2** | 多返回值 ABI | 复杂接口 |

@@ -552,7 +552,7 @@ pub const Compiler = struct {
                 for (self.storage_vars.items) |sv| {
                     if (std.mem.eql(u8, sv.name, field_name)) {
                         // Emit: sstore(slot, value)
-                        const sstore_call = try self.ir_builder.call("sstore", &.{
+                        const sstore_call = try self.ir_builder.builtin_call("sstore", &.{
                             self.ir_builder.literal_num(sv.slot),
                             value,
                         });
@@ -632,7 +632,7 @@ pub const Compiler = struct {
 
             if (else_body.items.len > 0) {
                 // Use the cached temp variable for iszero
-                const negated_cond = try self.ir_builder.call("iszero", &.{cond});
+                const negated_cond = try self.ir_builder.builtin_call("iszero", &.{cond});
                 const else_stmt = try self.ir_builder.if_stmt(negated_cond, else_body.items);
                 try stmts.append(self.allocator, else_stmt);
             }
@@ -719,14 +719,14 @@ pub const Compiler = struct {
         const init_decl = try self.ir_builder.variable(&.{payload_name}, start_expr);
         try init_stmts.append(self.allocator, init_decl);
 
-        const cond = try self.ir_builder.call("lt", &.{
+        const cond = try self.ir_builder.builtin_call("lt", &.{
             self.ir_builder.identifier(payload_name),
             end_expr,
         });
 
         var post_stmts: std.ArrayList(yul_ir.Statement) = .empty;
         defer post_stmts.deinit(self.allocator);
-        const inc_call = try self.ir_builder.call("add", &.{
+        const inc_call = try self.ir_builder.builtin_call("add", &.{
             self.ir_builder.identifier(payload_name),
             self.ir_builder.literal_num(@as(evm_types.U256, 1)),
         });
@@ -746,6 +746,24 @@ pub const Compiler = struct {
         const switch_info = p.ast.fullSwitch(index) orelse return;
 
         const cond_expr = try self.translateExpression(switch_info.ast.condition);
+
+        var needs_if_chain = false;
+        for (switch_info.ast.cases) |case_idx| {
+            const case_info = p.ast.fullSwitchCase(case_idx) orelse continue;
+            for (case_info.ast.values) |value_node| {
+                const tag = p.getNodeTag(value_node);
+                if (tag == .switch_range or !self.isLiteralSwitchValueLegacy(value_node)) {
+                    needs_if_chain = true;
+                    break;
+                }
+            }
+            if (needs_if_chain) break;
+        }
+
+        if (needs_if_chain) {
+            try self.processSwitchAsIfChain(cond_expr, switch_info, stmts);
+            return;
+        }
 
         var cases: std.ArrayList(yul_ir.Statement.SwitchStatement.Case) = .empty;
         defer cases.deinit(self.allocator);
@@ -777,6 +795,108 @@ pub const Compiler = struct {
         try stmts.append(self.allocator, switch_stmt);
     }
 
+    fn processSwitchAsIfChain(
+        self: *Self,
+        cond_expr: yul_ir.Expression,
+        switch_info: Ast.full.Switch,
+        stmts: *std.ArrayList(yul_ir.Statement),
+    ) ProcessError!void {
+        const p = &self.zig_parser.?;
+
+        const cond_name = try std.fmt.allocPrint(self.allocator, "$zig2yul$switch$cond${d}", .{self.temp_counter});
+        self.temp_counter += 1;
+        try self.temp_strings.append(self.allocator, cond_name);
+        const cond_decl = try self.ir_builder.variable(&.{cond_name}, cond_expr);
+        try stmts.append(self.allocator, cond_decl);
+        const cond_id = self.ir_builder.identifier(cond_name);
+
+        const match_name = try std.fmt.allocPrint(self.allocator, "$zig2yul$switch$matched${d}", .{self.temp_counter});
+        self.temp_counter += 1;
+        try self.temp_strings.append(self.allocator, match_name);
+        const match_decl = try self.ir_builder.variable(&.{match_name}, self.ir_builder.literal_num(@as(evm_types.U256, 0)));
+        try stmts.append(self.allocator, match_decl);
+        const match_id = self.ir_builder.identifier(match_name);
+
+        var default_block: ?[]const yul_ir.Statement = null;
+
+        for (switch_info.ast.cases) |case_idx| {
+            const case_info = p.ast.fullSwitchCase(case_idx) orelse continue;
+
+            var body_stmts: std.ArrayList(yul_ir.Statement) = .empty;
+            defer body_stmts.deinit(self.allocator);
+            try self.processBlock(case_info.ast.target_expr, &body_stmts);
+            const body_copy = try self.allocator.dupe(yul_ir.Statement, body_stmts.items);
+            try self.alloc_stmts.append(self.allocator, body_copy);
+
+            if (case_info.ast.values.len == 0) {
+                default_block = body_copy;
+                continue;
+            }
+
+            var conds: std.ArrayList(yul_ir.Expression) = .empty;
+            defer conds.deinit(self.allocator);
+            for (case_info.ast.values) |value_node| {
+                const cond = try self.buildSwitchMatchExprLegacy(cond_id, value_node);
+                try conds.append(self.allocator, cond);
+            }
+
+            const case_cond = try self.foldOrConditionsLegacy(conds.items);
+            const not_matched = try self.ir_builder.builtin_call("iszero", &.{match_id});
+            const guard = try self.ir_builder.builtin_call("and", &.{not_matched, case_cond});
+
+            var guarded_body: std.ArrayList(yul_ir.Statement) = .empty;
+            defer guarded_body.deinit(self.allocator);
+            const mark_matched = try self.ir_builder.assign(&.{match_name}, self.ir_builder.literal_num(@as(evm_types.U256, 1)));
+            try guarded_body.append(self.allocator, mark_matched);
+            try guarded_body.appendSlice(self.allocator, body_copy);
+            const guarded_copy = try self.allocator.dupe(yul_ir.Statement, guarded_body.items);
+            try self.alloc_stmts.append(self.allocator, guarded_copy);
+
+            const if_stmt = try self.ir_builder.if_stmt(guard, guarded_copy);
+            try stmts.append(self.allocator, if_stmt);
+        }
+
+        if (default_block) |block| {
+            const not_matched = try self.ir_builder.builtin_call("iszero", &.{match_id});
+            const else_stmt = try self.ir_builder.if_stmt(not_matched, block);
+            try stmts.append(self.allocator, else_stmt);
+        }
+    }
+
+    fn buildSwitchMatchExprLegacy(self: *Self, cond: yul_ir.Expression, value_node: Ast.Node.Index) ProcessError!yul_ir.Expression {
+        const p = &self.zig_parser.?;
+        const tag = p.getNodeTag(value_node);
+        if (tag == .switch_range) {
+            const nodes = p.ast.nodeData(value_node).node_and_node;
+            const start_expr = try self.translateExpression(nodes[0]);
+            const end_expr = try self.translateExpression(nodes[1]);
+            const lt_call = try self.ir_builder.builtin_call("lt", &.{cond, start_expr});
+            const not_lt = try self.ir_builder.builtin_call("iszero", &.{lt_call});
+            const gt_call = try self.ir_builder.builtin_call("gt", &.{cond, end_expr});
+            const not_gt = try self.ir_builder.builtin_call("iszero", &.{gt_call});
+            return try self.ir_builder.builtin_call("and", &.{not_lt, not_gt});
+        }
+
+        if (self.isLiteralSwitchValueLegacy(value_node)) {
+            if (try self.translateSwitchValueLegacy(value_node)) |lit| {
+                return try self.ir_builder.builtin_call("eq", &.{cond, .{ .literal = lit }});
+            }
+        }
+
+        const expr = try self.translateExpression(value_node);
+        return try self.ir_builder.builtin_call("eq", &.{cond, expr});
+    }
+
+    fn foldOrConditionsLegacy(self: *Self, conds: []const yul_ir.Expression) ProcessError!yul_ir.Expression {
+        if (conds.len == 0) return self.ir_builder.literal_bool(false);
+        var current = conds[0];
+        var i: usize = 1;
+        while (i < conds.len) : (i += 1) {
+            current = try self.ir_builder.builtin_call("or", &.{current, conds[i]});
+        }
+        return current;
+    }
+
     fn translateSwitchValueLegacy(self: *Self, index: Ast.Node.Index) ProcessError!?yul_ir.Literal {
         const p = &self.zig_parser.?;
         const tag = p.getNodeTag(index);
@@ -804,6 +924,19 @@ pub const Compiler = struct {
 
         try self.reportUnsupportedStmtLegacy(index, "switch case value must be a literal");
         return null;
+    }
+
+    fn isLiteralSwitchValueLegacy(self: *Self, index: Ast.Node.Index) bool {
+        const p = &self.zig_parser.?;
+        const tag = p.getNodeTag(index);
+        switch (tag) {
+            .number_literal => return true,
+            .identifier => {
+                const name = p.getNodeSource(index);
+                return std.mem.eql(u8, name, "true") or std.mem.eql(u8, name, "false");
+            },
+            else => return false,
+        }
     }
 
     fn processBreak(self: *Self, index: Ast.Node.Index, stmts: *std.ArrayList(yul_ir.Statement)) ProcessError!void {
@@ -924,7 +1057,7 @@ pub const Compiler = struct {
         const left = try self.translateExpression(nodes[0]);
         const right = try self.translateExpression(nodes[1]);
 
-        return try self.ir_builder.call(op, &.{ left, right });
+        return try self.ir_builder.builtin_call(op, &.{ left, right });
     }
 
     fn translateCall(self: *Self, index: Ast.Node.Index) ProcessError!yul_ir.Expression {
@@ -984,7 +1117,7 @@ pub const Compiler = struct {
             // Storage access - find slot
             for (self.storage_vars.items) |sv| {
                 if (std.mem.eql(u8, sv.name, field_name)) {
-                    return try self.ir_builder.call("sload", &.{
+                    return try self.ir_builder.builtin_call("sload", &.{
                         self.ir_builder.literal_num(sv.slot),
                     });
                 }
@@ -1025,17 +1158,17 @@ pub const Compiler = struct {
         defer init_code.deinit(self.allocator);
 
         // datacopy(0, dataoffset("Name_deployed"), datasize("Name_deployed"))
-        const datacopy = try self.ir_builder.call("datacopy", &.{
+        const datacopy = try self.ir_builder.builtin_call("datacopy", &.{
             self.ir_builder.literal_num(0),
-            try self.ir_builder.call("dataoffset", &.{.{ .literal = .{ .string = deployed_name } }}),
-            try self.ir_builder.call("datasize", &.{.{ .literal = .{ .string = deployed_name } }}),
+            try self.ir_builder.builtin_call("dataoffset", &.{.{ .literal = .{ .string = deployed_name } }}),
+            try self.ir_builder.builtin_call("datasize", &.{.{ .literal = .{ .string = deployed_name } }}),
         });
         try init_code.append(self.allocator, .{ .expression = datacopy });
 
         // return(0, datasize("Name_deployed"))
-        const ret = try self.ir_builder.call("return", &.{
+        const ret = try self.ir_builder.builtin_call("return", &.{
             self.ir_builder.literal_num(0),
-            try self.ir_builder.call("datasize", &.{.{ .literal = .{ .string = deployed_name } }}),
+            try self.ir_builder.builtin_call("datasize", &.{.{ .literal = .{ .string = deployed_name } }}),
         });
         try init_code.append(self.allocator, .{ .expression = ret });
 
@@ -1049,9 +1182,9 @@ pub const Compiler = struct {
 
     fn generateDispatcher(self: *Self, stmts: *std.ArrayList(yul_ir.Statement)) !void {
         // Get function selector: shr(224, calldataload(0))
-        const selector = try self.ir_builder.call("shr", &.{
+        const selector = try self.ir_builder.builtin_call("shr", &.{
             self.ir_builder.literal_num(224),
-            try self.ir_builder.call("calldataload", &.{self.ir_builder.literal_num(0)}),
+            try self.ir_builder.builtin_call("calldataload", &.{self.ir_builder.literal_num(0)}),
         });
 
         // Build switch cases for each public function
@@ -1068,7 +1201,7 @@ pub const Compiler = struct {
 
             for (fi.params, 0..) |param_name, i| {
                 const offset: evm_types.U256 = 4 + @as(evm_types.U256, @intCast(i)) * 32;
-                const load_call = try self.ir_builder.call("calldataload", &.{
+                const load_call = try self.ir_builder.builtin_call("calldataload", &.{
                     self.ir_builder.literal_num(offset),
                 });
                 const var_decl = try self.ir_builder.variable(&.{param_name}, load_call);
@@ -1082,20 +1215,20 @@ pub const Compiler = struct {
                 const result_decl = try self.ir_builder.variable(&.{"_result"}, func_call);
                 try case_stmts.append(self.allocator, result_decl);
 
-                const mstore_call = try self.ir_builder.call("mstore", &.{
+                const mstore_call = try self.ir_builder.builtin_call("mstore", &.{
                     self.ir_builder.literal_num(0),
                     self.ir_builder.identifier("_result"),
                 });
                 try case_stmts.append(self.allocator, .{ .expression = mstore_call });
 
-                const return_call = try self.ir_builder.call("return", &.{
+                const return_call = try self.ir_builder.builtin_call("return", &.{
                     self.ir_builder.literal_num(0),
                     self.ir_builder.literal_num(32),
                 });
                 try case_stmts.append(self.allocator, .{ .expression = return_call });
             } else {
                 try case_stmts.append(self.allocator, .{ .expression = func_call });
-                const return_call = try self.ir_builder.call("return", &.{
+                const return_call = try self.ir_builder.builtin_call("return", &.{
                     self.ir_builder.literal_num(0),
                     self.ir_builder.literal_num(0),
                 });
@@ -1111,7 +1244,7 @@ pub const Compiler = struct {
         }
 
         // Default revert case
-        const revert_call = try self.ir_builder.call("revert", &.{
+        const revert_call = try self.ir_builder.builtin_call("revert", &.{
             self.ir_builder.literal_num(0),
             self.ir_builder.literal_num(0),
         });

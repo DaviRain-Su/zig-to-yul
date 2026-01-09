@@ -495,7 +495,7 @@ pub const Transformer = struct {
                 for (self.storage_vars.items) |sv| {
                     if (std.mem.eql(u8, sv.name, field_name)) {
                         // Emit: sstore(slot, value)
-                        const sstore_call = try self.builder.call("sstore", &.{
+                        const sstore_call = try self.builder.builtinCall("sstore", &.{
                             ast.Expression.lit(ast.Literal.number(sv.slot)),
                             value,
                         });
@@ -580,7 +580,7 @@ pub const Transformer = struct {
             if (else_body.items.len > 0) {
                 const else_block = try self.builder.block(else_body.items);
                 // Use the cached temp variable for iszero
-                const negated_cond = try self.builder.call("iszero", &.{cond});
+                const negated_cond = try self.builder.builtinCall("iszero", &.{cond});
                 const else_stmt = self.builder.ifStmt(negated_cond, else_block);
                 try stmts.append(self.allocator, else_stmt);
             }
@@ -671,14 +671,14 @@ pub const Transformer = struct {
         const init_decl = try self.builder.varDecl(&.{payload_name}, start_expr);
         try init_stmts.append(self.allocator, init_decl);
 
-        const cond = try self.builder.call("lt", &.{
+        const cond = try self.builder.builtinCall("lt", &.{
             ast.Expression.id(payload_name),
             end_expr,
         });
 
         var post_stmts: std.ArrayList(ast.Statement) = .empty;
         defer post_stmts.deinit(self.allocator);
-        const inc_call = try self.builder.call("add", &.{
+        const inc_call = try self.builder.builtinCall("add", &.{
             ast.Expression.id(payload_name),
             ast.Expression.lit(ast.Literal.number(@as(ast.U256, 1))),
         });
@@ -702,6 +702,24 @@ pub const Transformer = struct {
         const switch_info = p.ast.fullSwitch(index) orelse return;
 
         const cond_expr = try self.translateExpression(switch_info.ast.condition);
+
+        var needs_if_chain = false;
+        for (switch_info.ast.cases) |case_idx| {
+            const case_info = p.ast.fullSwitchCase(case_idx) orelse continue;
+            for (case_info.ast.values) |value_node| {
+                const tag = p.getNodeTag(value_node);
+                if (tag == .switch_range or !self.isLiteralSwitchValue(value_node)) {
+                    needs_if_chain = true;
+                    break;
+                }
+            }
+            if (needs_if_chain) break;
+        }
+
+        if (needs_if_chain) {
+            try self.processSwitchAsIfChain(cond_expr, switch_info, stmts);
+            return;
+        }
 
         var cases: std.ArrayList(ast.Case) = .empty;
         defer cases.deinit(self.allocator);
@@ -728,6 +746,105 @@ pub const Transformer = struct {
 
         const switch_stmt = try self.builder.switchStmt(cond_expr, cases.items);
         try stmts.append(self.allocator, switch_stmt);
+    }
+
+    fn processSwitchAsIfChain(
+        self: *Self,
+        cond_expr: ast.Expression,
+        switch_info: ZigAst.full.Switch,
+        stmts: *std.ArrayList(ast.Statement),
+    ) TransformProcessError!void {
+        const p = &self.zig_parser.?;
+
+        const cond_name = try std.fmt.allocPrint(self.allocator, "$zig2yul$switch$cond${d}", .{self.temp_counter});
+        self.temp_counter += 1;
+        try self.temp_strings.append(self.allocator, cond_name);
+        const cond_decl = try self.builder.varDecl(&.{cond_name}, cond_expr);
+        try stmts.append(self.allocator, cond_decl);
+        const cond_id = ast.Expression.id(cond_name);
+
+        const match_name = try std.fmt.allocPrint(self.allocator, "$zig2yul$switch$matched${d}", .{self.temp_counter});
+        self.temp_counter += 1;
+        try self.temp_strings.append(self.allocator, match_name);
+        const match_decl = try self.builder.varDecl(&.{match_name}, ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0))));
+        try stmts.append(self.allocator, match_decl);
+        const match_id = ast.Expression.id(match_name);
+
+        var default_block: ?ast.Block = null;
+
+        for (switch_info.ast.cases) |case_idx| {
+            const case_info = p.ast.fullSwitchCase(case_idx) orelse continue;
+
+            var body_stmts: std.ArrayList(ast.Statement) = .empty;
+            defer body_stmts.deinit(self.allocator);
+            try self.processBlock(case_info.ast.target_expr, &body_stmts);
+
+            if (case_info.ast.values.len == 0) {
+                default_block = try self.builder.block(body_stmts.items);
+                continue;
+            }
+
+            var conds: std.ArrayList(ast.Expression) = .empty;
+            defer conds.deinit(self.allocator);
+            for (case_info.ast.values) |value_node| {
+                const cond = try self.buildSwitchMatchExpr(cond_id, value_node);
+                try conds.append(self.allocator, cond);
+            }
+
+            const case_cond = try self.foldOrConditions(conds.items);
+            const not_matched = try self.builder.builtinCall("iszero", &.{match_id});
+            const guard = try self.builder.builtinCall("and", &.{not_matched, case_cond});
+
+            var guarded_body: std.ArrayList(ast.Statement) = .empty;
+            defer guarded_body.deinit(self.allocator);
+            const mark_matched = try self.builder.assign(&.{match_name}, ast.Expression.lit(ast.Literal.number(@as(ast.U256, 1))));
+            try guarded_body.append(self.allocator, mark_matched);
+            try guarded_body.appendSlice(self.allocator, body_stmts.items);
+
+            const guarded_block = try self.builder.block(guarded_body.items);
+            const if_stmt = self.builder.ifStmt(guard, guarded_block);
+            try stmts.append(self.allocator, if_stmt);
+        }
+
+        if (default_block) |block| {
+            const not_matched = try self.builder.builtinCall("iszero", &.{match_id});
+            const else_stmt = self.builder.ifStmt(not_matched, block);
+            try stmts.append(self.allocator, else_stmt);
+        }
+    }
+
+    fn buildSwitchMatchExpr(self: *Self, cond: ast.Expression, value_node: ZigAst.Node.Index) TransformProcessError!ast.Expression {
+        const p = &self.zig_parser.?;
+        const tag = p.getNodeTag(value_node);
+        if (tag == .switch_range) {
+            const nodes = p.ast.nodeData(value_node).node_and_node;
+            const start_expr = try self.translateExpression(nodes[0]);
+            const end_expr = try self.translateExpression(nodes[1]);
+            const lt_call = try self.builder.builtinCall("lt", &.{cond, start_expr});
+            const not_lt = try self.builder.builtinCall("iszero", &.{lt_call});
+            const gt_call = try self.builder.builtinCall("gt", &.{cond, end_expr});
+            const not_gt = try self.builder.builtinCall("iszero", &.{gt_call});
+            return try self.builder.builtinCall("and", &.{not_lt, not_gt});
+        }
+
+        if (self.isLiteralSwitchValue(value_node)) {
+            if (try self.translateSwitchValue(value_node)) |lit| {
+                return try self.builder.builtinCall("eq", &.{cond, ast.Expression.lit(lit)});
+            }
+        }
+
+        const expr = try self.translateExpression(value_node);
+        return try self.builder.builtinCall("eq", &.{cond, expr});
+    }
+
+    fn foldOrConditions(self: *Self, conds: []const ast.Expression) TransformProcessError!ast.Expression {
+        if (conds.len == 0) return ast.Expression.lit(ast.Literal.boolean(false));
+        var current = conds[0];
+        var i: usize = 1;
+        while (i < conds.len) : (i += 1) {
+            current = try self.builder.builtinCall("or", &.{current, conds[i]});
+        }
+        return current;
     }
 
     fn translateSwitchValue(self: *Self, index: ZigAst.Node.Index) TransformProcessError!?ast.Literal {
@@ -757,6 +874,19 @@ pub const Transformer = struct {
 
         try self.addError("switch case value must be a literal", self.nodeLocation(index), .unsupported_feature);
         return null;
+    }
+
+    fn isLiteralSwitchValue(self: *Self, index: ZigAst.Node.Index) bool {
+        const p = &self.zig_parser.?;
+        const tag = p.getNodeTag(index);
+        switch (tag) {
+            .number_literal => return true,
+            .identifier => {
+                const name = p.getNodeSource(index);
+                return std.mem.eql(u8, name, "true") or std.mem.eql(u8, name, "false");
+            },
+            else => return false,
+        }
     }
 
     fn processBreak(self: *Self, index: ZigAst.Node.Index, stmts: *std.ArrayList(ast.Statement)) TransformProcessError!void {
@@ -881,7 +1011,7 @@ pub const Transformer = struct {
         const left = try self.translateExpression(nodes[0]);
         const right = try self.translateExpression(nodes[1]);
 
-        return try self.builder.call(op, &.{ left, right });
+        return try self.builder.builtinCall(op, &.{ left, right });
     }
 
     fn translateCall(self: *Self, index: ZigAst.Node.Index) TransformProcessError!ast.Expression {
@@ -937,7 +1067,7 @@ pub const Transformer = struct {
         if (std.mem.eql(u8, obj_src, "self")) {
             for (self.storage_vars.items) |sv| {
                 if (std.mem.eql(u8, sv.name, field_name)) {
-                    return try self.builder.call("sload", &.{
+                    return try self.builder.builtinCall("sload", &.{
                         ast.Expression.lit(ast.Literal.number(sv.slot)),
                     });
                 }
@@ -980,17 +1110,17 @@ pub const Transformer = struct {
         defer init_stmts.deinit(self.allocator);
 
         // datacopy(0, dataoffset("Name_deployed"), datasize("Name_deployed"))
-        const datacopy = ast.Statement.expr(try self.builder.call("datacopy", &.{
+        const datacopy = ast.Statement.expr(try self.builder.builtinCall("datacopy", &.{
             ast.Expression.lit(ast.Literal.number(0)),
-            try self.builder.call("dataoffset", &.{ast.Expression.lit(ast.Literal.string(deployed_name))}),
-            try self.builder.call("datasize", &.{ast.Expression.lit(ast.Literal.string(deployed_name))}),
+            try self.builder.builtinCall("dataoffset", &.{ast.Expression.lit(ast.Literal.string(deployed_name))}),
+            try self.builder.builtinCall("datasize", &.{ast.Expression.lit(ast.Literal.string(deployed_name))}),
         }));
         try init_stmts.append(self.allocator, datacopy);
 
         // return(0, datasize("Name_deployed"))
-        const ret = ast.Statement.expr(try self.builder.call("return", &.{
+        const ret = ast.Statement.expr(try self.builder.builtinCall("return", &.{
             ast.Expression.lit(ast.Literal.number(0)),
-            try self.builder.call("datasize", &.{ast.Expression.lit(ast.Literal.string(deployed_name))}),
+            try self.builder.builtinCall("datasize", &.{ast.Expression.lit(ast.Literal.string(deployed_name))}),
         }));
         try init_stmts.append(self.allocator, ret);
 
@@ -1006,9 +1136,9 @@ pub const Transformer = struct {
 
     fn generateDispatcher(self: *Self, stmts: *std.ArrayList(ast.Statement)) !void {
         // Get function selector: shr(224, calldataload(0))
-        const selector = try self.builder.call("shr", &.{
+        const selector = try self.builder.builtinCall("shr", &.{
             ast.Expression.lit(ast.Literal.number(224)),
-            try self.builder.call("calldataload", &.{ast.Expression.lit(ast.Literal.number(0))}),
+            try self.builder.builtinCall("calldataload", &.{ast.Expression.lit(ast.Literal.number(0))}),
         });
 
         // Build cases for all public functions
@@ -1025,7 +1155,7 @@ pub const Transformer = struct {
         }
 
         // Add default revert case
-        const revert_call = try self.builder.call("revert", &.{
+        const revert_call = try self.builder.builtinCall("revert", &.{
             ast.Expression.lit(ast.Literal.number(0)),
             ast.Expression.lit(ast.Literal.number(0)),
         });
@@ -1049,7 +1179,7 @@ pub const Transformer = struct {
         for (fi.params, 0..) |param_name, i| {
             // let paramN := calldataload(4 + i*32)
             const offset: evm_types.U256 = 4 + @as(evm_types.U256, @intCast(i)) * 32;
-            const load_call = try self.builder.call("calldataload", &.{
+            const load_call = try self.builder.builtinCall("calldataload", &.{
                 ast.Expression.lit(ast.Literal.number(offset)),
             });
             const var_decl = try self.builder.varDecl(&.{param_name}, load_call);
@@ -1069,13 +1199,13 @@ pub const Transformer = struct {
             const result_decl = try self.builder.varDecl(&.{"_result"}, func_call);
             try case_stmts.append(self.allocator, result_decl);
 
-            const mstore_call = try self.builder.call("mstore", &.{
+            const mstore_call = try self.builder.builtinCall("mstore", &.{
                 ast.Expression.lit(ast.Literal.number(0)),
                 ast.Expression.id("_result"),
             });
             try case_stmts.append(self.allocator, ast.Statement.expr(mstore_call));
 
-            const return_call = try self.builder.call("return", &.{
+            const return_call = try self.builder.builtinCall("return", &.{
                 ast.Expression.lit(ast.Literal.number(0)),
                 ast.Expression.lit(ast.Literal.number(32)),
             });
@@ -1086,7 +1216,7 @@ pub const Transformer = struct {
             // return(0, 0)
             try case_stmts.append(self.allocator, ast.Statement.expr(func_call));
 
-            const return_call = try self.builder.call("return", &.{
+            const return_call = try self.builder.builtinCall("return", &.{
                 ast.Expression.lit(ast.Literal.number(0)),
                 ast.Expression.lit(ast.Literal.number(0)),
             });
