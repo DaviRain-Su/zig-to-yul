@@ -6,6 +6,7 @@ const Compiler = @import("compiler.zig").Compiler;
 const Transformer = @import("yul/transformer.zig").Transformer;
 const printer = @import("yul/printer.zig");
 const event_decode = @import("evm/event_decode.zig");
+const optimizer = @import("yul/optimizer.zig");
 
 const version = "0.1.0";
 
@@ -57,12 +58,21 @@ fn runCompile(allocator: std.mem.Allocator, args: []const []const u8) !void {
     var trans = Transformer.init(allocator);
     defer trans.deinit();
 
-    const ast = trans.transform(source) catch |err| {
+    var ast = trans.transform(source) catch |err| {
         // Print detailed error diagnostics
         printTransformErrorsStderr(&trans, opts.input_file.?);
         std.debug.print("Compilation failed: {}\n", .{err});
         std.process.exit(1);
     };
+
+    if (opts.optimize_yul) {
+        var opt = optimizer.Optimizer.init(allocator);
+        defer opt.deinit();
+        ast = opt.optimize(ast) catch |err| {
+            std.debug.print("Yul optimization error: {}\n", .{err});
+            std.process.exit(1);
+        };
+    }
 
     if (opts.source_map) {
         if (opts.output_file == null) {
@@ -114,6 +124,10 @@ fn runBuild(allocator: std.mem.Allocator, args: []const []const u8) !void {
     }
     if (opts.source_map) {
         std.debug.print("Error: --sourcemap is only supported with compile\n", .{});
+        std.process.exit(1);
+    }
+    if (opts.optimize_yul) {
+        std.debug.print("Error: --optimize-yul is only supported with compile\n", .{});
         std.process.exit(1);
     }
 
@@ -337,6 +351,7 @@ const Options = struct {
     output_file: ?[]const u8 = null,
     optimize: bool = false,
     source_map: bool = false,
+    optimize_yul: bool = false,
 };
 
 fn parseOptions(args: []const []const u8) !Options {
@@ -358,6 +373,8 @@ fn parseOptions(args: []const []const u8) !Options {
             opts.optimize = true;
         } else if (std.mem.eql(u8, arg, "--sourcemap") or std.mem.eql(u8, arg, "--source-map")) {
             opts.source_map = true;
+        } else if (std.mem.eql(u8, arg, "--optimize-yul")) {
+            opts.optimize_yul = true;
         } else if (arg.len > 0 and arg[0] != '-') {
             opts.input_file = arg;
         } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
@@ -555,6 +572,7 @@ fn printUsageStderr() void {
         \\    -o, --output <file>    Write output to <file>
         \\    -O, --optimize         Enable solc optimizer (build only)
         \\    --sourcemap           Write a .map file next to output (compile only)
+        \\    --optimize-yul        Run basic Yul optimizer (compile only)
         \\    -h, --help             Print help message
         \\
     , .{version});
@@ -567,6 +585,7 @@ fn printCompileUsageStderr() void {
         \\OPTIONS:
         \\    -o, --output <file>    Write Yul output to <file>
         \\    --sourcemap           Write a .map file next to output
+        \\    --optimize-yul        Run basic Yul optimizer
         \\    -h, --help             Print help
         \\
     , .{});
@@ -630,6 +649,7 @@ fn printUsageTo(writer: anytype) !void {
         \\    -o, --output <file>    Write output to <file>
         \\    -O, --optimize         Enable solc optimizer (build only)
         \\    --sourcemap           Write a .map file next to output (compile only)
+        \\    --optimize-yul        Run basic Yul optimizer (compile only)
         \\    -h, --help             Print help message
         \\
         \\EXAMPLES:

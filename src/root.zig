@@ -28,6 +28,7 @@ pub const yul = struct {
     pub const printer = @import("yul/printer.zig");
     pub const transformer = @import("yul/transformer.zig");
     pub const gas_estimator = @import("yul/gas_estimator.zig");
+    pub const optimizer = @import("yul/optimizer.zig");
     pub const AST = yul_ast.AST;
     pub const AstBuilder = yul_ast.AstBuilder;
     pub const Printer = printer.Printer;

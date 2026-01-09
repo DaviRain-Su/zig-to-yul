@@ -334,7 +334,7 @@ Zig 源代码 → [zig-to-yul] → Yul 代码 → [solc] → EVM 字节码
 | 事件解码 (Event Decoding) | 解析合约事件日志 | ⚠️ 基础实现（静态类型/bytes/string/数组/CLI） |
 | ABI 解码 | 解码 calldata/returndata | ⚠️ 部分实现 |
 | Gas 估算 | 预估交易 gas 消耗 | ⚠️ 基础实现（静态估算） |
-| Yul 优化器 | 内置 Yul 级别优化 | ⚠️ 依赖 solc |
+| Yul 优化器 | 内置 Yul 级别优化 | ⚠️ 基础实现（peephole） |
 
 ### 5.4 调试/辅助功能
 
