@@ -208,21 +208,45 @@ pub const Parser = struct {
         body_node: Ast.Node.Index,
     };
 
+    pub const ContainerInfo = struct {
+        members: [2]Ast.Node.Index,
+        members_len: usize,
+        keyword_token: Ast.TokenIndex,
+    };
+
     /// Get container/struct info
+    /// The members are copied to avoid dangling pointers from internal buffer
     pub fn getContainerDecl(self: *const Self, index: Ast.Node.Index) ?ContainerInfo {
         var buf: [2]Ast.Node.Index = undefined;
         const container = self.ast.fullContainerDecl(&buf, index) orelse return null;
+
+        var result: ContainerInfo = .{
+            .members = undefined,
+            .members_len = container.ast.members.len,
+            .keyword_token = container.ast.main_token,
+        };
+
+        // Copy members to avoid dangling pointer
+        for (container.ast.members, 0..) |m, i| {
+            result.members[i] = m;
+        }
+
+        return result;
+    }
+
+    /// Get container/struct info with external buffer
+    /// Note: The returned members slice points to buf, use immediately or copy
+    pub fn getContainerDeclWithBuf(self: *const Self, buf: *[2]Ast.Node.Index, index: Ast.Node.Index) ?struct {
+        members: []const Ast.Node.Index,
+        keyword_token: Ast.TokenIndex,
+    } {
+        const container = self.ast.fullContainerDecl(buf, index) orelse return null;
 
         return .{
             .members = container.ast.members,
             .keyword_token = container.ast.main_token,
         };
     }
-
-    pub const ContainerInfo = struct {
-        members: []const Ast.Node.Index,
-        keyword_token: Ast.TokenIndex,
-    };
 
     /// Get variable declaration info
     pub fn getVarDecl(self: *const Self, index: Ast.Node.Index) ?VarDeclInfo {

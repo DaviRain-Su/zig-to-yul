@@ -1,37 +1,28 @@
-//! Zig to Yul Compiler
-//! Main compilation pipeline: Zig AST -> Yul AST -> Yul Code
+//! Zig AST to Yul AST Transformer
 //!
-//! This module provides two compilation paths:
-//! 1. New AST-based: Zig AST -> Yul AST -> Yul text (via compileWithAst)
-//! 2. Legacy IR-based: Zig AST -> Yul IR -> Yul text (via compile)
+//! Transforms parsed Zig source code into Yul AST representation.
+//! This is the core translation layer from Zig contracts to Yul.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const Ast = std.zig.Ast;
+const ZigAst = std.zig.Ast;
 
-const parser = @import("ast/parser.zig");
-const symbols = @import("sema/symbols.zig");
-const evm_types = @import("evm/types.zig");
-const builtins = @import("evm/builtins.zig");
-const yul_ir = @import("yul/ir.zig");
-const yul_codegen = @import("yul/codegen.zig");
+const parser = @import("../ast/parser.zig");
+const ast = @import("ast.zig");
+const symbols = @import("../sema/symbols.zig");
+const evm_types = @import("../evm/types.zig");
+const builtins = @import("../evm/builtins.zig");
 
-// New AST-based modules
-const transformer = @import("yul/transformer.zig");
-const yul_ast = @import("yul/ast.zig");
-const printer = @import("yul/printer.zig");
-
-pub const Compiler = struct {
+pub const Transformer = struct {
     allocator: Allocator,
     zig_parser: ?parser.Parser,
     symbol_table: symbols.SymbolTable,
-    type_mapper: evm_types.TypeMapper,
-    ir_builder: yul_ir.Builder,
-    errors: std.ArrayList(CompileError),
+    builder: ast.AstBuilder,
+    errors: std.ArrayList(TransformError),
 
-    // Compilation state
+    // State tracking
     current_contract: ?[]const u8,
-    functions: std.ArrayList(yul_ir.Statement),
+    functions: std.ArrayList(ast.Statement),
     storage_vars: std.ArrayList(StorageVar),
 
     // Track allocated strings for cleanup
@@ -44,10 +35,9 @@ pub const Compiler = struct {
         slot: evm_types.U256,
     };
 
-    pub const CompileError = struct {
+    pub const TransformError = struct {
         message: []const u8,
-        line: u32,
-        column: u32,
+        location: ast.SourceLocation,
         kind: ErrorKind,
 
         pub const ErrorKind = enum {
@@ -63,8 +53,7 @@ pub const Compiler = struct {
             .allocator = allocator,
             .zig_parser = null,
             .symbol_table = symbols.SymbolTable.init(allocator),
-            .type_mapper = evm_types.TypeMapper.init(allocator),
-            .ir_builder = yul_ir.Builder.init(allocator),
+            .builder = ast.AstBuilder.init(allocator),
             .errors = .empty,
             .current_contract = null,
             .functions = .empty,
@@ -78,8 +67,7 @@ pub const Compiler = struct {
             p.deinit();
         }
         self.symbol_table.deinit();
-        self.type_mapper.deinit();
-        self.ir_builder.deinit();
+        self.builder.deinit();
         self.errors.deinit(self.allocator);
         self.functions.deinit(self.allocator);
         self.storage_vars.deinit(self.allocator);
@@ -91,8 +79,8 @@ pub const Compiler = struct {
         self.temp_strings.deinit(self.allocator);
     }
 
-    /// Compile Zig source to Yul
-    pub fn compile(self: *Self, source: [:0]const u8) ![]const u8 {
+    /// Transform Zig source code to Yul AST
+    pub fn transform(self: *Self, source: [:0]const u8) !ast.AST {
         // Parse Zig source
         self.zig_parser = try parser.Parser.parse(self.allocator, source);
 
@@ -108,68 +96,48 @@ pub const Compiler = struct {
         }
 
         if (self.current_contract == null) {
-            try self.addError("No contract struct found", 0, 0, .invalid_contract);
+            try self.addError("No contract struct found", .none, .invalid_contract);
             return error.NoContract;
         }
 
-        // Generate Yul object
-        const yul_object = try self.generateYulObject();
-
-        // Generate Yul code
-        var codegen = yul_codegen.CodeGenerator.init(self.allocator);
-        defer codegen.deinit();
-
-        return try codegen.generate(yul_object);
-    }
-
-    /// Compile Zig source to Yul using the new AST-based pipeline
-    /// This is the recommended method for new code.
-    pub fn compileWithAst(allocator: Allocator, source: [:0]const u8) ![]const u8 {
-        // Step 1: Transform Zig AST to Yul AST
-        var trans = transformer.Transformer.init(allocator);
-        defer trans.deinit();
-
-        const ast = trans.transform(source) catch |err| {
-            return err;
-        };
-
-        // Step 2: Print Yul AST to Yul text
-        return try printer.format(allocator, ast);
+        // Generate Yul AST
+        return try self.generateYulAst();
     }
 
     fn reportParseErrors(self: *Self) !void {
         const p = &self.zig_parser.?;
         for (p.getErrors()) |err| {
             const token = p.ast.tokens.get(err.token);
-            const loc = p.getLocation(token.start);
-            try self.addError(@tagName(err.tag), loc.line, loc.column, .parse_error);
+            const location = ast.SourceLocation{
+                .start = token.start,
+                .end = token.start + 1,
+            };
+            try self.addError(@tagName(err.tag), location, .parse_error);
         }
     }
 
-    fn addError(self: *Self, message: []const u8, line: u32, column: u32, kind: CompileError.ErrorKind) !void {
+    fn addError(self: *Self, message: []const u8, location: ast.SourceLocation, kind: TransformError.ErrorKind) !void {
         try self.errors.append(self.allocator, .{
             .message = message,
-            .line = line,
-            .column = column,
+            .location = location,
             .kind = kind,
         });
     }
 
     /// Process a top-level declaration
-    fn processTopLevelDecl(self: *Self, index: Ast.Node.Index) !void {
+    fn processTopLevelDecl(self: *Self, index: ZigAst.Node.Index) !void {
         const p = &self.zig_parser.?;
         const tag = p.getNodeTag(index);
 
         switch (tag) {
             .simple_var_decl, .global_var_decl => {
-                // Look for: pub const ContractName = struct { ... }
                 try self.processVarDecl(index);
             },
             else => {},
         }
     }
 
-    fn processVarDecl(self: *Self, index: Ast.Node.Index) !void {
+    fn processVarDecl(self: *Self, index: ZigAst.Node.Index) !void {
         const p = &self.zig_parser.?;
 
         if (p.getVarDecl(index)) |var_decl| {
@@ -189,7 +157,7 @@ pub const Compiler = struct {
     }
 
     /// Process a contract struct
-    fn processContract(self: *Self, index: Ast.Node.Index) !void {
+    fn processContract(self: *Self, index: ZigAst.Node.Index) !void {
         const p = &self.zig_parser.?;
 
         _ = try self.symbol_table.enterScope(.contract);
@@ -203,49 +171,41 @@ pub const Compiler = struct {
         }
     }
 
-    fn processContractMember(self: *Self, index: Ast.Node.Index) !void {
+    fn processContractMember(self: *Self, index: ZigAst.Node.Index) !void {
         const p = &self.zig_parser.?;
         const tag = p.getNodeTag(index);
 
         switch (tag) {
             .container_field_init, .container_field => {
-                // Storage variable
                 try self.processStorageField(index);
             },
             .fn_decl => {
-                // Contract function
                 try self.processFunction(index);
             },
             else => {},
         }
     }
 
-    fn processStorageField(self: *Self, index: Ast.Node.Index) !void {
+    fn processStorageField(self: *Self, index: ZigAst.Node.Index) !void {
         const p = &self.zig_parser.?;
-        const data = p.getNodeData(index);
 
-        // Get field name from main token
         const name_token = p.getMainToken(index);
         const name = p.getIdentifier(name_token);
 
         if (name.len > 0) {
-            // Map type (simplified - just use uint256 for now)
-            const evm_type = try self.type_mapper.mapZigType("u256");
-
-            // Add to symbol table with storage slot
+            var type_mapper = evm_types.TypeMapper.init(self.allocator);
+            defer type_mapper.deinit();
+            const evm_type = try type_mapper.mapZigType("u256");
             _ = try self.symbol_table.defineStorageVar(name, evm_type);
 
-            // Track storage variable
             try self.storage_vars.append(self.allocator, .{
                 .name = name,
                 .slot = self.symbol_table.next_storage_slot - 1,
             });
         }
-
-        _ = data;
     }
 
-    fn processFunction(self: *Self, index: Ast.Node.Index) !void {
+    fn processFunction(self: *Self, index: ZigAst.Node.Index) !void {
         const p = &self.zig_parser.?;
 
         if (p.getFnProto(index)) |proto| {
@@ -253,10 +213,9 @@ pub const Compiler = struct {
             const name = p.getIdentifier(name_token);
             const is_public = p.isPublic(index);
 
-            // Enter function scope
             _ = try self.symbol_table.enterScope(.function);
 
-            // Process parameters using the iterator
+            // Process parameters
             var params: std.ArrayList([]const u8) = .empty;
             defer params.deinit(self.allocator);
 
@@ -269,7 +228,7 @@ pub const Compiler = struct {
                 }
             }
 
-            // Generate function IR
+            // Generate function AST
             const fn_stmt = try self.generateFunction(name, params.items, is_public, proto.body_node);
             try self.functions.append(self.allocator, fn_stmt);
 
@@ -282,38 +241,29 @@ pub const Compiler = struct {
         name: []const u8,
         params: []const []const u8,
         is_public: bool,
-        body_index: Ast.Node.Index,
-    ) !yul_ir.Statement {
+        body_index: ZigAst.Node.Index,
+    ) !ast.Statement {
         _ = is_public;
 
         // Generate function body
-        var body_stmts: std.ArrayList(yul_ir.Statement) = .empty;
+        var body_stmts: std.ArrayList(ast.Statement) = .empty;
         defer body_stmts.deinit(self.allocator);
 
-        // Process function body
         try self.processBlock(body_index, &body_stmts);
 
-        // Determine return value
-        const returns: []const []const u8 = &.{"result"};
+        const body = try self.builder.block(body_stmts.items);
 
-        return try self.ir_builder.function(
-            name,
-            params,
-            returns,
-            body_stmts.items,
-        );
+        return try self.builder.funcDef(name, params, &.{"result"}, body);
     }
 
-    // Shared error type for mutually recursive processing functions
-    const ProcessError = std.mem.Allocator.Error;
+    const TransformProcessError = std.mem.Allocator.Error;
 
-    fn processBlock(self: *Self, index: Ast.Node.Index, stmts: *std.ArrayList(yul_ir.Statement)) ProcessError!void {
+    fn processBlock(self: *Self, index: ZigAst.Node.Index, stmts: *std.ArrayList(ast.Statement)) TransformProcessError!void {
         const p = &self.zig_parser.?;
         const tag = p.getNodeTag(index);
 
         if (tag == .block or tag == .block_two or tag == .block_two_semicolon) {
-            // Get block statements
-            var buf: [2]Ast.Node.Index = undefined;
+            var buf: [2]ZigAst.Node.Index = undefined;
             const block_stmts = switch (tag) {
                 .block_two, .block_two_semicolon => blk: {
                     const data = p.ast.nodeData(index);
@@ -338,7 +288,7 @@ pub const Compiler = struct {
         }
     }
 
-    fn processStatement(self: *Self, index: Ast.Node.Index, stmts: *std.ArrayList(yul_ir.Statement)) ProcessError!void {
+    fn processStatement(self: *Self, index: ZigAst.Node.Index, stmts: *std.ArrayList(ast.Statement)) TransformProcessError!void {
         const p = &self.zig_parser.?;
         const tag = p.getNodeTag(index);
 
@@ -356,31 +306,30 @@ pub const Compiler = struct {
                 try self.processIf(index, stmts);
             },
             else => {
-                // Try to process as expression statement
                 if (self.translateExpression(index)) |expr| {
-                    try stmts.append(self.allocator, .{ .expression = expr });
+                    try stmts.append(self.allocator, ast.Statement.expr(expr));
                 } else |_| {}
             },
         }
     }
 
-    fn processLocalVarDecl(self: *Self, index: Ast.Node.Index, stmts: *std.ArrayList(yul_ir.Statement)) ProcessError!void {
+    fn processLocalVarDecl(self: *Self, index: ZigAst.Node.Index, stmts: *std.ArrayList(ast.Statement)) TransformProcessError!void {
         const p = &self.zig_parser.?;
 
         if (p.getVarDecl(index)) |var_decl| {
             const name = p.getIdentifier(var_decl.name_token);
 
-            var value: ?yul_ir.Expression = null;
+            var value: ?ast.Expression = null;
             if (var_decl.init_node.unwrap()) |init_idx| {
                 value = try self.translateExpression(init_idx);
             }
 
-            const stmt = try self.ir_builder.variable(&.{name}, value);
+            const stmt = try self.builder.varDecl(&.{name}, value);
             try stmts.append(self.allocator, stmt);
         }
     }
 
-    fn processAssign(self: *Self, index: Ast.Node.Index, stmts: *std.ArrayList(yul_ir.Statement)) ProcessError!void {
+    fn processAssign(self: *Self, index: ZigAst.Node.Index, stmts: *std.ArrayList(ast.Statement)) TransformProcessError!void {
         const p = &self.zig_parser.?;
         const data = p.ast.nodeData(index);
         const nodes = data.node_and_node;
@@ -388,30 +337,28 @@ pub const Compiler = struct {
         const target_name = p.getNodeSource(nodes[0]);
         const value = try self.translateExpression(nodes[1]);
 
-        const stmt = try self.ir_builder.assign(&.{target_name}, value);
+        const stmt = try self.builder.assign(&.{target_name}, value);
         try stmts.append(self.allocator, stmt);
     }
 
-    fn processReturn(self: *Self, index: Ast.Node.Index, stmts: *std.ArrayList(yul_ir.Statement)) ProcessError!void {
+    fn processReturn(self: *Self, index: ZigAst.Node.Index, stmts: *std.ArrayList(ast.Statement)) TransformProcessError!void {
         const p = &self.zig_parser.?;
         const data = p.ast.nodeData(index);
         const opt_node = data.opt_node;
 
         if (opt_node.unwrap()) |ret_node| {
             const value = try self.translateExpression(ret_node);
-            const assign = try self.ir_builder.assign(&.{"result"}, value);
+            const assign = try self.builder.assign(&.{"result"}, value);
             try stmts.append(self.allocator, assign);
         }
-        try stmts.append(self.allocator, .leave);
+        try stmts.append(self.allocator, ast.Statement.leaveStmt());
     }
 
-    fn processIf(self: *Self, index: Ast.Node.Index, stmts: *std.ArrayList(yul_ir.Statement)) ProcessError!void {
+    fn processIf(self: *Self, index: ZigAst.Node.Index, stmts: *std.ArrayList(ast.Statement)) TransformProcessError!void {
         const p = &self.zig_parser.?;
         const tag = p.getNodeTag(index);
         const data = p.ast.nodeData(index);
 
-        // if_simple uses node_and_node: [0] = condition, [1] = then_expr
-        // Note: Full if uses node_and_extra (for else branch)
         const cond_node = if (tag == .if_simple)
             data.node_and_node[0]
         else
@@ -419,21 +366,22 @@ pub const Compiler = struct {
 
         const cond = try self.translateExpression(cond_node);
 
-        var body: std.ArrayList(yul_ir.Statement) = .empty;
+        var body: std.ArrayList(ast.Statement) = .empty;
         defer body.deinit(self.allocator);
 
         const body_node = if (tag == .if_simple)
             data.node_and_node[1]
         else
-            data.node_and_extra[0]; // Simplified - full if handling would need extra data
+            data.node_and_extra[0];
 
         try self.processBlock(body_node, &body);
 
-        const stmt = try self.ir_builder.if_stmt(cond, body.items);
+        const body_block = try self.builder.block(body.items);
+        const stmt = self.builder.ifStmt(cond, body_block);
         try stmts.append(self.allocator, stmt);
     }
 
-    fn translateExpression(self: *Self, index: Ast.Node.Index) ProcessError!yul_ir.Expression {
+    fn translateExpression(self: *Self, index: ZigAst.Node.Index) TransformProcessError!ast.Expression {
         const p = &self.zig_parser.?;
         const tag = p.getNodeTag(index);
 
@@ -441,17 +389,16 @@ pub const Compiler = struct {
             .number_literal => blk: {
                 const src = p.getNodeSource(index);
                 const num = std.fmt.parseInt(evm_types.U256, src, 10) catch 0;
-                break :blk self.ir_builder.literal_num(num);
+                break :blk ast.Expression.lit(ast.Literal.number(num));
             },
             .identifier => blk: {
                 const name = p.getNodeSource(index);
-                // Handle true/false as special identifiers
                 if (std.mem.eql(u8, name, "true")) {
-                    break :blk self.ir_builder.literal_bool(true);
+                    break :blk ast.Expression.lit(ast.Literal.boolean(true));
                 } else if (std.mem.eql(u8, name, "false")) {
-                    break :blk self.ir_builder.literal_bool(false);
+                    break :blk ast.Expression.lit(ast.Literal.boolean(false));
                 }
-                break :blk self.ir_builder.identifier(name);
+                break :blk ast.Expression.id(name);
             },
             .add => try self.translateBinaryOp(index, "add"),
             .sub => try self.translateBinaryOp(index, "sub"),
@@ -462,11 +409,11 @@ pub const Compiler = struct {
             .greater_than => try self.translateBinaryOp(index, "gt"),
             .call, .call_one => try self.translateCall(index),
             .field_access => try self.translateFieldAccess(index),
-            else => self.ir_builder.literal_num(0), // Fallback
+            else => ast.Expression.lit(ast.Literal.number(0)),
         };
     }
 
-    fn translateBinaryOp(self: *Self, index: Ast.Node.Index, op: []const u8) ProcessError!yul_ir.Expression {
+    fn translateBinaryOp(self: *Self, index: ZigAst.Node.Index, op: []const u8) TransformProcessError!ast.Expression {
         const p = &self.zig_parser.?;
         const data = p.ast.nodeData(index);
         const nodes = data.node_and_node;
@@ -474,51 +421,44 @@ pub const Compiler = struct {
         const left = try self.translateExpression(nodes[0]);
         const right = try self.translateExpression(nodes[1]);
 
-        return try self.ir_builder.call(op, &.{ left, right });
+        return try self.builder.call(op, &.{ left, right });
     }
 
-    fn translateCall(self: *Self, index: Ast.Node.Index) ProcessError!yul_ir.Expression {
+    fn translateCall(self: *Self, index: ZigAst.Node.Index) TransformProcessError!ast.Expression {
         const p = &self.zig_parser.?;
         const tag = p.getNodeTag(index);
         const data = p.ast.nodeData(index);
 
-        // call_one uses node_and_opt_node: [0] = fn_expr, [1] = first param
-        // call uses node_and_extra: [0] = fn_expr, extra for params
         const fn_node = if (tag == .call_one)
             data.node_and_opt_node[0]
         else
             data.node_and_extra[0];
 
-        // Get function name
         const callee_src = p.getNodeSource(fn_node);
 
         // Check if it's an EVM builtin
         if (std.mem.startsWith(u8, callee_src, "evm.")) {
             const builtin_name = callee_src[4..];
             if (builtins.getBuiltin(builtin_name)) |b| {
-                // Translate arguments
-                var args: std.ArrayList(yul_ir.Expression) = .empty;
+                var args: std.ArrayList(ast.Expression) = .empty;
                 defer args.deinit(self.allocator);
 
-                // Handle arguments based on call type
                 if (tag == .call_one) {
                     if (data.node_and_opt_node[1].unwrap()) |arg_node| {
                         try args.append(self.allocator, try self.translateExpression(arg_node));
                     }
                 }
 
-                return try self.ir_builder.call(b.yul_name, args.items);
+                return try self.builder.call(b.yul_name, args.items);
             }
         }
 
-        // Regular function call
-        return try self.ir_builder.call(callee_src, &.{});
+        return try self.builder.call(callee_src, &.{});
     }
 
-    fn translateFieldAccess(self: *Self, index: Ast.Node.Index) ProcessError!yul_ir.Expression {
+    fn translateFieldAccess(self: *Self, index: ZigAst.Node.Index) TransformProcessError!ast.Expression {
         const p = &self.zig_parser.?;
         const data = p.ast.nodeData(index);
-        // field_access uses node_and_token: [0] = lhs, [1] = field name token
         const node_and_token = data.node_and_token;
 
         const obj_src = p.getNodeSource(node_and_token[0]);
@@ -527,90 +467,93 @@ pub const Compiler = struct {
 
         // Check if accessing storage
         if (std.mem.eql(u8, obj_src, "self")) {
-            // Storage access - find slot
             for (self.storage_vars.items) |sv| {
                 if (std.mem.eql(u8, sv.name, field_name)) {
-                    return try self.ir_builder.call("sload", &.{
-                        self.ir_builder.literal_num(sv.slot),
+                    return try self.builder.call("sload", &.{
+                        ast.Expression.lit(ast.Literal.number(sv.slot)),
                     });
                 }
             }
         }
 
-        return self.ir_builder.identifier(field_name);
+        return ast.Expression.id(field_name);
     }
 
-    /// Generate complete Yul object
-    fn generateYulObject(self: *Self) !yul_ir.Object {
+    /// Generate complete Yul AST
+    fn generateYulAst(self: *Self) !ast.AST {
         const name = self.current_contract orelse "Contract";
 
         // Generate deployed code
-        var deployed_code: std.ArrayList(yul_ir.Statement) = .empty;
-        defer deployed_code.deinit(self.allocator);
+        var deployed_stmts: std.ArrayList(ast.Statement) = .empty;
+        defer deployed_stmts.deinit(self.allocator);
 
         // Add function dispatcher
-        try self.generateDispatcher(&deployed_code);
+        try self.generateDispatcher(&deployed_stmts);
 
         // Add all functions
         for (self.functions.items) |func| {
-            try deployed_code.append(self.allocator, func);
+            try deployed_stmts.append(self.allocator, func);
         }
 
         // Create deployed object
         const deployed_name = try std.fmt.allocPrint(self.allocator, "{s}_deployed", .{name});
-        try self.temp_strings.append(self.allocator, deployed_name);
-        const deployed_obj = try self.ir_builder.object(
+        try self.temp_strings.append(self.allocator, deployed_name); // Track for cleanup
+
+        const deployed_code = try self.builder.block(deployed_stmts.items);
+        const deployed_obj = ast.Object.init(
             deployed_name,
-            deployed_code.items,
+            deployed_code,
             &.{},
             &.{},
         );
 
         // Generate constructor code
-        var init_code: std.ArrayList(yul_ir.Statement) = .empty;
-        defer init_code.deinit(self.allocator);
+        var init_stmts: std.ArrayList(ast.Statement) = .empty;
+        defer init_stmts.deinit(self.allocator);
 
         // datacopy(0, dataoffset("Name_deployed"), datasize("Name_deployed"))
-        const datacopy = try self.ir_builder.call("datacopy", &.{
-            self.ir_builder.literal_num(0),
-            try self.ir_builder.call("dataoffset", &.{.{ .literal = .{ .string = deployed_name } }}),
-            try self.ir_builder.call("datasize", &.{.{ .literal = .{ .string = deployed_name } }}),
-        });
-        try init_code.append(self.allocator, .{ .expression = datacopy });
+        const datacopy = ast.Statement.expr(try self.builder.call("datacopy", &.{
+            ast.Expression.lit(ast.Literal.number(0)),
+            try self.builder.call("dataoffset", &.{ast.Expression.lit(ast.Literal.string(deployed_name))}),
+            try self.builder.call("datasize", &.{ast.Expression.lit(ast.Literal.string(deployed_name))}),
+        }));
+        try init_stmts.append(self.allocator, datacopy);
 
         // return(0, datasize("Name_deployed"))
-        const ret = try self.ir_builder.call("return", &.{
-            self.ir_builder.literal_num(0),
-            try self.ir_builder.call("datasize", &.{.{ .literal = .{ .string = deployed_name } }}),
-        });
-        try init_code.append(self.allocator, .{ .expression = ret });
+        const ret = ast.Statement.expr(try self.builder.call("return", &.{
+            ast.Expression.lit(ast.Literal.number(0)),
+            try self.builder.call("datasize", &.{ast.Expression.lit(ast.Literal.string(deployed_name))}),
+        }));
+        try init_stmts.append(self.allocator, ret);
 
-        return try self.ir_builder.object(
-            name,
-            init_code.items,
-            &.{deployed_obj},
-            &.{},
-        );
+        const init_code = try self.builder.block(init_stmts.items);
+
+        // Need to allocate the deployed object slice
+        const sub_objects = try self.builder.dupeObjects(&.{deployed_obj});
+
+        const root_obj = ast.Object.init(name, init_code, sub_objects, &.{});
+
+        return ast.AST.init(root_obj);
     }
 
-    fn generateDispatcher(self: *Self, stmts: *std.ArrayList(yul_ir.Statement)) !void {
+    fn generateDispatcher(self: *Self, stmts: *std.ArrayList(ast.Statement)) !void {
         // Get function selector: shr(224, calldataload(0))
-        const selector = try self.ir_builder.call("shr", &.{
-            self.ir_builder.literal_num(224),
-            try self.ir_builder.call("calldataload", &.{self.ir_builder.literal_num(0)}),
+        const selector = try self.builder.call("shr", &.{
+            ast.Expression.lit(ast.Literal.number(224)),
+            try self.builder.call("calldataload", &.{ast.Expression.lit(ast.Literal.number(0))}),
         });
 
-        // Build switch cases (simplified - just add default revert for now)
-        const revert_call = try self.ir_builder.call("revert", &.{
-            self.ir_builder.literal_num(0),
-            self.ir_builder.literal_num(0),
+        // Build switch with default revert
+        const revert_call = try self.builder.call("revert", &.{
+            ast.Expression.lit(ast.Literal.number(0)),
+            ast.Expression.lit(ast.Literal.number(0)),
         });
 
-        const switch_stmt = try self.ir_builder.switch_stmt(
-            selector,
-            &.{}, // No cases yet - would need function selectors
-            &.{.{ .expression = revert_call }},
-        );
+        const default_body = try self.builder.block(&.{ast.Statement.expr(revert_call)});
+
+        const switch_stmt = try self.builder.switchStmt(selector, &.{
+            ast.Case.default(default_body),
+        });
 
         try stmts.append(self.allocator, switch_stmt);
     }
@@ -619,12 +562,16 @@ pub const Compiler = struct {
         return self.errors.items.len > 0;
     }
 
-    pub fn getErrors(self: *const Self) []const CompileError {
+    pub fn getErrors(self: *const Self) []const TransformError {
         return self.errors.items;
     }
 };
 
-test "compile simple contract (legacy)" {
+// =============================================================================
+// Tests
+// =============================================================================
+
+test "transform simple contract" {
     const allocator = std.testing.allocator;
 
     const source =
@@ -636,19 +583,46 @@ test "compile simple contract (legacy)" {
     const source_z = try allocator.dupeZ(u8, source);
     defer allocator.free(source_z);
 
-    var compiler = Compiler.init(allocator);
-    defer compiler.deinit();
+    var transformer = Transformer.init(allocator);
+    defer transformer.deinit();
 
-    const result = compiler.compile(source_z) catch |err| {
+    const yul_ast = transformer.transform(source_z) catch |err| {
         return err;
     };
-    defer allocator.free(result);
 
-    try std.testing.expect(std.mem.indexOf(u8, result, "object \"Token\"") != null);
+    try std.testing.expectEqualStrings("Token", yul_ast.root.name);
+    try std.testing.expectEqual(@as(usize, 1), yul_ast.root.sub_objects.len);
 }
 
-test "compile simple contract (AST-based)" {
+test "transform contract with function" {
     const allocator = std.testing.allocator;
+
+    const source =
+        \\pub const Counter = struct {
+        \\    count: u256,
+        \\
+        \\    pub fn increment(self: *Counter) void {
+        \\        return;
+        \\    }
+        \\};
+    ;
+
+    const source_z = try allocator.dupeZ(u8, source);
+    defer allocator.free(source_z);
+
+    var transformer = Transformer.init(allocator);
+    defer transformer.deinit();
+
+    const yul_ast = transformer.transform(source_z) catch |err| {
+        return err;
+    };
+
+    try std.testing.expectEqualStrings("Counter", yul_ast.root.name);
+}
+
+test "full pipeline: Zig -> Yul AST -> Yul text" {
+    const allocator = std.testing.allocator;
+    const printer = @import("printer.zig");
 
     const source =
         \\pub const Token = struct {
@@ -659,13 +633,19 @@ test "compile simple contract (AST-based)" {
     const source_z = try allocator.dupeZ(u8, source);
     defer allocator.free(source_z);
 
-    const result = Compiler.compileWithAst(allocator, source_z) catch |err| {
-        return err;
-    };
-    defer allocator.free(result);
+    // Step 1: Transform Zig to Yul AST
+    var transformer = Transformer.init(allocator);
+    defer transformer.deinit();
+
+    const yul_ast = try transformer.transform(source_z);
+
+    // Step 2: Print Yul AST to Yul text
+    const output = try printer.format(allocator, yul_ast);
+    defer allocator.free(output);
 
     // Verify output contains expected Yul constructs
-    try std.testing.expect(std.mem.indexOf(u8, result, "object \"Token\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "object \"Token_deployed\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "datacopy") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "object \"Token\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "object \"Token_deployed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "datacopy") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "switch") != null);
 }

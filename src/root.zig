@@ -26,9 +26,11 @@ pub const yul = struct {
     // New AST-based architecture
     pub const yul_ast = @import("yul/ast.zig");
     pub const printer = @import("yul/printer.zig");
+    pub const transformer = @import("yul/transformer.zig");
     pub const AST = yul_ast.AST;
     pub const AstBuilder = yul_ast.AstBuilder;
     pub const Printer = printer.Printer;
+    pub const Transformer = transformer.Transformer;
 };
 
 pub const evm = struct {
