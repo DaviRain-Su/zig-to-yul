@@ -64,6 +64,7 @@ pub const Compiler = struct {
         param_types: []const []const u8,
         param_struct_lens: []const usize,
         param_struct_dynamic: []const bool,
+        param_struct_names: []const []const u8,
         has_return: bool,
         is_public: bool,
         selector: u32,
@@ -183,6 +184,10 @@ pub const Compiler = struct {
             self.allocator.free(fi.param_types);
             self.allocator.free(fi.param_struct_lens);
             self.allocator.free(fi.param_struct_dynamic);
+            for (fi.param_struct_names) |name| {
+                if (name.len > 0) self.allocator.free(name);
+            }
+            self.allocator.free(fi.param_struct_names);
             if (fi.return_abi) |ret| self.allocator.free(ret);
         }
         self.function_infos.deinit(self.allocator);
@@ -360,7 +365,8 @@ pub const Compiler = struct {
 
     fn structHasDynamicFieldLegacy(self: *Self, fields: []const StructFieldDef) bool {
         for (fields) |field| {
-            const abi = self.abiTypeForZigLegacy(field.type_name) catch "uint256";
+            if (self.struct_defs.get(field.type_name) != null) continue;
+            const abi = mapZigTypeToAbi(field.type_name);
             if (isDynamicAbiType(abi)) return true;
         }
         return false;
@@ -473,6 +479,9 @@ pub const Compiler = struct {
             var param_struct_dynamic: std.ArrayList(bool) = .empty;
             defer param_struct_dynamic.deinit(self.allocator);
 
+            var param_struct_names: std.ArrayList([]const u8) = .empty;
+            defer param_struct_names.deinit(self.allocator);
+
             const param_infos = try p.getFnParams(self.allocator, proto.proto_node);
             defer self.allocator.free(param_infos);
 
@@ -485,10 +494,13 @@ pub const Compiler = struct {
                         abi_type = try self.buildTupleAbiLegacy(fields);
                         try param_struct_lens.append(self.allocator, fields.len);
                         try param_struct_dynamic.append(self.allocator, self.structHasDynamicFieldLegacy(fields));
+                        const type_copy = try self.allocator.dupe(u8, zig_type);
+                        try param_struct_names.append(self.allocator, type_copy);
                     } else {
                         abi_type = mapZigTypeToAbi(zig_type);
                         try param_struct_lens.append(self.allocator, 0);
                         try param_struct_dynamic.append(self.allocator, false);
+                        try param_struct_names.append(self.allocator, "");
                     }
                     try param_types.append(self.allocator, abi_type);
                 }
@@ -525,6 +537,7 @@ pub const Compiler = struct {
                 const owned_param_types = try self.allocator.dupe([]const u8, param_types.items);
                 const owned_param_struct_lens = try self.allocator.dupe(usize, param_struct_lens.items);
                 const owned_param_struct_dynamic = try self.allocator.dupe(bool, param_struct_dynamic.items);
+                const owned_param_struct_names = try self.allocator.dupe([]const u8, param_struct_names.items);
 
                 try self.function_infos.append(self.allocator, .{
                     .name = name,
@@ -532,6 +545,7 @@ pub const Compiler = struct {
                     .param_types = owned_param_types,
                     .param_struct_lens = owned_param_struct_lens,
                     .param_struct_dynamic = owned_param_struct_dynamic,
+                    .param_struct_names = owned_param_struct_names,
                     .has_return = has_return,
                     .is_public = true,
                     .selector = selector,
@@ -1797,6 +1811,8 @@ pub const Compiler = struct {
                     try call_args.append(self.allocator, self.ir_builder.identifier(param_name));
                     head_offset += @as(evm_types.U256, @intCast(struct_len * 32));
                 } else if (struct_len > 0 and struct_dynamic) {
+                    const struct_name = fi.param_struct_names[i];
+                    const fields_opt = self.struct_defs.get(struct_name);
                     const offset_name = try self.makeTempLegacy("offset");
                     const head_name = try self.makeTempLegacy("head");
                     const mem_name = try self.makeTempLegacy("mem");
@@ -1817,28 +1833,116 @@ pub const Compiler = struct {
                     });
                     try case_stmts.append(self.allocator, try self.ir_builder.variable(&.{mem_name}, mem_expr));
 
-                    for (0..struct_len) |idx| {
-                        const field_offset = try self.ir_builder.builtin_call("add", &.{
-                            self.ir_builder.identifier(head_name),
-                            self.ir_builder.literal_num(@as(evm_types.U256, @intCast(idx * 32))),
-                        });
-                        const val = try self.ir_builder.builtin_call("calldataload", &.{field_offset});
-                        const addr = try self.ir_builder.builtin_call("add", &.{
-                            self.ir_builder.identifier(mem_name),
-                            self.ir_builder.literal_num(@as(evm_types.U256, @intCast(idx * 32))),
-                        });
-                        const store = try self.ir_builder.builtin_call("mstore", &.{addr, val});
-                        try case_stmts.append(self.allocator, .{ .expression = store });
-                    }
-
-                    const update_free = try self.ir_builder.builtin_call("mstore", &.{
+                    const reserve_struct = try self.ir_builder.builtin_call("mstore", &.{
                         self.ir_builder.literal_num(@as(evm_types.U256, 0x40)),
                         try self.ir_builder.builtin_call("add", &.{
                             self.ir_builder.identifier(mem_name),
                             self.ir_builder.literal_num(@as(evm_types.U256, @intCast(struct_len * 32))),
                         }),
                     });
-                    try case_stmts.append(self.allocator, .{ .expression = update_free });
+                    try case_stmts.append(self.allocator, .{ .expression = reserve_struct });
+
+                    if (fields_opt) |fields| {
+                        for (fields, 0..) |field, idx| {
+                            const field_slot = try self.ir_builder.builtin_call("add", &.{
+                                self.ir_builder.identifier(mem_name),
+                                self.ir_builder.literal_num(@as(evm_types.U256, @intCast(idx * 32))),
+                            });
+                            const head_slot = try self.ir_builder.builtin_call("add", &.{
+                                self.ir_builder.identifier(head_name),
+                                self.ir_builder.literal_num(@as(evm_types.U256, @intCast(idx * 32))),
+                            });
+
+                            if (self.struct_defs.get(field.type_name) == null and isDynamicAbiType(mapZigTypeToAbi(field.type_name))) {
+                                const rel_name = try self.makeTempLegacy("field_off");
+                                const len_name = try self.makeTempLegacy("field_len");
+                                const data_name = try self.makeTempLegacy("field_data");
+                                const size_name = try self.makeTempLegacy("field_size");
+                                const field_mem = try self.makeTempLegacy("field_mem");
+
+                                const rel_expr = try self.ir_builder.builtin_call("calldataload", &.{head_slot});
+                                try case_stmts.append(self.allocator, try self.ir_builder.variable(&.{rel_name}, rel_expr));
+
+                                const field_head = try self.ir_builder.builtin_call("add", &.{
+                                    self.ir_builder.identifier(head_name),
+                                    self.ir_builder.identifier(rel_name),
+                                });
+                                const len_expr = try self.ir_builder.builtin_call("calldataload", &.{field_head});
+                                try case_stmts.append(self.allocator, try self.ir_builder.variable(&.{len_name}, len_expr));
+
+                                const field_mem_expr = try self.ir_builder.builtin_call("mload", &.{
+                                    self.ir_builder.literal_num(@as(evm_types.U256, 0x40)),
+                                });
+                                try case_stmts.append(self.allocator, try self.ir_builder.variable(&.{field_mem}, field_mem_expr));
+
+                                const store_len = try self.ir_builder.builtin_call("mstore", &.{
+                                    self.ir_builder.identifier(field_mem),
+                                    self.ir_builder.identifier(len_name),
+                                });
+                                try case_stmts.append(self.allocator, .{ .expression = store_len });
+
+                                const data_expr = try self.ir_builder.builtin_call("add", &.{
+                                    self.ir_builder.identifier(field_mem),
+                                    self.ir_builder.literal_num(@as(evm_types.U256, 32)),
+                                });
+                                try case_stmts.append(self.allocator, try self.ir_builder.variable(&.{data_name}, data_expr));
+
+                                const size_expr = if (isDynamicArrayAbiType(mapZigTypeToAbi(field.type_name)))
+                                    try self.ir_builder.builtin_call("mul", &.{
+                                        self.ir_builder.identifier(len_name),
+                                        self.ir_builder.literal_num(@as(evm_types.U256, 32)),
+                                    })
+                                else
+                                    try self.ir_builder.builtin_call("and", &.{
+                                        try self.ir_builder.builtin_call("add", &.{
+                                            self.ir_builder.identifier(len_name),
+                                            self.ir_builder.literal_num(@as(evm_types.U256, 31)),
+                                        }),
+                                        try self.ir_builder.builtin_call("not", &.{self.ir_builder.literal_num(@as(evm_types.U256, 31))}),
+                                    });
+                                try case_stmts.append(self.allocator, try self.ir_builder.variable(&.{size_name}, size_expr));
+
+                                const data_start = try self.ir_builder.builtin_call("add", &.{
+                                    field_head,
+                                    self.ir_builder.literal_num(@as(evm_types.U256, 32)),
+                                });
+                                try self.appendMemoryCopyLoopLegacy(&case_stmts, self.ir_builder.identifier(data_name), data_start, self.ir_builder.identifier(size_name));
+
+                                const update_free = try self.ir_builder.builtin_call("mstore", &.{
+                                    self.ir_builder.literal_num(@as(evm_types.U256, 0x40)),
+                                    try self.ir_builder.builtin_call("add", &.{
+                                        self.ir_builder.identifier(data_name),
+                                        self.ir_builder.identifier(size_name),
+                                    }),
+                                });
+                                try case_stmts.append(self.allocator, .{ .expression = update_free });
+
+                                const store_ptr = try self.ir_builder.builtin_call("mstore", &.{
+                                    field_slot,
+                                    self.ir_builder.identifier(field_mem),
+                                });
+                                try case_stmts.append(self.allocator, .{ .expression = store_ptr });
+                            } else {
+                                const val = try self.ir_builder.builtin_call("calldataload", &.{head_slot});
+                                const store = try self.ir_builder.builtin_call("mstore", &.{field_slot, val});
+                                try case_stmts.append(self.allocator, .{ .expression = store });
+                            }
+                        }
+                    } else {
+                        for (0..struct_len) |idx| {
+                            const field_offset = try self.ir_builder.builtin_call("add", &.{
+                                self.ir_builder.identifier(head_name),
+                                self.ir_builder.literal_num(@as(evm_types.U256, @intCast(idx * 32))),
+                            });
+                            const val = try self.ir_builder.builtin_call("calldataload", &.{field_offset});
+                            const addr = try self.ir_builder.builtin_call("add", &.{
+                                self.ir_builder.identifier(mem_name),
+                                self.ir_builder.literal_num(@as(evm_types.U256, @intCast(idx * 32))),
+                            });
+                            const store = try self.ir_builder.builtin_call("mstore", &.{addr, val});
+                            try case_stmts.append(self.allocator, .{ .expression = store });
+                        }
+                    }
 
                     try case_stmts.append(self.allocator, try self.ir_builder.variable(&.{param_name}, self.ir_builder.identifier(mem_name)));
                     try call_args.append(self.allocator, self.ir_builder.identifier(param_name));
@@ -2216,6 +2320,36 @@ test "compile struct param (legacy)" {
     try std.testing.expect(std.mem.indexOf(u8, result, "calldataload(4)") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "calldataload(36)") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "calldataload(68)") != null);
+}
+
+test "compile struct dynamic field param (legacy)" {
+    const allocator = std.testing.allocator;
+
+    const source =
+        \\const Payload = struct {
+        \\    data: []u8,
+        \\    x: u256,
+        \\};
+        \\
+        \\pub const Box = struct {
+        \\    pub fn take(self: *Box, p: Payload) u256 {
+        \\        return p.x;
+        \\    }
+        \\};
+    ;
+
+    const source_z = try allocator.dupeZ(u8, source);
+    defer allocator.free(source_z);
+
+    var compiler = Compiler.init(allocator);
+    defer compiler.deinit();
+
+    const result = compiler.compile(source_z) catch |err| {
+        return err;
+    };
+    defer allocator.free(result);
+
+    try std.testing.expect(std.mem.indexOf(u8, result, "calldataload(add(") != null);
 }
 
 test "compile simple contract (AST-based)" {
