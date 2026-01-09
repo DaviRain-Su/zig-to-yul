@@ -31,6 +31,7 @@ pub const Transformer = struct {
     storage_vars: std.ArrayList(StorageVar),
     function_infos: std.ArrayList(FunctionInfo),
     temp_counter: u32, // Counter for generating unique temp variable names
+    loop_break_flags: std.ArrayList(?[]const u8),
 
     // Track allocated strings for cleanup
     temp_strings: std.ArrayList([]const u8),
@@ -130,6 +131,7 @@ pub const Transformer = struct {
             .storage_vars = .empty,
             .function_infos = .empty,
             .temp_counter = 0,
+            .loop_break_flags = .empty,
             .temp_strings = .empty,
         };
     }
@@ -185,6 +187,7 @@ pub const Transformer = struct {
             self.allocator.free(s);
         }
         self.temp_strings.deinit(self.allocator);
+        self.loop_break_flags.deinit(self.allocator);
     }
 
     /// Transform Zig source code to Yul AST
@@ -858,7 +861,10 @@ pub const Transformer = struct {
 
         var body_stmts: std.ArrayList(ast.Statement) = .empty;
         defer body_stmts.deinit(self.allocator);
+        try self.pushLoopBreakFlag(null);
+        errdefer self.popLoopBreakFlag();
         try self.processBlock(while_info.ast.then_expr, &body_stmts);
+        self.popLoopBreakFlag();
 
         const pre_block = try self.builder.block(&.{});
         const post_block = try self.builder.block(post_stmts.items);
@@ -872,9 +878,13 @@ pub const Transformer = struct {
         const p = &self.zig_parser.?;
         const for_info = p.ast.fullFor(index) orelse return;
 
-        if (for_info.ast.else_expr.unwrap() != null) {
-            try self.addError("for-else is not supported", self.nodeLocation(index), .unsupported_feature);
-            return;
+        const else_node = for_info.ast.else_expr.unwrap();
+        var break_flag: ?[]const u8 = null;
+        if (else_node != null) {
+            const flag_name = try self.makeTemp("for_break");
+            const flag_decl = try self.builder.varDecl(&.{flag_name}, ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0))));
+            try stmts.append(self.allocator, self.stmtWithLocation(flag_decl, self.nodeLocation(index)));
+            break_flag = flag_name;
         }
 
         if (for_info.ast.inputs.len == 0 or for_info.ast.inputs.len > 2) {
@@ -925,7 +935,20 @@ pub const Transformer = struct {
                 try self.addError("for over array requires explicit index range", self.nodeLocation(input0), .unsupported_feature);
                 return;
             }
-            try self.processForArray(index, for_info, payloads, input0, input1.?, stmts);
+            try self.processForArray(index, for_info, payloads, input0, input1.?, break_flag, stmts);
+            if (break_flag) |flag_name| {
+                var else_body: std.ArrayList(ast.Statement) = .empty;
+                defer else_body.deinit(self.allocator);
+                if (else_node) |else_idx| {
+                    try self.processBlock(else_idx, &else_body);
+                }
+                if (else_body.items.len > 0) {
+                    const else_block = try self.builder.block(else_body.items);
+                    const cond = try self.builder.builtinCall("iszero", &.{ast.Expression.id(flag_name)});
+                    const else_stmt = self.builder.ifStmt(cond, else_block);
+                    try stmts.append(self.allocator, self.stmtWithLocation(else_stmt, self.nodeLocation(index)));
+                }
+            }
             return;
         }
 
@@ -991,7 +1014,10 @@ pub const Transformer = struct {
 
         var body_stmts: std.ArrayList(ast.Statement) = .empty;
         defer body_stmts.deinit(self.allocator);
+        try self.pushLoopBreakFlag(break_flag);
+        errdefer self.popLoopBreakFlag();
         try self.processBlock(for_info.ast.then_expr, &body_stmts);
+        self.popLoopBreakFlag();
 
         const pre_block = try self.builder.block(init_stmts.items);
         const post_block = try self.builder.block(post_stmts.items);
@@ -999,6 +1025,19 @@ pub const Transformer = struct {
 
         const loop_stmt = self.builder.forLoop(pre_block, cond, post_block, body_block);
         try stmts.append(self.allocator, self.stmtWithLocation(loop_stmt, self.nodeLocation(index)));
+        if (break_flag) |flag_name| {
+            var else_body: std.ArrayList(ast.Statement) = .empty;
+            defer else_body.deinit(self.allocator);
+            if (else_node) |else_idx| {
+                try self.processBlock(else_idx, &else_body);
+            }
+            if (else_body.items.len > 0) {
+                const else_block = try self.builder.block(else_body.items);
+                const cond_else = try self.builder.builtinCall("iszero", &.{ast.Expression.id(flag_name)});
+                const else_stmt = self.builder.ifStmt(cond_else, else_block);
+                try stmts.append(self.allocator, self.stmtWithLocation(else_stmt, self.nodeLocation(index)));
+            }
+        }
     }
 
     fn processForArray(
@@ -1008,6 +1047,7 @@ pub const Transformer = struct {
         payloads: PayloadList,
         base_node: ZigAst.Node.Index,
         index_range: ZigAst.Node.Index,
+        break_flag: ?[]const u8,
         stmts: *std.ArrayList(ast.Statement),
     ) TransformProcessError!void {
         const p = &self.zig_parser.?;
@@ -1066,7 +1106,10 @@ pub const Transformer = struct {
         var body_stmts: std.ArrayList(ast.Statement) = .empty;
         defer body_stmts.deinit(self.allocator);
         try body_stmts.append(self.allocator, assign_val);
+        try self.pushLoopBreakFlag(break_flag);
+        errdefer self.popLoopBreakFlag();
         try self.processBlock(for_info.ast.then_expr, &body_stmts);
+        self.popLoopBreakFlag();
 
         const pre_block = try self.builder.block(init_stmts.items);
         const post_block = try self.builder.block(post_stmts.items);
@@ -1316,6 +1359,10 @@ pub const Transformer = struct {
         if (data[0] != .none or data[1].unwrap() != null) {
             try self.addError("break with label/value is not supported", self.nodeLocation(index), .unsupported_feature);
             return;
+        }
+        if (self.currentLoopBreakFlag()) |flag| {
+            const set_break = try self.builder.assign(&.{flag}, ast.Expression.lit(ast.Literal.number(@as(ast.U256, 1))));
+            try stmts.append(self.allocator, self.stmtWithLocation(set_break, self.nodeLocation(index)));
         }
         try stmts.append(self.allocator, self.stmtWithLocation(ast.Statement.breakStmt(), self.nodeLocation(index)));
     }
@@ -2224,6 +2271,19 @@ pub const Transformer = struct {
         return name;
     }
 
+    fn pushLoopBreakFlag(self: *Self, flag: ?[]const u8) TransformProcessError!void {
+        try self.loop_break_flags.append(self.allocator, flag);
+    }
+
+    fn popLoopBreakFlag(self: *Self) void {
+        _ = self.loop_break_flags.pop();
+    }
+
+    fn currentLoopBreakFlag(self: *Self) ?[]const u8 {
+        if (self.loop_break_flags.items.len == 0) return null;
+        return self.loop_break_flags.items[self.loop_break_flags.items.len - 1];
+    }
+
     fn appendMemoryCopyLoop(
         self: *Self,
         stmts: *std.ArrayList(ast.Statement),
@@ -2798,6 +2858,14 @@ test "transform loops and control flow" {
         \\            i = i + val2 + idx2;
         \\        }
         \\
+        \\        for (0..2) |k| {
+        \\            if (k == 1) {
+        \\                break;
+        \\            }
+        \\        } else {
+        \\            i = i + 9;
+        \\        }
+        \\
         \\        for (0..) |_| {
         \\            break;
         \\        }
@@ -2823,6 +2891,7 @@ test "transform loops and control flow" {
     try std.testing.expect(std.mem.indexOf(u8, output, "let idx") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "let val2") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "let idx2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "for_break") != null);
 }
 
 test "transform expression coverage" {
