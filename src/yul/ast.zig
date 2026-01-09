@@ -9,6 +9,121 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
+// =============================================================================
+// Dialect - EVM version configuration
+// =============================================================================
+
+/// EVM version for dialect selection
+pub const EvmVersion = enum {
+    homestead,
+    tangerine_whistle,
+    spurious_dragon,
+    byzantium,
+    constantinople,
+    petersburg,
+    istanbul,
+    berlin,
+    london,
+    paris,
+    shanghai,
+    cancun,
+    prague,
+
+    /// Get the latest stable EVM version
+    pub fn latest() EvmVersion {
+        return .cancun;
+    }
+
+    /// Check if a feature is available in this EVM version
+    pub fn hasFeature(self: EvmVersion, feature: EvmFeature) bool {
+        return @intFromEnum(self) >= @intFromEnum(feature.minVersion());
+    }
+};
+
+/// EVM features that vary by version
+pub const EvmFeature = enum {
+    staticcall, // Byzantium+
+    create2, // Constantinople+
+    extcodehash, // Constantinople+
+    shl_shr_sar, // Constantinople+
+    chainid, // Istanbul+
+    selfbalance, // Istanbul+
+    basefee, // London+
+    prevrandao, // Paris+
+    push0, // Shanghai+
+    blobhash, // Cancun+
+    blobbasefee, // Cancun+
+    mcopy, // Cancun+
+
+    pub fn minVersion(self: EvmFeature) EvmVersion {
+        return switch (self) {
+            .staticcall => .byzantium,
+            .create2, .extcodehash, .shl_shr_sar => .constantinople,
+            .chainid, .selfbalance => .istanbul,
+            .basefee => .london,
+            .prevrandao => .paris,
+            .push0 => .shanghai,
+            .blobhash, .blobbasefee, .mcopy => .cancun,
+        };
+    }
+};
+
+/// Yul dialect configuration
+pub const Dialect = struct {
+    evm_version: EvmVersion = .cancun,
+    /// Whether to use typed Yul (with explicit types)
+    typed: bool = false,
+
+    pub fn default() Dialect {
+        return .{};
+    }
+
+    pub fn forVersion(version: EvmVersion) Dialect {
+        return .{ .evm_version = version };
+    }
+
+    /// Check if a builtin function is available in this dialect
+    pub fn hasBuiltin(self: Dialect, name: []const u8) bool {
+        // Version-specific builtins
+        if (std.mem.eql(u8, name, "staticcall")) {
+            return self.evm_version.hasFeature(.staticcall);
+        }
+        if (std.mem.eql(u8, name, "create2")) {
+            return self.evm_version.hasFeature(.create2);
+        }
+        if (std.mem.eql(u8, name, "extcodehash")) {
+            return self.evm_version.hasFeature(.extcodehash);
+        }
+        if (std.mem.eql(u8, name, "shl") or std.mem.eql(u8, name, "shr") or std.mem.eql(u8, name, "sar")) {
+            return self.evm_version.hasFeature(.shl_shr_sar);
+        }
+        if (std.mem.eql(u8, name, "chainid")) {
+            return self.evm_version.hasFeature(.chainid);
+        }
+        if (std.mem.eql(u8, name, "selfbalance")) {
+            return self.evm_version.hasFeature(.selfbalance);
+        }
+        if (std.mem.eql(u8, name, "basefee")) {
+            return self.evm_version.hasFeature(.basefee);
+        }
+        if (std.mem.eql(u8, name, "prevrandao")) {
+            return self.evm_version.hasFeature(.prevrandao);
+        }
+        if (std.mem.eql(u8, name, "blobhash")) {
+            return self.evm_version.hasFeature(.blobhash);
+        }
+        if (std.mem.eql(u8, name, "blobbasefee")) {
+            return self.evm_version.hasFeature(.blobbasefee);
+        }
+        if (std.mem.eql(u8, name, "mcopy")) {
+            return self.evm_version.hasFeature(.mcopy);
+        }
+
+        // All other builtins are always available
+        return BuiltinName.isBuiltin(name);
+    }
+};
+
 /// Source location for error reporting and debugging
 pub const SourceLocation = struct {
     start: u32 = 0,
@@ -111,6 +226,59 @@ pub const Identifier = struct {
 
     pub fn init(name: YulName) Identifier {
         return .{ .name = name };
+    }
+};
+
+/// Built-in function name (EVM opcodes like add, mstore, etc.)
+pub const BuiltinName = struct {
+    location: SourceLocation = .none,
+    name: YulName,
+
+    pub fn init(name: YulName) BuiltinName {
+        return .{ .name = name };
+    }
+
+    /// Check if a name is a known EVM builtin
+    pub fn isBuiltin(name: YulName) bool {
+        const builtins = [_][]const u8{
+            // Arithmetic
+            "add", "sub", "mul", "div", "sdiv", "mod", "smod", "exp",
+            "not", "lt", "gt", "slt", "sgt", "eq", "iszero",
+            "and", "or", "xor", "byte", "shl", "shr", "sar",
+            "addmod", "mulmod", "signextend", "keccak256",
+            // Memory
+            "mload", "mstore", "mstore8", "msize",
+            // Storage
+            "sload", "sstore",
+            // Call data
+            "calldataload", "calldatasize", "calldatacopy",
+            // Code
+            "codesize", "codecopy", "extcodesize", "extcodecopy", "extcodehash",
+            // Return data
+            "returndatasize", "returndatacopy",
+            // Block info
+            "blockhash", "coinbase", "timestamp", "number", "prevrandao", "gaslimit",
+            "chainid", "selfbalance", "basefee", "blobhash", "blobbasefee",
+            // Transaction
+            "origin", "gasprice", "gas",
+            // Account
+            "balance", "address", "caller", "callvalue",
+            // Control flow
+            "stop", "return", "revert", "invalid", "selfdestruct",
+            // Calls
+            "call", "callcode", "delegatecall", "staticcall", "create", "create2",
+            // Logging
+            "log0", "log1", "log2", "log3", "log4",
+            // Data
+            "datasize", "dataoffset", "datacopy",
+            // Misc
+            "pop", "dup1", "swap1", "verbatim",
+        };
+
+        for (builtins) |b| {
+            if (std.mem.eql(u8, name, b)) return true;
+        }
+        return false;
     }
 };
 
