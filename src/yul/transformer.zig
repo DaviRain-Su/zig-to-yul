@@ -883,11 +883,6 @@ pub const Transformer = struct {
         }
 
         const input0 = for_info.ast.inputs[0];
-        if (p.getNodeTag(input0) != .for_range) {
-            try self.addError("for only supports range syntax (start..end)", self.nodeLocation(input0), .unsupported_feature);
-            return;
-        }
-
         var input1: ?ZigAst.Node.Index = null;
         if (for_info.ast.inputs.len == 2) {
             input1 = for_info.ast.inputs[1];
@@ -897,10 +892,15 @@ pub const Transformer = struct {
             }
         }
 
-        const range0 = p.ast.nodeData(input0).node_and_opt_node;
-        const start_expr = try self.translateExpression(range0[0]);
-        const end_node = range0[1].unwrap();
-        const end_expr = if (end_node) |node| try self.translateExpression(node) else null;
+        const is_range0 = p.getNodeTag(input0) == .for_range;
+        var start_expr: ?ast.Expression = null;
+        var end_expr: ?ast.Expression = null;
+        if (is_range0) {
+            const range0 = p.ast.nodeData(input0).node_and_opt_node;
+            start_expr = try self.translateExpression(range0[0]);
+            const end_node = range0[1].unwrap();
+            end_expr = if (end_node) |node| try self.translateExpression(node) else null;
+        }
 
         var index_start_expr: ?ast.Expression = null;
         var index_end_expr: ?ast.Expression = null;
@@ -917,6 +917,15 @@ pub const Transformer = struct {
         }
         if (payloads.len == 2 and input1 == null) {
             try self.addError("for with index payload requires a second range input", self.nodeLocation(index), .unsupported_feature);
+            return;
+        }
+
+        if (!is_range0) {
+            if (input1 == null) {
+                try self.addError("for over array requires explicit index range", self.nodeLocation(input0), .unsupported_feature);
+                return;
+            }
+            try self.processForArray(index, for_info, payloads, input0, input1.?, stmts);
             return;
         }
 
@@ -940,7 +949,7 @@ pub const Transformer = struct {
 
         var init_stmts: std.ArrayList(ast.Statement) = .empty;
         defer init_stmts.deinit(self.allocator);
-        const init_decl = try self.builder.varDecl(&.{value_name}, start_expr);
+        const init_decl = try self.builder.varDecl(&.{value_name}, start_expr.?);
         try init_stmts.append(self.allocator, init_decl);
         if (index_name) |idx_name| {
             const idx_start = index_start_expr orelse ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0)));
@@ -982,6 +991,81 @@ pub const Transformer = struct {
 
         var body_stmts: std.ArrayList(ast.Statement) = .empty;
         defer body_stmts.deinit(self.allocator);
+        try self.processBlock(for_info.ast.then_expr, &body_stmts);
+
+        const pre_block = try self.builder.block(init_stmts.items);
+        const post_block = try self.builder.block(post_stmts.items);
+        const body_block = try self.builder.block(body_stmts.items);
+
+        const loop_stmt = self.builder.forLoop(pre_block, cond, post_block, body_block);
+        try stmts.append(self.allocator, self.stmtWithLocation(loop_stmt, self.nodeLocation(index)));
+    }
+
+    fn processForArray(
+        self: *Self,
+        index: ZigAst.Node.Index,
+        for_info: ZigAst.full.For,
+        payloads: PayloadList,
+        base_node: ZigAst.Node.Index,
+        index_range: ZigAst.Node.Index,
+        stmts: *std.ArrayList(ast.Statement),
+    ) TransformProcessError!void {
+        const p = &self.zig_parser.?;
+        const range1 = p.ast.nodeData(index_range).node_and_opt_node;
+        const idx_start_expr = try self.translateExpression(range1[0]);
+        const idx_end_node = range1[1].unwrap();
+        const idx_end_expr = if (idx_end_node) |node| try self.translateExpression(node) else null;
+
+        var value_name = payloads.items[0];
+        if (std.mem.eql(u8, value_name, "_")) {
+            value_name = try std.fmt.allocPrint(self.allocator, "$zig2yul$for$val${d}", .{self.temp_counter});
+            self.temp_counter += 1;
+            try self.temp_strings.append(self.allocator, value_name);
+        }
+
+        var index_name: []const u8 = undefined;
+        if (payloads.len == 2) {
+            index_name = payloads.items[1];
+            if (std.mem.eql(u8, index_name, "_")) {
+                index_name = try std.fmt.allocPrint(self.allocator, "$zig2yul$for$idx${d}", .{self.temp_counter});
+                self.temp_counter += 1;
+                try self.temp_strings.append(self.allocator, index_name);
+            }
+        } else {
+            index_name = try std.fmt.allocPrint(self.allocator, "$zig2yul$for$idx${d}", .{self.temp_counter});
+            self.temp_counter += 1;
+            try self.temp_strings.append(self.allocator, index_name);
+        }
+
+        const base_name = try self.makeTemp("for_base");
+        const base_expr = try self.translateExpression(base_node);
+
+        var init_stmts: std.ArrayList(ast.Statement) = .empty;
+        defer init_stmts.deinit(self.allocator);
+        try init_stmts.append(self.allocator, try self.builder.varDecl(&.{base_name}, base_expr));
+        try init_stmts.append(self.allocator, try self.builder.varDecl(&.{value_name}, ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0)))));
+        try init_stmts.append(self.allocator, try self.builder.varDecl(&.{index_name}, idx_start_expr));
+
+        var cond: ast.Expression = ast.Expression.lit(ast.Literal.number(@as(ast.U256, 1)));
+        if (idx_end_expr) |end_val| {
+            cond = try self.builder.builtinCall("lt", &.{ ast.Expression.id(index_name), end_val });
+        }
+
+        var post_stmts: std.ArrayList(ast.Statement) = .empty;
+        defer post_stmts.deinit(self.allocator);
+        const inc_call = try self.builder.builtinCall("add", &.{
+            ast.Expression.id(index_name),
+            ast.Expression.lit(ast.Literal.number(@as(ast.U256, 1))),
+        });
+        try post_stmts.append(self.allocator, try self.builder.assign(&.{index_name}, inc_call));
+
+        const addr = try self.indexedMemoryAddress(ast.Expression.id(base_name), ast.Expression.id(index_name));
+        const val_expr = try self.builder.builtinCall("mload", &.{addr});
+        const assign_val = try self.builder.assign(&.{value_name}, val_expr);
+
+        var body_stmts: std.ArrayList(ast.Statement) = .empty;
+        defer body_stmts.deinit(self.allocator);
+        try body_stmts.append(self.allocator, assign_val);
         try self.processBlock(for_info.ast.then_expr, &body_stmts);
 
         const pre_block = try self.builder.block(init_stmts.items);
@@ -2688,7 +2772,7 @@ test "transform loops and control flow" {
         \\pub const Counter = struct {
         \\    count: u256,
         \\
-        \\    pub fn loop(self: *Counter) void {
+        \\    pub fn loop(self: *Counter, data: u256) void {
         \\        var i = 0;
         \\        while (i < 4) : (i = i + 1) {
         \\            if (i == 2) {
@@ -2708,6 +2792,10 @@ test "transform loops and control flow" {
         \\                break;
         \\            }
         \\            i = i + val;
+        \\        }
+        \\
+        \\        for (data, 0..3) |val2, idx2| {
+        \\            i = i + val2 + idx2;
         \\        }
         \\
         \\        for (0..) |_| {
@@ -2733,6 +2821,8 @@ test "transform loops and control flow" {
     try std.testing.expect(std.mem.indexOf(u8, output, "let j") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "let val") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "let idx") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "let val2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "let idx2") != null);
 }
 
 test "transform expression coverage" {
