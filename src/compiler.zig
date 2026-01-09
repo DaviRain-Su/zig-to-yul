@@ -2127,11 +2127,11 @@ pub const Compiler = struct {
                         self.ir_builder.identifier(rel_name),
                     });
                     const nested_ptr = try self.decodeStructFromHeadLegacy(nested, nested_head, stmts);
-                    const store_ptr = try self.ir_builder.builtin_call("mstore", &.{field_slot, nested_ptr});
+                    const store_ptr = try self.ir_builder.builtin_call("mstore", &.{ field_slot, nested_ptr });
                     try stmts.append(self.allocator, .{ .expression = store_ptr });
                 } else {
                     const nested_ptr = try self.decodeStructFromHeadLegacy(nested, head_slot, stmts);
-                    const store_ptr = try self.ir_builder.builtin_call("mstore", &.{field_slot, nested_ptr});
+                    const store_ptr = try self.ir_builder.builtin_call("mstore", &.{ field_slot, nested_ptr });
                     try stmts.append(self.allocator, .{ .expression = store_ptr });
                 }
             } else if (isDynamicAbiType(mapZigTypeToAbi(field.type_name))) {
@@ -2205,7 +2205,7 @@ pub const Compiler = struct {
                 try stmts.append(self.allocator, .{ .expression = store_ptr });
             } else {
                 const val = try self.ir_builder.builtin_call("calldataload", &.{head_slot});
-                const store = try self.ir_builder.builtin_call("mstore", &.{field_slot, val});
+                const store = try self.ir_builder.builtin_call("mstore", &.{ field_slot, val });
                 try stmts.append(self.allocator, .{ .expression = store });
             }
 

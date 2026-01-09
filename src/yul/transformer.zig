@@ -2132,11 +2132,11 @@ pub const Transformer = struct {
                         ast.Expression.id(rel_name),
                     });
                     const nested_ptr = try self.decodeStructFromHead(nested, nested_head, stmts);
-                    const store_ptr = try self.builder.builtinCall("mstore", &.{field_slot, nested_ptr});
+                    const store_ptr = try self.builder.builtinCall("mstore", &.{ field_slot, nested_ptr });
                     try stmts.append(self.allocator, ast.Statement.expr(store_ptr));
                 } else {
                     const nested_ptr = try self.decodeStructFromHead(nested, head_slot, stmts);
-                    const store_ptr = try self.builder.builtinCall("mstore", &.{field_slot, nested_ptr});
+                    const store_ptr = try self.builder.builtinCall("mstore", &.{ field_slot, nested_ptr });
                     try stmts.append(self.allocator, ast.Statement.expr(store_ptr));
                 }
             } else if (isDynamicAbiType(mapZigTypeToAbi(field.type_name))) {
@@ -2210,7 +2210,7 @@ pub const Transformer = struct {
                 try stmts.append(self.allocator, ast.Statement.expr(store_ptr));
             } else {
                 const val = try self.builder.builtinCall("calldataload", &.{head_slot});
-                const store = try self.builder.builtinCall("mstore", &.{field_slot, val});
+                const store = try self.builder.builtinCall("mstore", &.{ field_slot, val });
                 try stmts.append(self.allocator, ast.Statement.expr(store));
             }
 
