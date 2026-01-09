@@ -333,7 +333,7 @@ Zig 源代码 → [zig-to-yul] → Yul 代码 → [solc] → EVM 字节码
 | 源码映射 (Source Maps) | 调试时定位源码位置 | ✅ 基础实现 |
 | 事件解码 (Event Decoding) | 解析合约事件日志 | ⚠️ 基础实现（静态类型/bytes/string） |
 | ABI 解码 | 解码 calldata/returndata | ⚠️ 部分实现 |
-| Gas 估算 | 预估交易 gas 消耗 | ⚠️ 未实现 |
+| Gas 估算 | 预估交易 gas 消耗 | ⚠️ 基础实现（静态估算） |
 | Yul 优化器 | 内置 Yul 级别优化 | ⚠️ 依赖 solc |
 
 ### 5.4 调试/辅助功能
