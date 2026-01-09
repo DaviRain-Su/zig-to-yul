@@ -1,6 +1,6 @@
 • 目前的 TODO 主要集中在 docs/libyul-comparison.md 的“未实现特性/限制”部分：
 
-  - ABI 编解码：结构体参数（6.4）
+  - ABI 编解码：结构体参数的动态字段（6.4）
   - SourceLocation 未填充（6.5）
   - 工具特性：Source Maps、事件解码、Gas 估算、Yul 优化器（5.3）
   - EOF Prague 相关指令（5.1）

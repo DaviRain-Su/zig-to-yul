@@ -29,7 +29,7 @@ pub const Compiler = struct {
     ir_builder: yul_ir.Builder,
     errors: std.ArrayList(CompileError),
     dialect: yul_ast.Dialect,
-    struct_defs: std.StringHashMap([]const []const u8),
+    struct_defs: std.StringHashMap([]const StructFieldDef),
     struct_init_helpers: std.StringHashMap([]const u8),
     local_struct_vars: std.StringHashMap([]const u8),
     extra_functions: std.ArrayList(yul_ir.Statement),
@@ -53,10 +53,17 @@ pub const Compiler = struct {
         slot: evm_types.U256,
     };
 
+    pub const StructFieldDef = struct {
+        name: []const u8,
+        type_name: []const u8,
+    };
+
     pub const FunctionInfo = struct {
         name: []const u8,
         params: []const []const u8,
         param_types: []const []const u8,
+        param_struct_lens: []const usize,
+        param_struct_dynamic: []const bool,
         has_return: bool,
         is_public: bool,
         selector: u32,
@@ -122,7 +129,7 @@ pub const Compiler = struct {
             .ir_builder = yul_ir.Builder.init(allocator),
             .errors = .empty,
             .dialect = yul_ast.Dialect.default(),
-            .struct_defs = std.StringHashMap([]const []const u8).init(allocator),
+            .struct_defs = std.StringHashMap([]const StructFieldDef).init(allocator),
             .struct_init_helpers = std.StringHashMap([]const u8).init(allocator),
             .local_struct_vars = std.StringHashMap([]const u8).init(allocator),
             .extra_functions = .empty,
@@ -174,6 +181,8 @@ pub const Compiler = struct {
         for (self.function_infos.items) |fi| {
             self.allocator.free(fi.params);
             self.allocator.free(fi.param_types);
+            self.allocator.free(fi.param_struct_lens);
+            self.allocator.free(fi.param_struct_dynamic);
             if (fi.return_abi) |ret| self.allocator.free(ret);
         }
         self.function_infos.deinit(self.allocator);
@@ -310,7 +319,7 @@ pub const Compiler = struct {
         const p = &self.zig_parser.?;
         if (self.struct_defs.get(name) != null) return;
 
-        var fields: std.ArrayList([]const u8) = .empty;
+        var fields: std.ArrayList(StructFieldDef) = .empty;
         defer fields.deinit(self.allocator);
 
         var buf: [2]Ast.Node.Index = undefined;
@@ -321,15 +330,64 @@ pub const Compiler = struct {
                 if (tag == .container_field_init or tag == .container_field) {
                     const field_name = p.getIdentifier(p.getMainToken(member));
                     if (field_name.len > 0) {
-                        try fields.append(self.allocator, field_name);
+                        const field_type = self.fieldTypeFromSourceLegacy(member);
+                        try fields.append(self.allocator, .{
+                            .name = field_name,
+                            .type_name = field_type,
+                        });
                     }
                 }
             }
         }
 
-        const fields_copy = try self.allocator.dupe([]const u8, fields.items);
+        const fields_copy = try self.allocator.dupe(StructFieldDef, fields.items);
         const key = try self.allocator.dupe(u8, name);
         try self.struct_defs.put(key, fields_copy);
+    }
+
+    fn fieldTypeFromSourceLegacy(self: *Self, field_node: Ast.Node.Index) []const u8 {
+        const p = &self.zig_parser.?;
+        const src = p.getNodeSource(field_node);
+        if (std.mem.indexOfScalar(u8, src, ':')) |colon| {
+            var slice = src[colon + 1 ..];
+            if (std.mem.indexOfScalar(u8, slice, '=')) |eq| {
+                slice = slice[0..eq];
+            }
+            return std.mem.trim(u8, slice, " \t\r\n,");
+        }
+        return "u256";
+    }
+
+    fn structHasDynamicFieldLegacy(self: *Self, fields: []const StructFieldDef) bool {
+        for (fields) |field| {
+            const abi = self.abiTypeForZigLegacy(field.type_name) catch "uint256";
+            if (isDynamicAbiType(abi)) return true;
+        }
+        return false;
+    }
+
+    fn abiTypeForZigLegacy(self: *Self, zig_type: []const u8) Allocator.Error![]const u8 {
+        if (self.struct_defs.get(zig_type)) |fields| {
+            return try self.buildTupleAbiLegacy(fields);
+        }
+        return mapZigTypeToAbi(zig_type);
+    }
+
+    fn buildTupleAbiLegacy(self: *Self, fields: []const StructFieldDef) Allocator.Error![]const u8 {
+        var buf = try std.ArrayList(u8).initCapacity(self.allocator, 32);
+        defer buf.deinit(self.allocator);
+
+        try buf.append(self.allocator, '(');
+        for (fields, 0..) |field, i| {
+            if (i > 0) try buf.append(self.allocator, ',');
+            const field_abi = try self.abiTypeForZigLegacy(field.type_name);
+            try buf.appendSlice(self.allocator, field_abi);
+        }
+        try buf.append(self.allocator, ')');
+
+        const owned = try buf.toOwnedSlice(self.allocator);
+        try self.temp_strings.append(self.allocator, owned);
+        return owned;
     }
 
     /// Process a contract struct
@@ -409,6 +467,12 @@ pub const Compiler = struct {
             var param_types: std.ArrayList([]const u8) = .empty;
             defer param_types.deinit(self.allocator);
 
+            var param_struct_lens: std.ArrayList(usize) = .empty;
+            defer param_struct_lens.deinit(self.allocator);
+
+            var param_struct_dynamic: std.ArrayList(bool) = .empty;
+            defer param_struct_dynamic.deinit(self.allocator);
+
             const param_infos = try p.getFnParams(self.allocator, proto.proto_node);
             defer self.allocator.free(param_infos);
 
@@ -416,7 +480,16 @@ pub const Compiler = struct {
                 if (param_info.name.len > 0 and !std.mem.eql(u8, param_info.name, "self")) {
                     try params.append(self.allocator, param_info.name);
                     const zig_type = if (param_info.type_expr) |te| p.getNodeSource(te) else "u256";
-                    const abi_type = mapZigTypeToAbi(zig_type);
+                    var abi_type: []const u8 = undefined;
+                    if (self.struct_defs.get(zig_type)) |fields| {
+                        abi_type = try self.buildTupleAbiLegacy(fields);
+                        try param_struct_lens.append(self.allocator, fields.len);
+                        try param_struct_dynamic.append(self.allocator, self.structHasDynamicFieldLegacy(fields));
+                    } else {
+                        abi_type = mapZigTypeToAbi(zig_type);
+                        try param_struct_lens.append(self.allocator, 0);
+                        try param_struct_dynamic.append(self.allocator, false);
+                    }
                     try param_types.append(self.allocator, abi_type);
                 }
             }
@@ -450,11 +523,15 @@ pub const Compiler = struct {
                 const selector = try FunctionInfo.calculateSelector(self.allocator, name, param_types.items);
                 const owned_params = try self.allocator.dupe([]const u8, params.items);
                 const owned_param_types = try self.allocator.dupe([]const u8, param_types.items);
+                const owned_param_struct_lens = try self.allocator.dupe(usize, param_struct_lens.items);
+                const owned_param_struct_dynamic = try self.allocator.dupe(bool, param_struct_dynamic.items);
 
                 try self.function_infos.append(self.allocator, .{
                     .name = name,
                     .params = owned_params,
                     .param_types = owned_param_types,
+                    .param_struct_lens = owned_param_struct_lens,
+                    .param_struct_dynamic = owned_param_struct_dynamic,
                     .has_return = has_return,
                     .is_public = true,
                     .selector = selector,
@@ -1454,8 +1531,8 @@ pub const Compiler = struct {
         var values: std.ArrayList(yul_ir.Expression) = .empty;
         defer values.deinit(self.allocator);
 
-        for (fields) |field_name| {
-            if (try self.structInitFieldValueLegacy(struct_init, field_name)) |expr| {
+        for (fields) |field| {
+            if (try self.structInitFieldValueLegacy(struct_init, field.name)) |expr| {
                 try values.append(self.allocator, expr);
             } else {
                 try values.append(self.allocator, self.ir_builder.literal_num(@as(evm_types.U256, 0)));
@@ -1466,7 +1543,7 @@ pub const Compiler = struct {
         return try self.ir_builder.call(helper, values.items);
     }
 
-    fn ensureStructInitHelperLegacy(self: *Self, type_name: []const u8, fields: []const []const u8) ![]const u8 {
+    fn ensureStructInitHelperLegacy(self: *Self, type_name: []const u8, fields: []const StructFieldDef) ![]const u8 {
         if (self.struct_init_helpers.get(type_name)) |helper| return helper;
 
         const helper_name = try self.structInitHelperNameLegacy(type_name);
@@ -1481,13 +1558,13 @@ pub const Compiler = struct {
         }));
         try body_stmts.append(self.allocator, ptr_assign);
 
-        for (fields, 0..) |field_name, i| {
+        for (fields, 0..) |field, i| {
             const offset: evm_types.U256 = @intCast(i * 32);
             const addr = try self.ir_builder.builtin_call("add", &.{
                 self.ir_builder.identifier("ptr"),
                 self.ir_builder.literal_num(offset),
             });
-            const store = try self.ir_builder.builtin_call("mstore", &.{addr, self.ir_builder.identifier(field_name)});
+            const store = try self.ir_builder.builtin_call("mstore", &.{addr, self.ir_builder.identifier(field.name)});
             try body_stmts.append(self.allocator, .{ .expression = store });
         }
 
@@ -1501,7 +1578,12 @@ pub const Compiler = struct {
         });
         try body_stmts.append(self.allocator, .{ .expression = update_ptr });
 
-        const func = try self.ir_builder.function(helper_name, fields, &.{"ptr"}, body_stmts.items);
+        const param_names = try self.allocator.alloc([]const u8, fields.len);
+        defer self.allocator.free(param_names);
+        for (fields, 0..) |field, i| {
+            param_names[i] = field.name;
+        }
+        const func = try self.ir_builder.function(helper_name, param_names, &.{"ptr"}, body_stmts.items);
         try self.extra_functions.append(self.allocator, func);
 
         return helper_name;
@@ -1544,9 +1626,9 @@ pub const Compiler = struct {
         return null;
     }
 
-    fn structFieldOffsetLegacy(_: *Self, fields: []const []const u8, field_name: []const u8) ?evm_types.U256 {
-        for (fields, 0..) |name, i| {
-            if (std.mem.eql(u8, name, field_name)) {
+    fn structFieldOffsetLegacy(_: *Self, fields: []const StructFieldDef, field_name: []const u8) ?evm_types.U256 {
+        for (fields, 0..) |field, i| {
+            if (std.mem.eql(u8, field.name, field_name)) {
                 return @intCast(i * 32);
             }
         }
@@ -1678,10 +1760,90 @@ pub const Compiler = struct {
             var call_args: std.ArrayList(yul_ir.Expression) = .empty;
             defer call_args.deinit(self.allocator);
 
+            var head_offset: evm_types.U256 = 4;
             for (fi.params, 0..) |param_name, i| {
-                const offset: evm_types.U256 = 4 + @as(evm_types.U256, @intCast(i)) * 32;
+                const offset: evm_types.U256 = head_offset;
                 const abi_type = fi.param_types[i];
-                if (isDynamicAbiType(abi_type)) {
+                const struct_len = fi.param_struct_lens[i];
+                const struct_dynamic = fi.param_struct_dynamic[i];
+                if (struct_len > 0 and !struct_dynamic) {
+                    const mem_name = try self.makeTempLegacy("mem");
+                    const mem_expr = try self.ir_builder.builtin_call("mload", &.{
+                        self.ir_builder.literal_num(@as(evm_types.U256, 0x40)),
+                    });
+                    try case_stmts.append(self.allocator, try self.ir_builder.variable(&.{mem_name}, mem_expr));
+
+                    for (0..struct_len) |idx| {
+                        const field_offset = self.ir_builder.literal_num(@as(evm_types.U256, @intCast(offset + idx * 32)));
+                        const val = try self.ir_builder.builtin_call("calldataload", &.{field_offset});
+                        const addr = try self.ir_builder.builtin_call("add", &.{
+                            self.ir_builder.identifier(mem_name),
+                            self.ir_builder.literal_num(@as(evm_types.U256, @intCast(idx * 32))),
+                        });
+                        const store = try self.ir_builder.builtin_call("mstore", &.{addr, val});
+                        try case_stmts.append(self.allocator, .{ .expression = store });
+                    }
+
+                    const update_free = try self.ir_builder.builtin_call("mstore", &.{
+                        self.ir_builder.literal_num(@as(evm_types.U256, 0x40)),
+                        try self.ir_builder.builtin_call("add", &.{
+                            self.ir_builder.identifier(mem_name),
+                            self.ir_builder.literal_num(@as(evm_types.U256, @intCast(struct_len * 32))),
+                        }),
+                    });
+                    try case_stmts.append(self.allocator, .{ .expression = update_free });
+
+                    try case_stmts.append(self.allocator, try self.ir_builder.variable(&.{param_name}, self.ir_builder.identifier(mem_name)));
+                    try call_args.append(self.allocator, self.ir_builder.identifier(param_name));
+                    head_offset += @as(evm_types.U256, @intCast(struct_len * 32));
+                } else if (struct_len > 0 and struct_dynamic) {
+                    const offset_name = try self.makeTempLegacy("offset");
+                    const head_name = try self.makeTempLegacy("head");
+                    const mem_name = try self.makeTempLegacy("mem");
+
+                    const offset_expr = try self.ir_builder.builtin_call("calldataload", &.{
+                        self.ir_builder.literal_num(offset),
+                    });
+                    try case_stmts.append(self.allocator, try self.ir_builder.variable(&.{offset_name}, offset_expr));
+
+                    const head_expr = try self.ir_builder.builtin_call("add", &.{
+                        self.ir_builder.literal_num(@as(evm_types.U256, 4)),
+                        self.ir_builder.identifier(offset_name),
+                    });
+                    try case_stmts.append(self.allocator, try self.ir_builder.variable(&.{head_name}, head_expr));
+
+                    const mem_expr = try self.ir_builder.builtin_call("mload", &.{
+                        self.ir_builder.literal_num(@as(evm_types.U256, 0x40)),
+                    });
+                    try case_stmts.append(self.allocator, try self.ir_builder.variable(&.{mem_name}, mem_expr));
+
+                    for (0..struct_len) |idx| {
+                        const field_offset = try self.ir_builder.builtin_call("add", &.{
+                            self.ir_builder.identifier(head_name),
+                            self.ir_builder.literal_num(@as(evm_types.U256, @intCast(idx * 32))),
+                        });
+                        const val = try self.ir_builder.builtin_call("calldataload", &.{field_offset});
+                        const addr = try self.ir_builder.builtin_call("add", &.{
+                            self.ir_builder.identifier(mem_name),
+                            self.ir_builder.literal_num(@as(evm_types.U256, @intCast(idx * 32))),
+                        });
+                        const store = try self.ir_builder.builtin_call("mstore", &.{addr, val});
+                        try case_stmts.append(self.allocator, .{ .expression = store });
+                    }
+
+                    const update_free = try self.ir_builder.builtin_call("mstore", &.{
+                        self.ir_builder.literal_num(@as(evm_types.U256, 0x40)),
+                        try self.ir_builder.builtin_call("add", &.{
+                            self.ir_builder.identifier(mem_name),
+                            self.ir_builder.literal_num(@as(evm_types.U256, @intCast(struct_len * 32))),
+                        }),
+                    });
+                    try case_stmts.append(self.allocator, .{ .expression = update_free });
+
+                    try case_stmts.append(self.allocator, try self.ir_builder.variable(&.{param_name}, self.ir_builder.identifier(mem_name)));
+                    try call_args.append(self.allocator, self.ir_builder.identifier(param_name));
+                    head_offset += @as(evm_types.U256, 32);
+                } else if (isDynamicAbiType(abi_type)) {
                     const offset_name = try self.makeTempLegacy("offset");
                     const head_name = try self.makeTempLegacy("head");
                     const len_name = try self.makeTempLegacy("len");
@@ -1752,6 +1914,7 @@ pub const Compiler = struct {
 
                     try case_stmts.append(self.allocator, try self.ir_builder.variable(&.{param_name}, self.ir_builder.identifier(mem_name)));
                     try call_args.append(self.allocator, self.ir_builder.identifier(param_name));
+                    head_offset += @as(evm_types.U256, 32);
                 } else {
                     const load_call = try self.ir_builder.builtin_call("calldataload", &.{
                         self.ir_builder.literal_num(offset),
@@ -1759,6 +1922,7 @@ pub const Compiler = struct {
                     const var_decl = try self.ir_builder.variable(&.{param_name}, load_call);
                     try case_stmts.append(self.allocator, var_decl);
                     try call_args.append(self.allocator, self.ir_builder.identifier(param_name));
+                    head_offset += @as(evm_types.U256, 32);
                 }
             }
 
@@ -2020,6 +2184,38 @@ test "compile dynamic abi size rounding (legacy)" {
 
     try std.testing.expect(std.mem.indexOf(u8, result, "and(add(") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "mul(") != null);
+}
+
+test "compile struct param (legacy)" {
+    const allocator = std.testing.allocator;
+
+    const source =
+        \\const Pair = struct {
+        \\    a: u256,
+        \\    b: u256,
+        \\};
+        \\
+        \\pub const Box = struct {
+        \\    pub fn take(self: *Box, p: Pair, x: u256) u256 {
+        \\        return x;
+        \\    }
+        \\};
+    ;
+
+    const source_z = try allocator.dupeZ(u8, source);
+    defer allocator.free(source_z);
+
+    var compiler = Compiler.init(allocator);
+    defer compiler.deinit();
+
+    const result = compiler.compile(source_z) catch |err| {
+        return err;
+    };
+    defer allocator.free(result);
+
+    try std.testing.expect(std.mem.indexOf(u8, result, "calldataload(4)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "calldataload(36)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "calldataload(68)") != null);
 }
 
 test "compile simple contract (AST-based)" {

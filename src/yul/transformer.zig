@@ -20,7 +20,7 @@ pub const Transformer = struct {
     builder: ast.AstBuilder,
     errors: std.ArrayList(TransformError),
     dialect: ast.Dialect,
-    struct_defs: std.StringHashMap([]const []const u8),
+    struct_defs: std.StringHashMap([]const StructFieldDef),
     struct_init_helpers: std.StringHashMap([]const u8),
     local_struct_vars: std.StringHashMap([]const u8),
     extra_functions: std.ArrayList(ast.Statement),
@@ -42,10 +42,17 @@ pub const Transformer = struct {
         slot: evm_types.U256,
     };
 
+    pub const StructFieldDef = struct {
+        name: []const u8,
+        type_name: []const u8,
+    };
+
     pub const FunctionInfo = struct {
         name: []const u8,
         params: []const []const u8,
         param_types: []const []const u8,
+        param_struct_lens: []const usize,
+        param_struct_dynamic: []const bool,
         has_return: bool, // Track if function has non-void return
         is_public: bool,
         selector: u32, // First 4 bytes of keccak256(signature)
@@ -113,7 +120,7 @@ pub const Transformer = struct {
             .builder = ast.AstBuilder.init(allocator),
             .errors = .empty,
             .dialect = ast.Dialect.default(),
-            .struct_defs = std.StringHashMap([]const []const u8).init(allocator),
+            .struct_defs = std.StringHashMap([]const StructFieldDef).init(allocator),
             .struct_init_helpers = std.StringHashMap([]const u8).init(allocator),
             .local_struct_vars = std.StringHashMap([]const u8).init(allocator),
             .extra_functions = .empty,
@@ -162,6 +169,8 @@ pub const Transformer = struct {
         for (self.function_infos.items) |fi| {
             self.allocator.free(fi.params);
             self.allocator.free(fi.param_types);
+            self.allocator.free(fi.param_struct_lens);
+            self.allocator.free(fi.param_struct_dynamic);
             if (fi.return_abi) |ret| self.allocator.free(ret);
         }
         self.function_infos.deinit(self.allocator);
@@ -267,7 +276,7 @@ pub const Transformer = struct {
         const p = &self.zig_parser.?;
         if (self.struct_defs.get(name) != null) return;
 
-        var fields: std.ArrayList([]const u8) = .empty;
+        var fields: std.ArrayList(StructFieldDef) = .empty;
         defer fields.deinit(self.allocator);
 
         var buf: [2]ZigAst.Node.Index = undefined;
@@ -278,15 +287,64 @@ pub const Transformer = struct {
                 if (tag == .container_field_init or tag == .container_field) {
                     const field_name = p.getIdentifier(p.getMainToken(member));
                     if (field_name.len > 0) {
-                        try fields.append(self.allocator, field_name);
+                        const field_type = self.fieldTypeFromSource(member);
+                        try fields.append(self.allocator, .{
+                            .name = field_name,
+                            .type_name = field_type,
+                        });
                     }
                 }
             }
         }
 
-        const fields_copy = try self.allocator.dupe([]const u8, fields.items);
+        const fields_copy = try self.allocator.dupe(StructFieldDef, fields.items);
         const key = try self.allocator.dupe(u8, name);
         try self.struct_defs.put(key, fields_copy);
+    }
+
+    fn fieldTypeFromSource(self: *Self, field_node: ZigAst.Node.Index) []const u8 {
+        const p = &self.zig_parser.?;
+        const src = p.getNodeSource(field_node);
+        if (std.mem.indexOfScalar(u8, src, ':')) |colon| {
+            var slice = src[colon + 1 ..];
+            if (std.mem.indexOfScalar(u8, slice, '=')) |eq| {
+                slice = slice[0..eq];
+            }
+            return std.mem.trim(u8, slice, " \t\r\n,");
+        }
+        return "u256";
+    }
+
+    fn structHasDynamicField(self: *Self, fields: []const StructFieldDef) bool {
+        for (fields) |field| {
+            const abi = self.abiTypeForZig(field.type_name) catch "uint256";
+            if (isDynamicAbiType(abi)) return true;
+        }
+        return false;
+    }
+
+    fn abiTypeForZig(self: *Self, zig_type: []const u8) Allocator.Error![]const u8 {
+        if (self.struct_defs.get(zig_type)) |fields| {
+            return try self.buildTupleAbi(fields);
+        }
+        return mapZigTypeToAbi(zig_type);
+    }
+
+    fn buildTupleAbi(self: *Self, fields: []const StructFieldDef) Allocator.Error![]const u8 {
+        var buf = try std.ArrayList(u8).initCapacity(self.allocator, 32);
+        defer buf.deinit(self.allocator);
+
+        try buf.append(self.allocator, '(');
+        for (fields, 0..) |field, i| {
+            if (i > 0) try buf.append(self.allocator, ',');
+            const field_abi = try self.abiTypeForZig(field.type_name);
+            try buf.appendSlice(self.allocator, field_abi);
+        }
+        try buf.append(self.allocator, ')');
+
+        const owned = try buf.toOwnedSlice(self.allocator);
+        try self.temp_strings.append(self.allocator, owned);
+        return owned;
     }
 
     /// Process a contract struct
@@ -357,6 +415,12 @@ pub const Transformer = struct {
             var param_types: std.ArrayList([]const u8) = .empty;
             defer param_types.deinit(self.allocator);
 
+            var param_struct_lens: std.ArrayList(usize) = .empty;
+            defer param_struct_lens.deinit(self.allocator);
+
+            var param_struct_dynamic: std.ArrayList(bool) = .empty;
+            defer param_struct_dynamic.deinit(self.allocator);
+
             const param_infos = try p.getFnParams(self.allocator, proto.proto_node);
             defer self.allocator.free(param_infos);
 
@@ -365,7 +429,16 @@ pub const Transformer = struct {
                     try params.append(self.allocator, param_info.name);
                     // Map Zig type to Solidity ABI type
                     const zig_type = if (param_info.type_expr) |te| p.getNodeSource(te) else "u256";
-                    const abi_type = mapZigTypeToAbi(zig_type);
+                    var abi_type: []const u8 = undefined;
+                    if (self.struct_defs.get(zig_type)) |fields| {
+                        abi_type = try self.buildTupleAbi(fields);
+                        try param_struct_lens.append(self.allocator, fields.len);
+                        try param_struct_dynamic.append(self.allocator, self.structHasDynamicField(fields));
+                    } else {
+                        abi_type = mapZigTypeToAbi(zig_type);
+                        try param_struct_lens.append(self.allocator, 0);
+                        try param_struct_dynamic.append(self.allocator, false);
+                    }
                     try param_types.append(self.allocator, abi_type);
                 }
             }
@@ -399,11 +472,15 @@ pub const Transformer = struct {
                 const selector = try FunctionInfo.calculateSelector(self.allocator, name, param_types.items);
                 const owned_params = try self.allocator.dupe([]const u8, params.items);
                 const owned_param_types = try self.allocator.dupe([]const u8, param_types.items);
+                const owned_param_struct_lens = try self.allocator.dupe(usize, param_struct_lens.items);
+                const owned_param_struct_dynamic = try self.allocator.dupe(bool, param_struct_dynamic.items);
 
                 try self.function_infos.append(self.allocator, .{
                     .name = name,
                     .params = owned_params,
                     .param_types = owned_param_types,
+                    .param_struct_lens = owned_param_struct_lens,
+                    .param_struct_dynamic = owned_param_struct_dynamic,
                     .has_return = has_return,
                     .is_public = true,
                     .selector = selector,
@@ -1404,8 +1481,8 @@ pub const Transformer = struct {
         var values: std.ArrayList(ast.Expression) = .empty;
         defer values.deinit(self.allocator);
 
-        for (fields) |field_name| {
-            if (try self.structInitFieldValue(struct_init, field_name)) |expr| {
+        for (fields) |field| {
+            if (try self.structInitFieldValue(struct_init, field.name)) |expr| {
                 try values.append(self.allocator, expr);
             } else {
                 try values.append(self.allocator, ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0))));
@@ -1416,7 +1493,7 @@ pub const Transformer = struct {
         return try self.builder.call(helper, values.items);
     }
 
-    fn ensureStructInitHelper(self: *Self, type_name: []const u8, fields: []const []const u8) ![]const u8 {
+    fn ensureStructInitHelper(self: *Self, type_name: []const u8, fields: []const StructFieldDef) ![]const u8 {
         if (self.struct_init_helpers.get(type_name)) |helper| return helper;
 
         const helper_name = try self.structInitHelperName(type_name);
@@ -1431,13 +1508,13 @@ pub const Transformer = struct {
         }));
         try body_stmts.append(self.allocator, ptr_assign);
 
-        for (fields, 0..) |field_name, i| {
+        for (fields, 0..) |field, i| {
             const offset: ast.U256 = @intCast(i * 32);
             const addr = try self.builder.builtinCall("add", &.{
                 ast.Expression.id("ptr"),
                 ast.Expression.lit(ast.Literal.number(offset)),
             });
-            const store = try self.builder.builtinCall("mstore", &.{addr, ast.Expression.id(field_name)});
+            const store = try self.builder.builtinCall("mstore", &.{addr, ast.Expression.id(field.name)});
             try body_stmts.append(self.allocator, ast.Statement.expr(store));
         }
 
@@ -1451,8 +1528,13 @@ pub const Transformer = struct {
         });
         try body_stmts.append(self.allocator, ast.Statement.expr(update_ptr));
 
+        const param_names = try self.allocator.alloc([]const u8, fields.len);
+        defer self.allocator.free(param_names);
+        for (fields, 0..) |field, i| {
+            param_names[i] = field.name;
+        }
         const body = try self.builder.block(body_stmts.items);
-        const func = try self.builder.funcDef(helper_name, fields, &.{"ptr"}, body);
+        const func = try self.builder.funcDef(helper_name, param_names, &.{"ptr"}, body);
         try self.extra_functions.append(self.allocator, func);
 
         return helper_name;
@@ -1495,10 +1577,10 @@ pub const Transformer = struct {
         return null;
     }
 
-    fn structFieldOffset(self: *Self, fields: []const []const u8, field_name: []const u8) ?ast.U256 {
+    fn structFieldOffset(self: *Self, fields: []const StructFieldDef, field_name: []const u8) ?ast.U256 {
         _ = self;
-        for (fields, 0..) |name, i| {
-            if (std.mem.eql(u8, name, field_name)) {
+        for (fields, 0..) |field, i| {
+            if (std.mem.eql(u8, field.name, field_name)) {
                 return @intCast(i * 32);
             }
         }
@@ -1657,10 +1739,92 @@ pub const Transformer = struct {
         var call_args: std.ArrayList(ast.Expression) = .empty;
         defer call_args.deinit(self.allocator);
 
+        var head_offset: ast.U256 = 4;
         for (fi.params, 0..) |param_name, i| {
-            const offset: evm_types.U256 = 4 + @as(evm_types.U256, @intCast(i)) * 32;
+            const offset: evm_types.U256 = head_offset;
             const abi_type = fi.param_types[i];
-            if (isDynamicAbiType(abi_type)) {
+            const struct_len = fi.param_struct_lens[i];
+            const struct_dynamic = fi.param_struct_dynamic[i];
+            if (struct_len > 0 and !struct_dynamic) {
+                const mem_name = try self.makeTemp("mem");
+                const mem_expr = try self.builder.builtinCall("mload", &.{
+                    ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0x40))),
+                });
+                try case_stmts.append(self.allocator, try self.builder.varDecl(&.{mem_name}, mem_expr));
+
+                for (0..struct_len) |idx| {
+                    const field_offset = ast.Expression.lit(ast.Literal.number(@as(ast.U256, @intCast(offset + idx * 32))));
+                    const val = try self.builder.builtinCall("calldataload", &.{field_offset});
+                    const addr = try self.builder.builtinCall("add", &.{
+                        ast.Expression.id(mem_name),
+                        ast.Expression.lit(ast.Literal.number(@as(ast.U256, @intCast(idx * 32)))),
+                    });
+                    const store = try self.builder.builtinCall("mstore", &.{addr, val});
+                    try case_stmts.append(self.allocator, ast.Statement.expr(store));
+                }
+
+                const update_free = try self.builder.builtinCall("mstore", &.{
+                    ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0x40))),
+                    try self.builder.builtinCall("add", &.{
+                        ast.Expression.id(mem_name),
+                        ast.Expression.lit(ast.Literal.number(@as(ast.U256, @intCast(struct_len * 32)))),
+                    }),
+                });
+                try case_stmts.append(self.allocator, ast.Statement.expr(update_free));
+
+                const var_decl = try self.builder.varDecl(&.{param_name}, ast.Expression.id(mem_name));
+                try case_stmts.append(self.allocator, var_decl);
+                try call_args.append(self.allocator, ast.Expression.id(param_name));
+                head_offset += @as(ast.U256, @intCast(struct_len * 32));
+            } else if (struct_len > 0 and struct_dynamic) {
+                const offset_name = try self.makeTemp("offset");
+                const head_name = try self.makeTemp("head");
+                const mem_name = try self.makeTemp("mem");
+
+                const offset_expr = try self.builder.builtinCall("calldataload", &.{
+                    ast.Expression.lit(ast.Literal.number(offset)),
+                });
+                try case_stmts.append(self.allocator, try self.builder.varDecl(&.{offset_name}, offset_expr));
+
+                const head_expr = try self.builder.builtinCall("add", &.{
+                    ast.Expression.lit(ast.Literal.number(@as(ast.U256, 4))),
+                    ast.Expression.id(offset_name),
+                });
+                try case_stmts.append(self.allocator, try self.builder.varDecl(&.{head_name}, head_expr));
+
+                const mem_expr = try self.builder.builtinCall("mload", &.{
+                    ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0x40))),
+                });
+                try case_stmts.append(self.allocator, try self.builder.varDecl(&.{mem_name}, mem_expr));
+
+                for (0..struct_len) |idx| {
+                    const field_offset = try self.builder.builtinCall("add", &.{
+                        ast.Expression.id(head_name),
+                        ast.Expression.lit(ast.Literal.number(@as(ast.U256, @intCast(idx * 32)))),
+                    });
+                    const val = try self.builder.builtinCall("calldataload", &.{field_offset});
+                    const addr = try self.builder.builtinCall("add", &.{
+                        ast.Expression.id(mem_name),
+                        ast.Expression.lit(ast.Literal.number(@as(ast.U256, @intCast(idx * 32)))),
+                    });
+                    const store = try self.builder.builtinCall("mstore", &.{addr, val});
+                    try case_stmts.append(self.allocator, ast.Statement.expr(store));
+                }
+
+                const update_free = try self.builder.builtinCall("mstore", &.{
+                    ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0x40))),
+                    try self.builder.builtinCall("add", &.{
+                        ast.Expression.id(mem_name),
+                        ast.Expression.lit(ast.Literal.number(@as(ast.U256, @intCast(struct_len * 32)))),
+                    }),
+                });
+                try case_stmts.append(self.allocator, ast.Statement.expr(update_free));
+
+                const var_decl = try self.builder.varDecl(&.{param_name}, ast.Expression.id(mem_name));
+                try case_stmts.append(self.allocator, var_decl);
+                try call_args.append(self.allocator, ast.Expression.id(param_name));
+                head_offset += @as(ast.U256, 32);
+            } else if (isDynamicAbiType(abi_type)) {
                 const offset_name = try self.makeTemp("offset");
                 const head_name = try self.makeTemp("head");
                 const len_name = try self.makeTemp("len");
@@ -1732,6 +1896,7 @@ pub const Transformer = struct {
                 const var_decl = try self.builder.varDecl(&.{param_name}, ast.Expression.id(mem_name));
                 try case_stmts.append(self.allocator, var_decl);
                 try call_args.append(self.allocator, ast.Expression.id(param_name));
+                head_offset += @as(ast.U256, 32);
             } else {
                 const load_call = try self.builder.builtinCall("calldataload", &.{
                     ast.Expression.lit(ast.Literal.number(offset)),
@@ -1739,6 +1904,7 @@ pub const Transformer = struct {
                 const var_decl = try self.builder.varDecl(&.{param_name}, load_call);
                 try case_stmts.append(self.allocator, var_decl);
                 try call_args.append(self.allocator, ast.Expression.id(param_name));
+                head_offset += @as(ast.U256, 32);
             }
         }
 
@@ -2123,6 +2289,39 @@ test "dispatcher dynamic abi size rounding" {
     // Bytes/string use word rounding; dynamic array uses mul(len, 32)
     try std.testing.expect(std.mem.indexOf(u8, output, "and(add(") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "mul(") != null);
+}
+
+test "dispatcher with struct param" {
+    const allocator = std.testing.allocator;
+    const printer = @import("printer.zig");
+
+    const source =
+        \\const Pair = struct {
+        \\    a: u256,
+        \\    b: u256,
+        \\};
+        \\
+        \\pub const Box = struct {
+        \\    pub fn take(self: *Box, p: Pair, x: u256) u256 {
+        \\        return x;
+        \\    }
+        \\};
+    ;
+
+    const source_z = try allocator.dupeZ(u8, source);
+    defer allocator.free(source_z);
+
+    var transformer = Transformer.init(allocator);
+    defer transformer.deinit();
+
+    const yul_ast = try transformer.transform(source_z);
+    const output = try printer.format(allocator, yul_ast);
+    defer allocator.free(output);
+
+    // Struct fields occupy two slots; next param starts at offset 68.
+    try std.testing.expect(std.mem.indexOf(u8, output, "calldataload(4)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "calldataload(36)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "calldataload(68)") != null);
 }
 
 test "transform loops and control flow" {
