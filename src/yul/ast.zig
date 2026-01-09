@@ -170,7 +170,8 @@ pub const TypedName = struct {
 
 /// Literal kind
 pub const LiteralKind = enum {
-    number,
+    number, // Decimal number (e.g., 255)
+    hex_number, // Hex number (e.g., 0xff)
     boolean,
     string,
     hex_string,
@@ -182,6 +183,7 @@ pub const U256 = @import("../evm/types.zig").U256;
 /// Literal value - can be number, boolean, or string
 pub const LiteralValue = union(LiteralKind) {
     number: U256,
+    hex_number: U256,
     boolean: bool,
     string: []const u8,
     hex_string: []const u8,
@@ -198,6 +200,13 @@ pub const Literal = struct {
         return .{
             .kind = .number,
             .value = .{ .number = n },
+        };
+    }
+
+    pub fn hexNumber(n: U256) Literal {
+        return .{
+            .kind = .hex_number,
+            .value = .{ .hex_number = n },
         };
     }
 

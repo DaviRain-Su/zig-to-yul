@@ -269,6 +269,7 @@ pub const CodeGenerator = struct {
     fn emitLiteral(self: *Self, lit: ir.Literal) EmitError!void {
         switch (lit) {
             .number => |n| try self.writeFmt("{}", .{n}),
+            .hex_number => |n| try self.writeFmt("0x{x}", .{n}),
             .string => |s| try self.writeFmt("\"{s}\"", .{s}),
             .hex_string => |s| try self.writeFmt("hex\"{s}\"", .{s}),
             .bool_ => |b| try self.write(if (b) "true" else "false"),

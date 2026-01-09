@@ -575,7 +575,9 @@ pub const Transformer = struct {
                     self.reportExprError("Invalid number literal", index, err) catch {};
                     break :blk ast.Expression.lit(ast.Literal.number(0));
                 };
-                break :blk ast.Expression.lit(ast.Literal.number(num));
+                // Preserve hex format if source starts with 0x
+                const is_hex = src.len > 2 and src[0] == '0' and (src[1] == 'x' or src[1] == 'X');
+                break :blk ast.Expression.lit(if (is_hex) ast.Literal.hexNumber(num) else ast.Literal.number(num));
             },
             .identifier => blk: {
                 const name = p.getNodeSource(index);

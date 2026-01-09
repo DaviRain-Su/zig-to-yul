@@ -214,6 +214,7 @@ pub const Printer = struct {
     fn printLiteral(self: *Self, lit: ast.Literal) Error!void {
         switch (lit.kind) {
             .number => try self.writeFmt("{}", .{lit.value.number}),
+            .hex_number => try self.writeFmt("0x{x}", .{lit.value.hex_number}),
             .boolean => try self.write(if (lit.value.boolean) "true" else "false"),
             .string => {
                 try self.write("\"");

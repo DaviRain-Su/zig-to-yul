@@ -627,7 +627,9 @@ pub const Compiler = struct {
                     self.reportExprErrorLegacy("Invalid number literal", index, err) catch {};
                     break :blk self.ir_builder.literal_num(0);
                 };
-                break :blk self.ir_builder.literal_num(num);
+                // Preserve hex format if source starts with 0x
+                const is_hex = src.len > 2 and src[0] == '0' and (src[1] == 'x' or src[1] == 'X');
+                break :blk if (is_hex) self.ir_builder.literal_hex_num(num) else self.ir_builder.literal_num(num);
             },
             .identifier => blk: {
                 const name = p.getNodeSource(index);

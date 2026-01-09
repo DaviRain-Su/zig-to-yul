@@ -9,6 +9,7 @@ const evm_types = @import("../evm/types.zig");
 /// Yul literal value
 pub const Literal = union(enum) {
     number: evm_types.U256,
+    hex_number: evm_types.U256, // Preserves hex format in output
     string: []const u8,
     hex_string: []const u8,
     bool_: bool,
@@ -16,6 +17,7 @@ pub const Literal = union(enum) {
     pub fn format(self: Literal, comptime _: []const u8, _: std.fmt.FormatOptions, writer: anytype) !void {
         switch (self) {
             .number => |n| try writer.print("{}", .{n}),
+            .hex_number => |n| try writer.print("0x{x}", .{n}),
             .string => |s| try writer.print("\"{s}\"", .{s}),
             .hex_string => |s| try writer.print("hex\"{s}\"", .{s}),
             .bool_ => |b| try writer.print("{}", .{b}),
@@ -155,6 +157,11 @@ pub const Builder = struct {
     pub fn literal_num(self: *Builder, n: evm_types.U256) Expression {
         _ = self;
         return .{ .literal = .{ .number = n } };
+    }
+
+    pub fn literal_hex_num(self: *Builder, n: evm_types.U256) Expression {
+        _ = self;
+        return .{ .literal = .{ .hex_number = n } };
     }
 
     pub fn literal_str(self: *Builder, s: []const u8) Expression {
