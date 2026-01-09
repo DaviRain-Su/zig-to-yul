@@ -877,67 +877,108 @@ pub const Transformer = struct {
             return;
         }
 
-        if (for_info.ast.inputs.len != 1) {
-            try self.addError("for requires a single range input", self.nodeLocation(index), .unsupported_feature);
+        if (for_info.ast.inputs.len == 0 or for_info.ast.inputs.len > 2) {
+            try self.addError("for requires one or two range inputs", self.nodeLocation(index), .unsupported_feature);
             return;
         }
 
-        const input = for_info.ast.inputs[0];
-        if (p.getNodeTag(input) != .for_range) {
-            try self.addError("for only supports range syntax (start..end)", self.nodeLocation(input), .unsupported_feature);
+        const input0 = for_info.ast.inputs[0];
+        if (p.getNodeTag(input0) != .for_range) {
+            try self.addError("for only supports range syntax (start..end)", self.nodeLocation(input0), .unsupported_feature);
             return;
         }
 
-        const range = p.ast.nodeData(input).node_and_opt_node;
-        const start_expr = try self.translateExpression(range[0]);
-        const end_node = range[1].unwrap();
-        const end_expr = if (end_node) |node| try self.translateExpression(node) else null;
-
-        var payload_token = for_info.payload_token;
-        if (p.getTokenTag(payload_token) == .asterisk) {
-            payload_token += 1;
-        }
-        if (p.getTokenTag(payload_token) != .identifier) {
-            try self.addError("for payload must be an identifier", self.nodeLocation(index), .unsupported_feature);
-            return;
-        }
-
-        const body_first_token = p.ast.firstToken(for_info.ast.then_expr);
-        var tok: ZigAst.TokenIndex = payload_token;
-        while (tok < body_first_token) : (tok += 1) {
-            const tag = p.getTokenTag(tok);
-            if (tag == .pipe) break;
-            if (tag == .comma) {
-                try self.addError("multiple for payloads are not supported", self.nodeLocation(index), .unsupported_feature);
+        var input1: ?ZigAst.Node.Index = null;
+        if (for_info.ast.inputs.len == 2) {
+            input1 = for_info.ast.inputs[1];
+            if (p.getNodeTag(input1.?) != .for_range) {
+                try self.addError("for index must use range syntax (start..end)", self.nodeLocation(input1.?), .unsupported_feature);
                 return;
             }
         }
 
-        var payload_name = p.getIdentifier(payload_token);
-        if (std.mem.eql(u8, payload_name, "_")) {
-            payload_name = try std.fmt.allocPrint(self.allocator, "$zig2yul$for$idx${d}", .{self.temp_counter});
+        const range0 = p.ast.nodeData(input0).node_and_opt_node;
+        const start_expr = try self.translateExpression(range0[0]);
+        const end_node = range0[1].unwrap();
+        const end_expr = if (end_node) |node| try self.translateExpression(node) else null;
+
+        var index_start_expr: ?ast.Expression = null;
+        var index_end_expr: ?ast.Expression = null;
+        if (input1) |range_node| {
+            const range1 = p.ast.nodeData(range_node).node_and_opt_node;
+            index_start_expr = try self.translateExpression(range1[0]);
+            const idx_end_node = range1[1].unwrap();
+            index_end_expr = if (idx_end_node) |node| try self.translateExpression(node) else null;
+        }
+
+        const payloads = try self.collectForPayloads(for_info.payload_token, for_info.ast.then_expr, index);
+        if (payloads.len == 0) {
+            return;
+        }
+        if (payloads.len == 2 and input1 == null) {
+            try self.addError("for with index payload requires a second range input", self.nodeLocation(index), .unsupported_feature);
+            return;
+        }
+
+        var value_name = payloads.items[0];
+        if (std.mem.eql(u8, value_name, "_")) {
+            value_name = try std.fmt.allocPrint(self.allocator, "$zig2yul$for$val${d}", .{self.temp_counter});
             self.temp_counter += 1;
-            try self.temp_strings.append(self.allocator, payload_name);
+            try self.temp_strings.append(self.allocator, value_name);
+        }
+
+        var index_name: ?[]const u8 = null;
+        if (payloads.len == 2) {
+            var tmp = payloads.items[1];
+            if (std.mem.eql(u8, tmp, "_")) {
+                tmp = try std.fmt.allocPrint(self.allocator, "$zig2yul$for$idx${d}", .{self.temp_counter});
+                self.temp_counter += 1;
+                try self.temp_strings.append(self.allocator, tmp);
+            }
+            index_name = tmp;
         }
 
         var init_stmts: std.ArrayList(ast.Statement) = .empty;
         defer init_stmts.deinit(self.allocator);
-        const init_decl = try self.builder.varDecl(&.{payload_name}, start_expr);
+        const init_decl = try self.builder.varDecl(&.{value_name}, start_expr);
         try init_stmts.append(self.allocator, init_decl);
+        if (index_name) |idx_name| {
+            const idx_start = index_start_expr orelse ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0)));
+            const idx_decl = try self.builder.varDecl(&.{idx_name}, idx_start);
+            try init_stmts.append(self.allocator, idx_decl);
+        }
 
-        const cond = if (end_expr) |end_val|
-            try self.builder.builtinCall("lt", &.{ ast.Expression.id(payload_name), end_val })
-        else
-            ast.Expression.lit(ast.Literal.number(@as(ast.U256, 1)));
+        var cond: ast.Expression = ast.Expression.lit(ast.Literal.number(@as(ast.U256, 1)));
+        if (end_expr) |end_val| {
+            cond = try self.builder.builtinCall("lt", &.{ ast.Expression.id(value_name), end_val });
+        }
+        if (index_name) |idx_name| {
+            if (index_end_expr) |idx_end| {
+                const idx_cond = try self.builder.builtinCall("lt", &.{ ast.Expression.id(idx_name), idx_end });
+                if (end_expr != null) {
+                    cond = try self.builder.builtinCall("and", &.{ cond, idx_cond });
+                } else {
+                    cond = idx_cond;
+                }
+            }
+        }
 
         var post_stmts: std.ArrayList(ast.Statement) = .empty;
         defer post_stmts.deinit(self.allocator);
         const inc_call = try self.builder.builtinCall("add", &.{
-            ast.Expression.id(payload_name),
+            ast.Expression.id(value_name),
             ast.Expression.lit(ast.Literal.number(@as(ast.U256, 1))),
         });
-        const inc_stmt = try self.builder.assign(&.{payload_name}, inc_call);
+        const inc_stmt = try self.builder.assign(&.{value_name}, inc_call);
         try post_stmts.append(self.allocator, inc_stmt);
+        if (index_name) |idx_name| {
+            const idx_inc = try self.builder.builtinCall("add", &.{
+                ast.Expression.id(idx_name),
+                ast.Expression.lit(ast.Literal.number(@as(ast.U256, 1))),
+            });
+            const idx_stmt = try self.builder.assign(&.{idx_name}, idx_inc);
+            try post_stmts.append(self.allocator, idx_stmt);
+        }
 
         var body_stmts: std.ArrayList(ast.Statement) = .empty;
         defer body_stmts.deinit(self.allocator);
@@ -949,6 +990,46 @@ pub const Transformer = struct {
 
         const loop_stmt = self.builder.forLoop(pre_block, cond, post_block, body_block);
         try stmts.append(self.allocator, self.stmtWithLocation(loop_stmt, self.nodeLocation(index)));
+    }
+
+    const PayloadList = struct {
+        items: [2][]const u8,
+        len: u8,
+    };
+
+    fn collectForPayloads(
+        self: *Self,
+        payload_token: ZigAst.TokenIndex,
+        body_index: ZigAst.Node.Index,
+        for_index: ZigAst.Node.Index,
+    ) TransformProcessError!PayloadList {
+        const p = &self.zig_parser.?;
+        const body_first_token = p.ast.firstToken(body_index);
+
+        var out: PayloadList = .{ .items = .{ "", "" }, .len = 0 };
+
+        var tok = payload_token;
+        while (tok < body_first_token) : (tok += 1) {
+            const tag = p.getTokenTag(tok);
+            switch (tag) {
+                .pipe, .comma, .asterisk => {},
+                .identifier => {
+                    if (out.len >= 2) {
+                        try self.addError("for payload must have at most two identifiers", self.nodeLocation(for_index), .unsupported_feature);
+                        return out;
+                    }
+                    out.items[out.len] = p.getIdentifier(tok);
+                    out.len += 1;
+                },
+                else => {},
+            }
+        }
+
+        if (out.len == 0) {
+            try self.addError("for payload must be an identifier", self.nodeLocation(for_index), .unsupported_feature);
+        }
+
+        return out;
     }
 
     fn processSwitch(self: *Self, index: ZigAst.Node.Index, stmts: *std.ArrayList(ast.Statement)) TransformProcessError!void {
@@ -2622,6 +2703,13 @@ test "transform loops and control flow" {
         \\            i = i + j;
         \\        }
         \\
+        \\        for (1..3, 0..) |val, idx| {
+        \\            if (idx == 1) {
+        \\                break;
+        \\            }
+        \\            i = i + val;
+        \\        }
+        \\
         \\        for (0..) |_| {
         \\            break;
         \\        }
@@ -2643,6 +2731,8 @@ test "transform loops and control flow" {
     try std.testing.expect(std.mem.indexOf(u8, output, "break") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "continue") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "let j") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "let val") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "let idx") != null);
 }
 
 test "transform expression coverage" {
