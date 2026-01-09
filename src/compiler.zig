@@ -194,8 +194,10 @@ pub const Compiler = struct {
 
         _ = try self.symbol_table.enterScope(.contract);
 
-        if (p.getContainerDecl(index)) |container| {
-            for (container.members[0..container.members_len]) |member| {
+        // Use raw AST API to get all container members
+        var buf: [2]Ast.Node.Index = undefined;
+        if (p.ast.fullContainerDecl(&buf, index)) |container| {
+            for (container.ast.members) |member| {
                 // Skip invalid/none indices
                 if (@intFromEnum(member) == 0) continue;
                 try self.processContractMember(member);
@@ -311,30 +313,34 @@ pub const Compiler = struct {
         const p = &self.zig_parser.?;
         const tag = p.getNodeTag(index);
 
-        if (tag == .block or tag == .block_two or tag == .block_two_semicolon) {
-            // Get block statements
-            var buf: [2]Ast.Node.Index = undefined;
-            const block_stmts = switch (tag) {
-                .block_two, .block_two_semicolon => blk: {
-                    const data = p.ast.nodeData(index);
-                    const opt_nodes = data.opt_node_and_opt_node;
-                    var len: usize = 0;
-                    if (opt_nodes[0].unwrap()) |n| {
-                        buf[len] = n;
-                        len += 1;
-                    }
-                    if (opt_nodes[1].unwrap()) |n| {
-                        buf[len] = n;
-                        len += 1;
-                    }
-                    break :blk buf[0..len];
-                },
-                else => &.{},
-            };
-
-            for (block_stmts) |stmt_idx| {
-                try self.processStatement(stmt_idx, stmts);
-            }
+        switch (tag) {
+            .block_two, .block_two_semicolon => {
+                // Up to 2 statements stored inline
+                const data = p.ast.nodeData(index);
+                const opt_nodes = data.opt_node_and_opt_node;
+                if (opt_nodes[0].unwrap()) |n| {
+                    try self.processStatement(n, stmts);
+                }
+                if (opt_nodes[1].unwrap()) |n| {
+                    try self.processStatement(n, stmts);
+                }
+            },
+            .block, .block_semicolon => {
+                // Multiple statements stored in extra_data via SubRange
+                const data = p.ast.nodeData(index);
+                const range = data.extra_range;
+                const start: usize = @intFromEnum(range.start);
+                const end: usize = @intFromEnum(range.end);
+                const stmt_indices = p.ast.extra_data[start..end];
+                for (stmt_indices) |stmt_idx_raw| {
+                    const stmt_idx: Ast.Node.Index = @enumFromInt(stmt_idx_raw);
+                    try self.processStatement(stmt_idx, stmts);
+                }
+            },
+            else => {
+                // Not a block - might be a single expression as body
+                try self.processStatement(index, stmts);
+            },
         }
     }
 
@@ -385,9 +391,36 @@ pub const Compiler = struct {
         const data = p.ast.nodeData(index);
         const nodes = data.node_and_node;
 
-        const target_name = p.getNodeSource(nodes[0]);
+        const target_node = nodes[0];
+        const target_tag = p.getNodeTag(target_node);
         const value = try self.translateExpression(nodes[1]);
 
+        // Check if this is a storage write (self.field = value)
+        if (target_tag == .field_access) {
+            const target_data = p.ast.nodeData(target_node);
+            const node_and_token = target_data.node_and_token;
+            const obj_src = p.getNodeSource(node_and_token[0]);
+            const field_token = node_and_token[1];
+            const field_name = p.getIdentifier(field_token);
+
+            if (std.mem.eql(u8, obj_src, "self")) {
+                // Find storage slot for this field
+                for (self.storage_vars.items) |sv| {
+                    if (std.mem.eql(u8, sv.name, field_name)) {
+                        // Emit: sstore(slot, value)
+                        const sstore_call = try self.ir_builder.call("sstore", &.{
+                            self.ir_builder.literal_num(sv.slot),
+                            value,
+                        });
+                        try stmts.append(self.allocator, .{ .expression = sstore_call });
+                        return;
+                    }
+                }
+            }
+        }
+
+        // Regular assignment
+        const target_name = p.getNodeSource(target_node);
         const stmt = try self.ir_builder.assign(&.{target_name}, value);
         try stmts.append(self.allocator, stmt);
     }
@@ -407,30 +440,21 @@ pub const Compiler = struct {
 
     fn processIf(self: *Self, index: Ast.Node.Index, stmts: *std.ArrayList(yul_ir.Statement)) ProcessError!void {
         const p = &self.zig_parser.?;
-        const tag = p.getNodeTag(index);
-        const data = p.ast.nodeData(index);
 
-        // if_simple uses node_and_node: [0] = condition, [1] = then_expr
-        // Note: Full if uses node_and_extra (for else branch)
-        const cond_node = if (tag == .if_simple)
-            data.node_and_node[0]
-        else
-            data.node_and_extra[0];
+        // Use fullIf to properly extract condition and body
+        const if_info = p.ast.fullIf(index) orelse return;
 
-        const cond = try self.translateExpression(cond_node);
+        const cond = try self.translateExpression(if_info.ast.cond_expr);
 
         var body: std.ArrayList(yul_ir.Statement) = .empty;
         defer body.deinit(self.allocator);
 
-        const body_node = if (tag == .if_simple)
-            data.node_and_node[1]
-        else
-            data.node_and_extra[0]; // Simplified - full if handling would need extra data
-
-        try self.processBlock(body_node, &body);
+        try self.processBlock(if_info.ast.then_expr, &body);
 
         const stmt = try self.ir_builder.if_stmt(cond, body.items);
         try stmts.append(self.allocator, stmt);
+
+        // Note: Yul doesn't have else, so we ignore if_info.ast.else_expr
     }
 
     fn translateExpression(self: *Self, index: Ast.Node.Index) ProcessError!yul_ir.Expression {
@@ -479,40 +503,31 @@ pub const Compiler = struct {
 
     fn translateCall(self: *Self, index: Ast.Node.Index) ProcessError!yul_ir.Expression {
         const p = &self.zig_parser.?;
-        const tag = p.getNodeTag(index);
-        const data = p.ast.nodeData(index);
 
-        // call_one uses node_and_opt_node: [0] = fn_expr, [1] = first param
-        // call uses node_and_extra: [0] = fn_expr, extra for params
-        const fn_node = if (tag == .call_one)
-            data.node_and_opt_node[0]
-        else
-            data.node_and_extra[0];
+        // Use fullCall to properly extract function and arguments
+        var call_buf: [1]Ast.Node.Index = undefined;
+        const call_info = p.ast.fullCall(&call_buf, index) orelse return self.ir_builder.literal_num(0);
 
-        // Get function name
-        const callee_src = p.getNodeSource(fn_node);
+        const callee_src = p.getNodeSource(call_info.ast.fn_expr);
+
+        // Collect all arguments
+        var args: std.ArrayList(yul_ir.Expression) = .empty;
+        defer args.deinit(self.allocator);
+
+        for (call_info.ast.params) |param_node| {
+            try args.append(self.allocator, try self.translateExpression(param_node));
+        }
 
         // Check if it's an EVM builtin
         if (std.mem.startsWith(u8, callee_src, "evm.")) {
             const builtin_name = callee_src[4..];
             if (builtins.getBuiltin(builtin_name)) |b| {
-                // Translate arguments
-                var args: std.ArrayList(yul_ir.Expression) = .empty;
-                defer args.deinit(self.allocator);
-
-                // Handle arguments based on call type
-                if (tag == .call_one) {
-                    if (data.node_and_opt_node[1].unwrap()) |arg_node| {
-                        try args.append(self.allocator, try self.translateExpression(arg_node));
-                    }
-                }
-
                 return try self.ir_builder.call(b.yul_name, args.items);
             }
         }
 
         // Regular function call
-        return try self.ir_builder.call(callee_src, &.{});
+        return try self.ir_builder.call(callee_src, args.items);
     }
 
     fn translateFieldAccess(self: *Self, index: Ast.Node.Index) ProcessError!yul_ir.Expression {

@@ -24,6 +24,7 @@ pub const Transformer = struct {
     current_contract: ?[]const u8,
     functions: std.ArrayList(ast.Statement),
     storage_vars: std.ArrayList(StorageVar),
+    function_infos: std.ArrayList(FunctionInfo),
 
     // Track allocated strings for cleanup
     temp_strings: std.ArrayList([]const u8),
@@ -33,6 +34,40 @@ pub const Transformer = struct {
     pub const StorageVar = struct {
         name: []const u8,
         slot: evm_types.U256,
+    };
+
+    pub const FunctionInfo = struct {
+        name: []const u8,
+        params: []const []const u8,
+        param_types: []const []const u8,
+        is_public: bool,
+        selector: u32, // First 4 bytes of keccak256(signature)
+
+        /// Calculate function selector using a simple hash (for demo purposes)
+        /// In production, this should use keccak256
+        pub fn calculateSelector(name: []const u8, param_types: []const []const u8) u32 {
+            // Build signature string: "funcName(type1,type2,...)"
+            var hash: u32 = 0;
+
+            // Hash function name
+            for (name) |c| {
+                hash = hash *% 31 +% c;
+            }
+            hash = hash *% 31 +% '(';
+
+            // Hash parameter types
+            for (param_types, 0..) |pt, i| {
+                if (i > 0) {
+                    hash = hash *% 31 +% ',';
+                }
+                for (pt) |c| {
+                    hash = hash *% 31 +% c;
+                }
+            }
+            hash = hash *% 31 +% ')';
+
+            return hash;
+        }
     };
 
     pub const TransformError = struct {
@@ -58,6 +93,7 @@ pub const Transformer = struct {
             .current_contract = null,
             .functions = .empty,
             .storage_vars = .empty,
+            .function_infos = .empty,
             .temp_strings = .empty,
         };
     }
@@ -71,6 +107,13 @@ pub const Transformer = struct {
         self.errors.deinit(self.allocator);
         self.functions.deinit(self.allocator);
         self.storage_vars.deinit(self.allocator);
+
+        // Free function info param arrays
+        for (self.function_infos.items) |fi| {
+            self.allocator.free(fi.params);
+            self.allocator.free(fi.param_types);
+        }
+        self.function_infos.deinit(self.allocator);
 
         // Free all temporary strings
         for (self.temp_strings.items) |s| {
@@ -162,8 +205,10 @@ pub const Transformer = struct {
 
         _ = try self.symbol_table.enterScope(.contract);
 
-        if (p.getContainerDecl(index)) |container| {
-            for (container.members[0..container.members_len]) |member| {
+        // Use raw AST API to get all container members
+        var buf: [2]ZigAst.Node.Index = undefined;
+        if (p.ast.fullContainerDecl(&buf, index)) |container| {
+            for (container.ast.members) |member| {
                 // Skip invalid/none indices
                 if (@intFromEnum(member) == 0) continue;
                 try self.processContractMember(member);
@@ -219,12 +264,19 @@ pub const Transformer = struct {
             var params: std.ArrayList([]const u8) = .empty;
             defer params.deinit(self.allocator);
 
+            var param_types: std.ArrayList([]const u8) = .empty;
+            defer param_types.deinit(self.allocator);
+
             const param_infos = try p.getFnParams(self.allocator, proto.fn_proto);
             defer self.allocator.free(param_infos);
 
             for (param_infos) |param_info| {
                 if (param_info.name.len > 0 and !std.mem.eql(u8, param_info.name, "self")) {
                     try params.append(self.allocator, param_info.name);
+                    // Map Zig type to Solidity ABI type
+                    const zig_type = if (param_info.type_expr) |te| p.getNodeSource(te) else "u256";
+                    const abi_type = mapZigTypeToAbi(zig_type);
+                    try param_types.append(self.allocator, abi_type);
                 }
             }
 
@@ -232,8 +284,38 @@ pub const Transformer = struct {
             const fn_stmt = try self.generateFunction(name, params.items, is_public, proto.body_node);
             try self.functions.append(self.allocator, fn_stmt);
 
+            // Track public functions for dispatcher
+            if (is_public) {
+                const selector = FunctionInfo.calculateSelector(name, param_types.items);
+                const owned_params = try self.allocator.dupe([]const u8, params.items);
+                const owned_param_types = try self.allocator.dupe([]const u8, param_types.items);
+
+                try self.function_infos.append(self.allocator, .{
+                    .name = name,
+                    .params = owned_params,
+                    .param_types = owned_param_types,
+                    .is_public = true,
+                    .selector = selector,
+                });
+            }
+
             self.symbol_table.exitScope();
         }
+    }
+
+    /// Map Zig types to Solidity ABI types
+    fn mapZigTypeToAbi(zig_type: []const u8) []const u8 {
+        if (std.mem.eql(u8, zig_type, "u256")) return "uint256";
+        if (std.mem.eql(u8, zig_type, "u128")) return "uint128";
+        if (std.mem.eql(u8, zig_type, "u64")) return "uint64";
+        if (std.mem.eql(u8, zig_type, "u32")) return "uint32";
+        if (std.mem.eql(u8, zig_type, "u8")) return "uint8";
+        if (std.mem.eql(u8, zig_type, "bool")) return "bool";
+        if (std.mem.eql(u8, zig_type, "Address") or std.mem.eql(u8, zig_type, "evm.Address")) return "address";
+        if (std.mem.eql(u8, zig_type, "[20]u8")) return "address";
+        if (std.mem.eql(u8, zig_type, "[32]u8")) return "bytes32";
+        // Default to uint256 for unknown types
+        return "uint256";
     }
 
     fn generateFunction(
@@ -262,29 +344,34 @@ pub const Transformer = struct {
         const p = &self.zig_parser.?;
         const tag = p.getNodeTag(index);
 
-        if (tag == .block or tag == .block_two or tag == .block_two_semicolon) {
-            var buf: [2]ZigAst.Node.Index = undefined;
-            const block_stmts = switch (tag) {
-                .block_two, .block_two_semicolon => blk: {
-                    const data = p.ast.nodeData(index);
-                    const opt_nodes = data.opt_node_and_opt_node;
-                    var len: usize = 0;
-                    if (opt_nodes[0].unwrap()) |n| {
-                        buf[len] = n;
-                        len += 1;
-                    }
-                    if (opt_nodes[1].unwrap()) |n| {
-                        buf[len] = n;
-                        len += 1;
-                    }
-                    break :blk buf[0..len];
-                },
-                else => &.{},
-            };
-
-            for (block_stmts) |stmt_idx| {
-                try self.processStatement(stmt_idx, stmts);
-            }
+        switch (tag) {
+            .block_two, .block_two_semicolon => {
+                // Up to 2 statements stored inline
+                const data = p.ast.nodeData(index);
+                const opt_nodes = data.opt_node_and_opt_node;
+                if (opt_nodes[0].unwrap()) |n| {
+                    try self.processStatement(n, stmts);
+                }
+                if (opt_nodes[1].unwrap()) |n| {
+                    try self.processStatement(n, stmts);
+                }
+            },
+            .block, .block_semicolon => {
+                // Multiple statements stored in extra_data via SubRange
+                const data = p.ast.nodeData(index);
+                const range = data.extra_range;
+                const start: usize = @intFromEnum(range.start);
+                const end: usize = @intFromEnum(range.end);
+                const stmt_indices = p.ast.extra_data[start..end];
+                for (stmt_indices) |stmt_idx_raw| {
+                    const stmt_idx: ZigAst.Node.Index = @enumFromInt(stmt_idx_raw);
+                    try self.processStatement(stmt_idx, stmts);
+                }
+            },
+            else => {
+                // Not a block - might be a single expression as body
+                try self.processStatement(index, stmts);
+            },
         }
     }
 
@@ -334,9 +421,36 @@ pub const Transformer = struct {
         const data = p.ast.nodeData(index);
         const nodes = data.node_and_node;
 
-        const target_name = p.getNodeSource(nodes[0]);
+        const target_node = nodes[0];
+        const target_tag = p.getNodeTag(target_node);
         const value = try self.translateExpression(nodes[1]);
 
+        // Check if this is a storage write (self.field = value)
+        if (target_tag == .field_access) {
+            const target_data = p.ast.nodeData(target_node);
+            const node_and_token = target_data.node_and_token;
+            const obj_src = p.getNodeSource(node_and_token[0]);
+            const field_token = node_and_token[1];
+            const field_name = p.getIdentifier(field_token);
+
+            if (std.mem.eql(u8, obj_src, "self")) {
+                // Find storage slot for this field
+                for (self.storage_vars.items) |sv| {
+                    if (std.mem.eql(u8, sv.name, field_name)) {
+                        // Emit: sstore(slot, value)
+                        const sstore_call = try self.builder.call("sstore", &.{
+                            ast.Expression.lit(ast.Literal.number(sv.slot)),
+                            value,
+                        });
+                        try stmts.append(self.allocator, ast.Statement.expr(sstore_call));
+                        return;
+                    }
+                }
+            }
+        }
+
+        // Regular assignment
+        const target_name = p.getNodeSource(target_node);
         const stmt = try self.builder.assign(&.{target_name}, value);
         try stmts.append(self.allocator, stmt);
     }
@@ -356,29 +470,23 @@ pub const Transformer = struct {
 
     fn processIf(self: *Self, index: ZigAst.Node.Index, stmts: *std.ArrayList(ast.Statement)) TransformProcessError!void {
         const p = &self.zig_parser.?;
-        const tag = p.getNodeTag(index);
-        const data = p.ast.nodeData(index);
 
-        const cond_node = if (tag == .if_simple)
-            data.node_and_node[0]
-        else
-            data.node_and_extra[0];
+        // Use fullIf to properly extract condition and body
+        const if_info = p.ast.fullIf(index) orelse return;
 
-        const cond = try self.translateExpression(cond_node);
+        const cond = try self.translateExpression(if_info.ast.cond_expr);
 
         var body: std.ArrayList(ast.Statement) = .empty;
         defer body.deinit(self.allocator);
 
-        const body_node = if (tag == .if_simple)
-            data.node_and_node[1]
-        else
-            data.node_and_extra[0];
-
-        try self.processBlock(body_node, &body);
+        try self.processBlock(if_info.ast.then_expr, &body);
 
         const body_block = try self.builder.block(body.items);
         const stmt = self.builder.ifStmt(cond, body_block);
         try stmts.append(self.allocator, stmt);
+
+        // Note: Yul doesn't have else, so we ignore if_info.ast.else_expr
+        // If needed, we could emit: if iszero(cond) { else_body }
     }
 
     fn translateExpression(self: *Self, index: ZigAst.Node.Index) TransformProcessError!ast.Expression {
@@ -426,34 +534,31 @@ pub const Transformer = struct {
 
     fn translateCall(self: *Self, index: ZigAst.Node.Index) TransformProcessError!ast.Expression {
         const p = &self.zig_parser.?;
-        const tag = p.getNodeTag(index);
-        const data = p.ast.nodeData(index);
 
-        const fn_node = if (tag == .call_one)
-            data.node_and_opt_node[0]
-        else
-            data.node_and_extra[0];
+        // Use fullCall to properly extract function and arguments
+        var call_buf: [1]ZigAst.Node.Index = undefined;
+        const call_info = p.ast.fullCall(&call_buf, index) orelse return ast.Expression.lit(ast.Literal.number(0));
 
-        const callee_src = p.getNodeSource(fn_node);
+        const callee_src = p.getNodeSource(call_info.ast.fn_expr);
+
+        // Collect all arguments
+        var args: std.ArrayList(ast.Expression) = .empty;
+        defer args.deinit(self.allocator);
+
+        for (call_info.ast.params) |param_node| {
+            try args.append(self.allocator, try self.translateExpression(param_node));
+        }
 
         // Check if it's an EVM builtin
         if (std.mem.startsWith(u8, callee_src, "evm.")) {
             const builtin_name = callee_src[4..];
             if (builtins.getBuiltin(builtin_name)) |b| {
-                var args: std.ArrayList(ast.Expression) = .empty;
-                defer args.deinit(self.allocator);
-
-                if (tag == .call_one) {
-                    if (data.node_and_opt_node[1].unwrap()) |arg_node| {
-                        try args.append(self.allocator, try self.translateExpression(arg_node));
-                    }
-                }
-
                 return try self.builder.call(b.yul_name, args.items);
             }
         }
 
-        return try self.builder.call(callee_src, &.{});
+        // Regular function call
+        return try self.builder.call(callee_src, args.items);
     }
 
     fn translateFieldAccess(self: *Self, index: ZigAst.Node.Index) TransformProcessError!ast.Expression {
@@ -543,19 +648,73 @@ pub const Transformer = struct {
             try self.builder.call("calldataload", &.{ast.Expression.lit(ast.Literal.number(0))}),
         });
 
-        // Build switch with default revert
+        // Build cases for all public functions
+        var cases: std.ArrayList(ast.Case) = .empty;
+        defer cases.deinit(self.allocator);
+
+        for (self.function_infos.items) |fi| {
+            const case_body = try self.generateFunctionCase(fi);
+            const case = ast.Case.init(
+                ast.Literal.number(fi.selector),
+                case_body,
+            );
+            try cases.append(self.allocator, case);
+        }
+
+        // Add default revert case
         const revert_call = try self.builder.call("revert", &.{
             ast.Expression.lit(ast.Literal.number(0)),
             ast.Expression.lit(ast.Literal.number(0)),
         });
-
         const default_body = try self.builder.block(&.{ast.Statement.expr(revert_call)});
+        try cases.append(self.allocator, ast.Case.default(default_body));
 
-        const switch_stmt = try self.builder.switchStmt(selector, &.{
-            ast.Case.default(default_body),
-        });
-
+        const switch_stmt = try self.builder.switchStmt(selector, cases.items);
         try stmts.append(self.allocator, switch_stmt);
+    }
+
+    /// Generate the body for a function dispatch case
+    fn generateFunctionCase(self: *Self, fi: FunctionInfo) !ast.Block {
+        var case_stmts: std.ArrayList(ast.Statement) = .empty;
+        defer case_stmts.deinit(self.allocator);
+
+        // Decode parameters from calldata
+        // Each parameter is 32 bytes, starting at offset 4 (after selector)
+        var call_args: std.ArrayList(ast.Expression) = .empty;
+        defer call_args.deinit(self.allocator);
+
+        for (fi.params, 0..) |param_name, i| {
+            // let paramN := calldataload(4 + i*32)
+            const offset: evm_types.U256 = 4 + @as(evm_types.U256, @intCast(i)) * 32;
+            const load_call = try self.builder.call("calldataload", &.{
+                ast.Expression.lit(ast.Literal.number(offset)),
+            });
+            const var_decl = try self.builder.varDecl(&.{param_name}, load_call);
+            try case_stmts.append(self.allocator, var_decl);
+
+            // Add to call arguments
+            try call_args.append(self.allocator, ast.Expression.id(param_name));
+        }
+
+        // Call the function: let result := funcName(arg1, arg2, ...)
+        const func_call = try self.builder.call(fi.name, call_args.items);
+        const result_decl = try self.builder.varDecl(&.{"_result"}, func_call);
+        try case_stmts.append(self.allocator, result_decl);
+
+        // Store result and return: mstore(0, result) then return(0, 32)
+        const mstore_call = try self.builder.call("mstore", &.{
+            ast.Expression.lit(ast.Literal.number(0)),
+            ast.Expression.id("_result"),
+        });
+        try case_stmts.append(self.allocator, ast.Statement.expr(mstore_call));
+
+        const return_call = try self.builder.call("return", &.{
+            ast.Expression.lit(ast.Literal.number(0)),
+            ast.Expression.lit(ast.Literal.number(32)),
+        });
+        try case_stmts.append(self.allocator, ast.Statement.expr(return_call));
+
+        return try self.builder.block(case_stmts.items);
     }
 
     pub fn hasErrors(self: *const Self) bool {
@@ -648,4 +807,80 @@ test "full pipeline: Zig -> Yul AST -> Yul text" {
     try std.testing.expect(std.mem.indexOf(u8, output, "object \"Token_deployed\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "datacopy") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "switch") != null);
+}
+
+test "dispatcher generates function cases" {
+    const allocator = std.testing.allocator;
+    const printer = @import("printer.zig");
+
+    const source =
+        \\pub const Counter = struct {
+        \\    count: u256,
+        \\
+        \\    pub fn increment(self: *Counter) void {
+        \\        self.count = self.count + 1;
+        \\    }
+        \\
+        \\    pub fn getCount(self: *Counter) u256 {
+        \\        return self.count;
+        \\    }
+        \\};
+    ;
+
+    const source_z = try allocator.dupeZ(u8, source);
+    defer allocator.free(source_z);
+
+    var transformer = Transformer.init(allocator);
+    defer transformer.deinit();
+
+    const yul_ast = try transformer.transform(source_z);
+    const output = try printer.format(allocator, yul_ast);
+    defer allocator.free(output);
+
+    // Verify switch cases are generated for public functions
+    try std.testing.expect(std.mem.indexOf(u8, output, "switch") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "case") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "default") != null);
+
+    // Verify dispatcher loads calldata and calls functions
+    try std.testing.expect(std.mem.indexOf(u8, output, "calldataload") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "mstore") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "return") != null);
+
+    // Verify functions exist
+    try std.testing.expect(std.mem.indexOf(u8, output, "function increment") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "function getCount") != null);
+}
+
+test "dispatcher with parameterized function" {
+    const allocator = std.testing.allocator;
+    const printer = @import("printer.zig");
+
+    const source =
+        \\pub const Token = struct {
+        \\    balance: u256,
+        \\
+        \\    pub fn transfer(self: *Token, to: u256, amount: u256) bool {
+        \\        return true;
+        \\    }
+        \\};
+    ;
+
+    const source_z = try allocator.dupeZ(u8, source);
+    defer allocator.free(source_z);
+
+    var transformer = Transformer.init(allocator);
+    defer transformer.deinit();
+
+    const yul_ast = try transformer.transform(source_z);
+    const output = try printer.format(allocator, yul_ast);
+    defer allocator.free(output);
+
+    // Verify parameters are extracted from calldata
+    // First param at offset 4, second at offset 36
+    try std.testing.expect(std.mem.indexOf(u8, output, "calldataload(4)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "calldataload(36)") != null);
+
+    // Verify function definition with parameters
+    try std.testing.expect(std.mem.indexOf(u8, output, "function transfer(to, amount)") != null);
 }

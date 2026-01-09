@@ -35,7 +35,7 @@ pub fn main() !void {
     }
 }
 
-/// Compile Zig to Yul only
+/// Compile Zig to Yul only (using new AST-based transformer)
 fn runCompile(allocator: std.mem.Allocator, args: []const []const u8) !void {
     const opts = try parseOptions(args);
 
@@ -48,11 +48,9 @@ fn runCompile(allocator: std.mem.Allocator, args: []const []const u8) !void {
     const source = try readFile(allocator, opts.input_file.?);
     defer allocator.free(source);
 
-    var compiler = Compiler.init(allocator);
-    defer compiler.deinit();
-
-    const yul_code = compiler.compile(source) catch {
-        printCompileErrorsStderr(&compiler);
+    // Use new AST-based compiler with proper dispatcher
+    const yul_code = Compiler.compileWithAst(allocator, source) catch |err| {
+        std.debug.print("Compilation error: {}\n", .{err});
         std.process.exit(1);
     };
     defer allocator.free(yul_code);
