@@ -147,10 +147,11 @@ pub const builtins = [_]Builtin{
     .{ .name = "pop", .yul_name = "pop", .inputs = 1, .outputs = 0, .category = .other, .description = "discard stack top" },
 };
 
-/// Lookup a builtin by name
+/// Lookup a builtin by name (checks both internal name and Yul name)
 pub fn getBuiltin(name: []const u8) ?Builtin {
     for (builtins) |b| {
-        if (std.mem.eql(u8, b.name, name)) {
+        // Check both internal name (e.g., "and_") and yul_name (e.g., "and")
+        if (std.mem.eql(u8, b.name, name) or std.mem.eql(u8, b.yul_name, name)) {
             return b;
         }
     }
@@ -199,6 +200,19 @@ test "get builtin" {
     try std.testing.expect(caller != null);
     try std.testing.expectEqual(@as(u8, 0), caller.?.inputs);
     try std.testing.expectEqual(@as(u8, 1), caller.?.outputs);
+
+    // Test lookup by yul_name (e.g., "and" instead of "and_")
+    const and_builtin = getBuiltin("and");
+    try std.testing.expect(and_builtin != null);
+    try std.testing.expectEqualStrings("and", and_builtin.?.yul_name);
+
+    const or_builtin = getBuiltin("or");
+    try std.testing.expect(or_builtin != null);
+    try std.testing.expectEqualStrings("or", or_builtin.?.yul_name);
+
+    const return_builtin = getBuiltin("return");
+    try std.testing.expect(return_builtin != null);
+    try std.testing.expectEqualStrings("return", return_builtin.?.yul_name);
 }
 
 test "map operator" {
