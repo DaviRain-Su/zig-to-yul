@@ -126,6 +126,8 @@ pub fn writeValue(writer: anytype, value: Value) !void {
 pub const DecodeError = error{
     InvalidSignature,
     MissingTopics,
+    ExtraTopics,
+    TopicCountMismatch,
     MissingData,
     UnsupportedType,
     InvalidData,
@@ -179,6 +181,7 @@ pub fn decodeEvent(
     const indexed_count = countIndexed(event.params);
     const required_topics: usize = if (event.anonymous) indexed_count else indexed_count + 1;
     if (topics.len < required_topics) return error.MissingTopics;
+    if (topics.len > required_topics) return error.ExtraTopics;
 
     if (!event.anonymous) {
         const expected = try eventSignatureHash(allocator, event);
@@ -209,6 +212,8 @@ pub fn decodeEvent(
             .value = value,
         });
     }
+
+    if (topic_index != topics.len) return error.TopicCountMismatch;
 
     return .{
         .name = event.name,
@@ -1095,4 +1100,27 @@ test "event signature validation" {
     var bad_topics: [3][32]u8 = topics;
     bad_topics[0][0] ^= 0x01;
     try std.testing.expectError(error.InvalidSignature, decodeEvent(allocator, event, bad_topics[0..], data[0..]));
+}
+
+test "anonymous event topic count" {
+    const allocator = std.testing.allocator;
+
+    const event = Event{
+        .name = "Anon",
+        .params = &.{
+            .{ .name = "who", .abi_type = "address", .indexed = true },
+        },
+        .anonymous = true,
+    };
+
+    var topics: [1][32]u8 = undefined;
+    @memset(&topics, 0);
+    var data: [0]u8 = .{};
+
+    const decoded = try decodeEvent(allocator, event, topics[0..], data[0..]);
+    defer decoded.deinit(allocator);
+
+    var extra_topics: [2][32]u8 = undefined;
+    @memset(&extra_topics, 0);
+    try std.testing.expectError(error.ExtraTopics, decodeEvent(allocator, event, extra_topics[0..], data[0..]));
 }
