@@ -251,9 +251,9 @@ pub const BuiltinName = struct {
         return .{ .name = name };
     }
 
-const builtins = @import("../evm/builtins.zig");
+    const builtins = @import("../evm/builtins.zig");
 
-// ...
+    // ...
 
     /// Check if a name is a known EVM builtin
     /// Based on libyul EVMDialect and Solidity Yul specification
