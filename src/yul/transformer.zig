@@ -2394,7 +2394,7 @@ pub const Transformer = struct {
     fn shouldUseIdentityCopy(self: *Self, size: ast.Expression) bool {
         _ = self;
         const size_literal = literalU256(size) orelse return true;
-        return size_literal > 96;
+        return size_literal > 64;
     }
 
     fn literalU256(expr: ast.Expression) ?ast.U256 {
@@ -3270,6 +3270,32 @@ pub const Transformer = struct {
         src: ast.Expression,
         size: ast.Expression,
     ) TransformProcessError!void {
+        if (literalU256(size)) |size_literal| {
+            if (size_literal == 0) return;
+            if (size_literal <= 64) {
+                const first_src = if (size_literal > 0)
+                    try self.builder.builtinCall("add", &.{ src, ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0))) })
+                else
+                    src;
+                const first_val = try self.builder.builtinCall("mload", &.{first_src});
+                const first_dst = if (size_literal > 0)
+                    try self.builder.builtinCall("add", &.{ dest, ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0))) })
+                else
+                    dest;
+                const first_store = try self.builder.builtinCall("mstore", &.{ first_dst, first_val });
+                try stmts.append(self.allocator, ast.Statement.expr(first_store));
+
+                if (size_literal > 32) {
+                    const second_src = try self.builder.builtinCall("add", &.{ src, ast.Expression.lit(ast.Literal.number(@as(ast.U256, 32))) });
+                    const second_val = try self.builder.builtinCall("mload", &.{second_src});
+                    const second_dst = try self.builder.builtinCall("add", &.{ dest, ast.Expression.lit(ast.Literal.number(@as(ast.U256, 32))) });
+                    const second_store = try self.builder.builtinCall("mstore", &.{ second_dst, second_val });
+                    try stmts.append(self.allocator, ast.Statement.expr(second_store));
+                }
+                return;
+            }
+        }
+
         if (self.shouldUseIdentityCopy(size)) {
             const gas_call = try self.builder.builtinCall("gas", &.{});
             const call_expr = try self.builder.builtinCall("staticcall", &.{
@@ -3896,6 +3922,35 @@ test "dispatcher batches static params" {
     try std.testing.expect(std.mem.indexOf(u8, output, "mload(0)") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "mload(32)") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "mload(64)") != null);
+}
+
+test "memory copy small unroll" {
+    const allocator = std.testing.allocator;
+    const printer = @import("printer.zig");
+
+    var transformer = Transformer.init(allocator);
+    defer transformer.deinit();
+
+    var stmts: std.ArrayList(ast.Statement) = .empty;
+    defer stmts.deinit(allocator);
+
+    try transformer.appendMemoryCopyLoop(
+        &stmts,
+        ast.Expression.lit(ast.Literal.number(0x80)),
+        ast.Expression.lit(ast.Literal.number(0x00)),
+        ast.Expression.lit(ast.Literal.number(32)),
+    );
+
+    const block = ast.Block.init(try transformer.builder.dupeStatements(stmts.items));
+    const obj = ast.Object.init("Copy", block, &.{}, &.{});
+    const root = ast.AST.init(obj);
+    const output = try printer.format(allocator, root);
+    defer allocator.free(output);
+
+    try std.testing.expect(std.mem.indexOf(u8, output, "staticcall") == null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "for") == null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "mstore") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "mload") != null);
 }
 
 test "dispatcher dynamic abi size rounding" {
