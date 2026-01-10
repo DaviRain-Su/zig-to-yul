@@ -23,6 +23,7 @@ pub const Transformer = struct {
     struct_defs: std.StringHashMap([]const StructFieldDef),
     struct_init_helpers: std.StringHashMap([]const u8),
     local_struct_vars: std.StringHashMap([]const u8),
+    local_array_elem_types: std.StringHashMap([]const u8),
     extra_functions: std.ArrayList(ast.Statement),
 
     // State tracking
@@ -125,6 +126,7 @@ pub const Transformer = struct {
             .struct_defs = std.StringHashMap([]const StructFieldDef).init(allocator),
             .struct_init_helpers = std.StringHashMap([]const u8).init(allocator),
             .local_struct_vars = std.StringHashMap([]const u8).init(allocator),
+            .local_array_elem_types = std.StringHashMap([]const u8).init(allocator),
             .extra_functions = .empty,
             .current_contract = null,
             .functions = .empty,
@@ -167,6 +169,12 @@ pub const Transformer = struct {
             self.allocator.free(entry.value_ptr.*);
         }
         self.local_struct_vars.deinit();
+        var array_it = self.local_array_elem_types.iterator();
+        while (array_it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            self.allocator.free(entry.value_ptr.*);
+        }
+        self.local_array_elem_types.deinit();
 
         // Free function info param arrays
         for (self.function_infos.items) |fi| {
@@ -479,6 +487,9 @@ pub const Transformer = struct {
                     try params.append(self.allocator, param_info.name);
                     // Map Zig type to Solidity ABI type
                     const zig_type = if (param_info.type_expr) |te| p.getNodeSource(te) else "u256";
+                    if (self.parseArrayElemType(zig_type)) |elem_type| {
+                        try self.setLocalArrayElemType(param_info.name, elem_type);
+                    }
                     var abi_type: []const u8 = undefined;
                     if (self.struct_defs.get(zig_type)) |fields| {
                         abi_type = try self.buildTupleAbi(fields);
@@ -684,6 +695,12 @@ pub const Transformer = struct {
             const name = p.getIdentifier(var_decl.name_token);
 
             var value: ?ast.Expression = null;
+            if (var_decl.type_node.unwrap()) |type_node| {
+                const type_src = p.getNodeSource(type_node);
+                if (self.parseArrayElemType(type_src)) |elem_type| {
+                    try self.setLocalArrayElemType(name, elem_type);
+                }
+            }
             if (var_decl.init_node.unwrap()) |init_idx| {
                 if (self.isStructInitTag(p.getNodeTag(init_idx))) {
                     if (try self.structInitTypeName(init_idx)) |type_name| {
@@ -916,10 +933,12 @@ pub const Transformer = struct {
             }
         }
         var input1: ?ZigAst.Node.Index = null;
-        var input1_is_range = false;
         if (for_info.ast.inputs.len == 2) {
             input1 = for_info.ast.inputs[1];
-            input1_is_range = p.getNodeTag(input1.?) == .for_range;
+            if (p.getNodeTag(input1.?) != .for_range) {
+                try self.addError("for index must use range syntax (start..end)", self.nodeLocation(input1.?), .unsupported_feature);
+                return;
+            }
         }
 
         const is_range0 = range_step_input or p.getNodeTag(input0) == .for_range;
@@ -933,18 +952,10 @@ pub const Transformer = struct {
         var index_start_expr: ?ast.Expression = null;
         var index_end_expr: ?ast.Expression = null;
         if (input1) |input_node| {
-            if (input1_is_range) {
-                const range1 = p.ast.nodeData(input_node).node_and_opt_node;
-                index_start_expr = try self.translateExpression(range1[0]);
-                const idx_end_node = range1[1].unwrap();
-                index_end_expr = if (idx_end_node) |node| try self.translateExpression(node) else null;
-            } else {
-                if (!is_range0) {
-                    try self.addError("for step input requires a range input", self.nodeLocation(input_node), .unsupported_feature);
-                    return;
-                }
-                step_expr = try self.translateExpression(input_node);
-            }
+            const range1 = p.ast.nodeData(input_node).node_and_opt_node;
+            index_start_expr = try self.translateExpression(range1[0]);
+            const idx_end_node = range1[1].unwrap();
+            index_end_expr = if (idx_end_node) |node| try self.translateExpression(node) else null;
         }
 
         const payloads = try self.collectForPayloads(for_info.payload_token, for_info.ast.then_expr, index);
@@ -963,22 +974,13 @@ pub const Transformer = struct {
                 return;
             }
         }
-        if (payloads.len == 2 and (input1 == null or !input1_is_range)) {
+        if (payloads.len == 2 and input1 == null) {
             try self.addError("for with index payload requires a second range input", self.nodeLocation(index), .unsupported_feature);
             return;
         }
         if (payloads.len == 2 and step_expr != null) {
-            try self.addError("for step input does not support index payloads", self.nodeLocation(index), .unsupported_feature);
+            try self.addError("range_step does not support index payloads", self.nodeLocation(index), .unsupported_feature);
             return;
-        }
-        if (input1_is_range and payloads.len == 1) {
-            if (!is_range0) {
-                try self.addError("for step input requires a range input", self.nodeLocation(input1.?), .unsupported_feature);
-                return;
-            }
-            step_expr = index_start_expr;
-            index_start_expr = null;
-            index_end_expr = null;
         }
 
         if (!is_range0) {
@@ -1131,6 +1133,15 @@ pub const Transformer = struct {
         break_flag: ?[]const u8,
         stmts: *std.ArrayList(ast.Statement),
     ) TransformProcessError!void {
+        const elem_type = self.arrayElemTypeForNode(base_node);
+        var struct_elem_type: ?[]const u8 = null;
+        var elem_stride: ast.U256 = 32;
+        if (elem_type) |type_name| {
+            if (self.struct_defs.get(type_name)) |fields| {
+                struct_elem_type = type_name;
+                elem_stride = @intCast(fields.len * 32);
+            }
+        }
         const base_expr = try self.translateExpression(base_node);
         const base_name = try self.makeTemp("for_base");
         const len_name = try self.makeTemp("for_len");
@@ -1141,6 +1152,9 @@ pub const Transformer = struct {
             value_name = try std.fmt.allocPrint(self.allocator, "$zig2yul$for$val${d}", .{self.temp_counter});
             self.temp_counter += 1;
             try self.temp_strings.append(self.allocator, value_name);
+        }
+        if (struct_elem_type) |type_name| {
+            try self.setLocalStructVar(value_name, type_name);
         }
 
         var index_name: []const u8 = undefined;
@@ -1182,8 +1196,14 @@ pub const Transformer = struct {
         });
         try post_stmts.append(self.allocator, try self.builder.assign(&.{index_name}, inc_call));
 
-        const addr = try self.indexedMemoryAddress(ast.Expression.id(data_name), ast.Expression.id(index_name));
-        const val_expr = try self.builder.builtinCall("mload", &.{addr});
+        const addr = if (elem_stride == 32)
+            try self.indexedMemoryAddress(ast.Expression.id(data_name), ast.Expression.id(index_name))
+        else
+            try self.indexedMemoryAddressStride(ast.Expression.id(data_name), ast.Expression.id(index_name), elem_stride);
+        const val_expr = if (struct_elem_type != null)
+            addr
+        else
+            try self.builder.builtinCall("mload", &.{addr});
         const assign_val = try self.builder.assign(&.{value_name}, val_expr);
 
         var body_stmts: std.ArrayList(ast.Statement) = .empty;
@@ -1212,6 +1232,15 @@ pub const Transformer = struct {
         break_flag: ?[]const u8,
         stmts: *std.ArrayList(ast.Statement),
     ) TransformProcessError!void {
+        const elem_type = self.arrayElemTypeForNode(base_node);
+        var struct_elem_type: ?[]const u8 = null;
+        var elem_stride: ast.U256 = 32;
+        if (elem_type) |type_name| {
+            if (self.struct_defs.get(type_name)) |fields| {
+                struct_elem_type = type_name;
+                elem_stride = @intCast(fields.len * 32);
+            }
+        }
         const p = &self.zig_parser.?;
         const range1 = p.ast.nodeData(index_range).node_and_opt_node;
         const idx_start_expr = try self.translateExpression(range1[0]);
@@ -1223,6 +1252,9 @@ pub const Transformer = struct {
             value_name = try std.fmt.allocPrint(self.allocator, "$zig2yul$for$val${d}", .{self.temp_counter});
             self.temp_counter += 1;
             try self.temp_strings.append(self.allocator, value_name);
+        }
+        if (struct_elem_type) |type_name| {
+            try self.setLocalStructVar(value_name, type_name);
         }
 
         var index_name: []const u8 = undefined;
@@ -1261,8 +1293,14 @@ pub const Transformer = struct {
         });
         try post_stmts.append(self.allocator, try self.builder.assign(&.{index_name}, inc_call));
 
-        const addr = try self.indexedMemoryAddress(ast.Expression.id(base_name), ast.Expression.id(index_name));
-        const val_expr = try self.builder.builtinCall("mload", &.{addr});
+        const addr = if (elem_stride == 32)
+            try self.indexedMemoryAddress(ast.Expression.id(base_name), ast.Expression.id(index_name))
+        else
+            try self.indexedMemoryAddressStride(ast.Expression.id(base_name), ast.Expression.id(index_name), elem_stride);
+        const val_expr = if (struct_elem_type != null)
+            addr
+        else
+            try self.builder.builtinCall("mload", &.{addr});
         const assign_val = try self.builder.assign(&.{value_name}, val_expr);
 
         var body_stmts: std.ArrayList(ast.Statement) = .empty;
@@ -1893,6 +1931,14 @@ pub const Transformer = struct {
         return try self.builder.builtinCall("add", &.{ base, offset });
     }
 
+    fn indexedMemoryAddressStride(self: *Self, base: ast.Expression, idx_expr: ast.Expression, stride: ast.U256) TransformProcessError!ast.Expression {
+        const offset = try self.builder.builtinCall("mul", &.{
+            idx_expr,
+            ast.Expression.lit(ast.Literal.number(stride)),
+        });
+        return try self.builder.builtinCall("add", &.{ base, offset });
+    }
+
     fn translateStructInit(self: *Self, index: ZigAst.Node.Index) TransformProcessError!ast.Expression {
         const p = &self.zig_parser.?;
         var buf: [2]ZigAst.Node.Index = undefined;
@@ -2065,6 +2111,69 @@ pub const Transformer = struct {
         const key = try self.allocator.dupe(u8, name);
         const val = try self.allocator.dupe(u8, type_name);
         try self.local_struct_vars.put(key, val);
+    }
+
+    fn setLocalArrayElemType(self: *Self, name: []const u8, elem_type: []const u8) !void {
+        if (self.local_array_elem_types.getEntry(name)) |entry| {
+            self.allocator.free(entry.value_ptr.*);
+            entry.value_ptr.* = try self.allocator.dupe(u8, elem_type);
+            return;
+        }
+        const key = try self.allocator.dupe(u8, name);
+        const val = try self.allocator.dupe(u8, elem_type);
+        try self.local_array_elem_types.put(key, val);
+    }
+
+    fn stripTypeQualifiers(src: []const u8) []const u8 {
+        var out = std.mem.trim(u8, src, " \t\r\n");
+        while (true) {
+            if (std.mem.startsWith(u8, out, "const ")) {
+                out = std.mem.trim(u8, out[6..], " \t\r\n");
+                continue;
+            }
+            if (std.mem.startsWith(u8, out, "volatile ")) {
+                out = std.mem.trim(u8, out[9..], " \t\r\n");
+                continue;
+            }
+            break;
+        }
+        return out;
+    }
+
+    fn parseArrayElemType(self: *Self, type_src: []const u8) ?[]const u8 {
+        _ = self;
+        var src = std.mem.trim(u8, type_src, " \t\r\n");
+        if (std.mem.startsWith(u8, src, "[]")) {
+            src = stripTypeQualifiers(src[2..]);
+            return if (src.len > 0) src else null;
+        }
+        if (std.mem.startsWith(u8, src, "[*]")) {
+            src = stripTypeQualifiers(src[3..]);
+            return if (src.len > 0) src else null;
+        }
+        if (std.mem.startsWith(u8, src, "[")) {
+            if (std.mem.indexOfScalar(u8, src, ']')) |idx| {
+                src = stripTypeQualifiers(src[idx + 1 ..]);
+                return if (src.len > 0) src else null;
+            }
+        }
+        return null;
+    }
+
+    fn arrayElemTypeForNode(self: *Self, node: ZigAst.Node.Index) ?[]const u8 {
+        const p = &self.zig_parser.?;
+        if (p.getNodeTag(node) == .identifier) {
+            const name = p.getNodeSource(node);
+            return self.local_array_elem_types.get(name);
+        }
+        return null;
+    }
+
+    fn elementStrideBytes(self: *Self, type_name: []const u8) ast.U256 {
+        if (self.struct_defs.get(type_name)) |fields| {
+            return @intCast(fields.len * 32);
+        }
+        return 32;
     }
 
     /// Generate complete Yul AST
@@ -2666,6 +2775,11 @@ test "transform contract with function" {
     const source =
         \\const zig2yul = @import("zig2yul.zig");
         \\
+        \\const Pair = struct {
+        \\    a: u256,
+        \\    b: u256,
+        \\};
+        \\
         \\pub const Counter = struct {
         \\    count: u256,
         \\
@@ -2996,7 +3110,7 @@ test "transform loops and control flow" {
         \\pub const Counter = struct {
         \\    count: u256,
         \\
-        \\    pub fn loop(self: *Counter, data: u256) void {
+        \\    pub fn loop(self: *Counter, data: u256, pairs: []Pair) void {
         \\        var i = 0;
         \\        while (i < 4) : (i = i + 1) {
         \\            if (i == 2) {
@@ -3028,6 +3142,10 @@ test "transform loops and control flow" {
         \\
         \\        for (data, 0..3) |val2, idx2| {
         \\            i = i + val2 + idx2;
+        \\        }
+        \\
+        \\        for (pairs, 0..2) |pair, _| {
+        \\            i = i + pair.a + pair.b;
         \\        }
         \\
         \\        for (0..2) |k| {
@@ -3073,6 +3191,8 @@ test "transform loops and control flow" {
     try std.testing.expect(std.mem.indexOf(u8, output, "let idx2") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "for_break") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "let val3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "pair") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "mload") != null);
 }
 
 test "transform expression coverage" {
