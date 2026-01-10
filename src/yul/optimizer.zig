@@ -340,7 +340,43 @@ pub const Optimizer = struct {
         return try self.builder.builtinCall("iszero", &.{inner});
     }
 
+    fn optimizeToBranchless(self: *Optimizer, first: ast.Statement, second: ast.Statement) Error!?ast.Statement {
+        const first_info = assignmentFromIf(first) orelse return null;
+        const second_info = assignmentFromIf(second) orelse return null;
+
+        if (!std.mem.eql(u8, first_info.var_name, second_info.var_name)) return null;
+        const else_cond = isIsZeroCall(second_info.cond, first_info.cond) orelse return null;
+
+        if (literalU256(first_info.value)) |then_val| {
+            if (then_val == 1) {
+                if (literalU256(second_info.value)) |else_val| {
+                    if (else_val == 0) {
+                        const value = try self.boolify(first_info.cond);
+                        return try self.builder.assign(&.{first_info.var_name}, value);
+                    }
+                }
+            }
+        }
+
+        if (literalU256(first_info.value)) |then_val| {
+            if (then_val == 0) {
+                if (literalU256(second_info.value)) |else_val| {
+                    if (else_val == 1) {
+                        const value = try self.builder.builtinCall("iszero", &.{first_info.cond});
+                        return try self.builder.assign(&.{first_info.var_name}, value);
+                    }
+                }
+            }
+        }
+
+        _ = else_cond;
+        return null;
+    }
+
     fn mergeIfElseAssignment(self: *Optimizer, first: ast.Statement, second: ast.Statement) Error!?ast.Statement {
+        if (try self.optimizeToBranchless(first, second)) |optimized| {
+            return optimized;
+        }
         const first_info = assignmentFromIf(first) orelse return null;
         const second_info = assignmentFromIf(second) orelse return null;
 
@@ -1280,10 +1316,11 @@ test "optimize basic expression folds" {
     var builder = ast.AstBuilder.init(allocator);
     defer builder.deinit();
 
-    const stmt = ast.Statement.expr(ast.Expression.builtinCall("add", &.{
+    const add_expr = try builder.builtinCall("add", &.{
         ast.Expression.lit(ast.Literal.number(0)),
         ast.Expression.id("x"),
-    }));
+    });
+    const stmt = ast.Statement.expr(add_expr);
     const code_block = ast.Block.init(try builder.dupeStatements(&.{stmt}));
     const obj = ast.Object.init("Opt", code_block, &.{}, &.{});
     const root = ast.AST.init(obj);
@@ -1397,12 +1434,47 @@ test "normalize condition to boolean" {
     var builder = ast.AstBuilder.init(allocator);
     defer builder.deinit();
 
-    const cond = ast.Expression.builtinCall("add", &.{ ast.Expression.id("a"), ast.Expression.id("b") });
+    const cond = try builder.builtinCall("add", &.{ ast.Expression.id("a"), ast.Expression.id("b") });
     const then_assign = try builder.assign(&.{"x"}, ast.Expression.lit(ast.Literal.number(1)));
     const then_block = try builder.block(&.{then_assign});
     const then_stmt = ast.Statement.ifStmt(cond, then_block);
 
-    const else_cond = ast.Expression.builtinCall("iszero", &.{cond});
+    const else_cond = try builder.builtinCall("iszero", &.{cond});
+    const else_assign = try builder.assign(&.{"x"}, ast.Expression.lit(ast.Literal.number(0)));
+    const else_block = try builder.block(&.{else_assign});
+    const else_stmt = ast.Statement.ifStmt(else_cond, else_block);
+
+    const code_block = try builder.block(&.{ then_stmt, else_stmt });
+    const obj = ast.Object.init("Opt", code_block, &.{}, &.{});
+    const root = ast.AST.init(obj);
+
+    var opt = Optimizer.init(allocator);
+    defer opt.deinit();
+    const optimized = try opt.optimize(root);
+    try std.testing.expectEqual(@as(usize, 1), optimized.root.code.statements.len);
+
+    const stmt = optimized.root.code.statements[0];
+    try std.testing.expect(stmt == .assignment);
+    const assign = stmt.assignment;
+    try std.testing.expect(assign.value == .builtin_call);
+    const call = assign.value.builtin_call;
+    try std.testing.expectEqualStrings("iszero", call.builtin_name.name);
+    try std.testing.expect(call.arguments.len == 1);
+    try std.testing.expect(call.arguments[0] == .builtin_call);
+    try std.testing.expectEqualStrings("iszero", call.arguments[0].builtin_call.builtin_name.name);
+}
+
+test "branchless cond to boolean" {
+    const allocator = std.testing.allocator;
+    var builder = ast.AstBuilder.init(allocator);
+    defer builder.deinit();
+
+    const cond = ast.Expression.id("cond");
+    const then_assign = try builder.assign(&.{"x"}, ast.Expression.lit(ast.Literal.number(1)));
+    const then_block = try builder.block(&.{then_assign});
+    const then_stmt = ast.Statement.ifStmt(cond, then_block);
+
+    const else_cond = try builder.builtinCall("iszero", &.{cond});
     const else_assign = try builder.assign(&.{"x"}, ast.Expression.lit(ast.Literal.number(0)));
     const else_block = try builder.block(&.{else_assign});
     const else_stmt = ast.Statement.ifStmt(else_cond, else_block);
@@ -1432,15 +1504,19 @@ test "optimize calldata hash copy" {
     var builder = ast.AstBuilder.init(allocator);
     defer builder.deinit();
 
-    const mstore0 = ast.Statement.expr(ast.Expression.builtinCall("mstore", &.{
+    const load0 = try builder.builtinCall("calldataload", &.{ast.Expression.lit(ast.Literal.number(4))});
+    const mstore0_expr = try builder.builtinCall("mstore", &.{
         ast.Expression.lit(ast.Literal.number(0)),
-        ast.Expression.builtinCall("calldataload", &.{ast.Expression.lit(ast.Literal.number(4))}),
-    }));
-    const mstore1 = ast.Statement.expr(ast.Expression.builtinCall("mstore", &.{
+        load0,
+    });
+    const mstore0 = ast.Statement.expr(mstore0_expr);
+    const load1 = try builder.builtinCall("calldataload", &.{ast.Expression.lit(ast.Literal.number(36))});
+    const mstore1_expr = try builder.builtinCall("mstore", &.{
         ast.Expression.lit(ast.Literal.number(32)),
-        ast.Expression.builtinCall("calldataload", &.{ast.Expression.lit(ast.Literal.number(36))}),
-    }));
-    const hash_expr = ast.Expression.builtinCall("keccak256", &.{
+        load1,
+    });
+    const mstore1 = ast.Statement.expr(mstore1_expr);
+    const hash_expr = try builder.builtinCall("keccak256", &.{
         ast.Expression.lit(ast.Literal.number(0)),
         ast.Expression.lit(ast.Literal.number(64)),
     });
@@ -1467,8 +1543,8 @@ test "rewrite mod mul to mulmod" {
     var builder = ast.AstBuilder.init(allocator);
     defer builder.deinit();
 
-    const mul_expr = ast.Expression.builtinCall("mul", &.{ ast.Expression.id("a"), ast.Expression.id("b") });
-    const mod_expr = ast.Expression.builtinCall("mod", &.{ mul_expr, ast.Expression.id("m") });
+    const mul_expr = try builder.builtinCall("mul", &.{ ast.Expression.id("a"), ast.Expression.id("b") });
+    const mod_expr = try builder.builtinCall("mod", &.{ mul_expr, ast.Expression.id("m") });
     const stmt = ast.Statement.expr(mod_expr);
 
     const code_block = ast.Block.init(try builder.dupeStatements(&.{stmt}));
@@ -1492,8 +1568,8 @@ test "rewrite mod add to addmod" {
     var builder = ast.AstBuilder.init(allocator);
     defer builder.deinit();
 
-    const add_expr = ast.Expression.builtinCall("add", &.{ ast.Expression.id("a"), ast.Expression.id("b") });
-    const mod_expr = ast.Expression.builtinCall("mod", &.{ add_expr, ast.Expression.id("m") });
+    const add_expr = try builder.builtinCall("add", &.{ ast.Expression.id("a"), ast.Expression.id("b") });
+    const mod_expr = try builder.builtinCall("mod", &.{ add_expr, ast.Expression.id("m") });
     const stmt = ast.Statement.expr(mod_expr);
 
     const code_block = ast.Block.init(try builder.dupeStatements(&.{stmt}));
@@ -1518,7 +1594,7 @@ test "constant propagation simple" {
     defer builder.deinit();
 
     const decl_x = try builder.varDecl(&.{"x"}, ast.Expression.lit(ast.Literal.number(32)));
-    const mul_expr = ast.Expression.builtinCall("mul", &.{ ast.Expression.id("x"), ast.Expression.lit(ast.Literal.number(2)) });
+    const mul_expr = try builder.builtinCall("mul", &.{ ast.Expression.id("x"), ast.Expression.lit(ast.Literal.number(2)) });
     const decl_y = try builder.varDecl(&.{"y"}, mul_expr);
 
     const code_block = ast.Block.init(try builder.dupeStatements(&.{ decl_x, decl_y }));
@@ -1542,28 +1618,33 @@ test "optimize erc20 transferfrom layout" {
     var builder = ast.AstBuilder.init(allocator);
     defer builder.deinit();
 
-    const selector = ast.Expression.builtinCall("shl", &.{
+    const selector = try builder.builtinCall("shl", &.{
         ast.Expression.lit(ast.Literal.number(224)),
         ast.Expression.lit(ast.Literal.number(0x23b872dd)),
     });
-    const mstore0 = ast.Statement.expr(ast.Expression.builtinCall("mstore", &.{
+    const mstore0_expr = try builder.builtinCall("mstore", &.{
         ast.Expression.lit(ast.Literal.number(0)),
         selector,
-    }));
-    const mstore1 = ast.Statement.expr(ast.Expression.builtinCall("mstore", &.{
+    });
+    const mstore0 = ast.Statement.expr(mstore0_expr);
+    const mstore1_expr = try builder.builtinCall("mstore", &.{
         ast.Expression.lit(ast.Literal.number(4)),
         ast.Expression.id("from"),
-    }));
-    const mstore2 = ast.Statement.expr(ast.Expression.builtinCall("mstore", &.{
+    });
+    const mstore1 = ast.Statement.expr(mstore1_expr);
+    const mstore2_expr = try builder.builtinCall("mstore", &.{
         ast.Expression.lit(ast.Literal.number(0x24)),
         ast.Expression.id("to"),
-    }));
-    const mstore3 = ast.Statement.expr(ast.Expression.builtinCall("mstore", &.{
+    });
+    const mstore2 = ast.Statement.expr(mstore2_expr);
+    const mstore3_expr = try builder.builtinCall("mstore", &.{
         ast.Expression.lit(ast.Literal.number(0x44)),
         ast.Expression.id("amount"),
-    }));
-    const call_expr = ast.Expression.builtinCall("call", &.{
-        ast.Expression.builtinCall("gas", &.{}),
+    });
+    const mstore3 = ast.Statement.expr(mstore3_expr);
+    const gas_expr = try builder.builtinCall("gas", &.{});
+    const call_expr = try builder.builtinCall("call", &.{
+        gas_expr,
         ast.Expression.id("token"),
         ast.Expression.lit(ast.Literal.number(0)),
         ast.Expression.lit(ast.Literal.number(0)),
@@ -1596,13 +1677,13 @@ test "cache sload across statements" {
     defer builder.deinit();
 
     const slot = ast.Expression.lit(ast.Literal.number(0));
-    const load0 = ast.Expression.builtinCall("sload", &.{slot});
-    const expr1 = ast.Expression.builtinCall("and", &.{ load0, ast.Expression.lit(ast.Literal.number(0xff)) });
+    const load0 = try builder.builtinCall("sload", &.{slot});
+    const expr1 = try builder.builtinCall("and", &.{ load0, ast.Expression.lit(ast.Literal.number(0xff)) });
     const decl1 = try builder.varDecl(&.{"a"}, expr1);
 
-    const load1 = ast.Expression.builtinCall("sload", &.{slot});
-    const shr = ast.Expression.builtinCall("shr", &.{ ast.Expression.lit(ast.Literal.number(8)), load1 });
-    const expr2 = ast.Expression.builtinCall("and", &.{ shr, ast.Expression.lit(ast.Literal.number(0xff)) });
+    const load1 = try builder.builtinCall("sload", &.{slot});
+    const shr = try builder.builtinCall("shr", &.{ ast.Expression.lit(ast.Literal.number(8)), load1 });
+    const expr2 = try builder.builtinCall("and", &.{ shr, ast.Expression.lit(ast.Literal.number(0xff)) });
     const decl2 = try builder.varDecl(&.{"b"}, expr2);
 
     const code_block = ast.Block.init(try builder.dupeStatements(&.{ decl1, decl2 }));
@@ -1628,23 +1709,21 @@ test "merge packed sstore sequence" {
     defer builder.deinit();
 
     const slot = ast.Expression.lit(ast.Literal.number(1));
-    const sload_expr = ast.Expression.builtinCall("sload", &.{slot});
+    const sload_expr = try builder.builtinCall("sload", &.{slot});
     const clear1 = ast.Expression.lit(ast.Literal.number(0xffff));
     const clear2 = ast.Expression.lit(ast.Literal.number(0xff00ff));
     const val1 = ast.Expression.id("a");
     const val2 = ast.Expression.id("b");
 
-    const merged1 = ast.Expression.builtinCall("or", &.{
-        ast.Expression.builtinCall("and", &.{ sload_expr, clear1 }),
-        val1,
-    });
-    const merged2 = ast.Expression.builtinCall("or", &.{
-        ast.Expression.builtinCall("and", &.{ sload_expr, clear2 }),
-        val2,
-    });
+    const and1 = try builder.builtinCall("and", &.{ sload_expr, clear1 });
+    const merged1 = try builder.builtinCall("or", &.{ and1, val1 });
+    const and2 = try builder.builtinCall("and", &.{ sload_expr, clear2 });
+    const merged2 = try builder.builtinCall("or", &.{ and2, val2 });
 
-    const stmt1 = ast.Statement.expr(ast.Expression.builtinCall("sstore", &.{ slot, merged1 }));
-    const stmt2 = ast.Statement.expr(ast.Expression.builtinCall("sstore", &.{ slot, merged2 }));
+    const sstore1 = try builder.builtinCall("sstore", &.{ slot, merged1 });
+    const sstore2 = try builder.builtinCall("sstore", &.{ slot, merged2 });
+    const stmt1 = ast.Statement.expr(sstore1);
+    const stmt2 = ast.Statement.expr(sstore2);
 
     const code_block = ast.Block.init(try builder.dupeStatements(&.{ stmt1, stmt2 }));
     const obj = ast.Object.init("Opt", code_block, &.{}, &.{});
