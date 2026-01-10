@@ -109,6 +109,64 @@ pub fn parseAccessListJson(allocator: std.mem.Allocator, json: []const u8) !Acce
     };
 }
 
+pub fn parseBranchOverridesJson(allocator: std.mem.Allocator, json: []const u8) ![]BranchOverride {
+    const OverridesJson = struct {
+        items: []const OverrideJson,
+
+        const OverrideJson = struct {
+            start: u32,
+            end: u32,
+            mode: []const u8,
+            weight_num: ?u64 = null,
+            weight_den: ?u64 = null,
+        };
+    };
+
+    const parsed = try std.json.parseFromSlice(OverridesJson, allocator, json, .{});
+    defer parsed.deinit();
+
+    var out = try allocator.alloc(BranchOverride, parsed.value.items.len);
+    for (parsed.value.items, 0..) |item, i| {
+        out[i] = .{
+            .start = item.start,
+            .end = item.end,
+            .mode = try parseBranchMode(item.mode),
+            .weight_num = item.weight_num orelse 1,
+            .weight_den = item.weight_den orelse 2,
+        };
+    }
+    return out;
+}
+
+pub fn parseSwitchOverridesJson(allocator: std.mem.Allocator, json: []const u8) ![]SwitchOverride {
+    const OverridesJson = struct {
+        items: []const OverrideJson,
+
+        const OverrideJson = struct {
+            start: u32,
+            end: u32,
+            mode: []const u8,
+            weight_num: ?u64 = null,
+            weight_den: ?u64 = null,
+        };
+    };
+
+    const parsed = try std.json.parseFromSlice(OverridesJson, allocator, json, .{});
+    defer parsed.deinit();
+
+    var out = try allocator.alloc(SwitchOverride, parsed.value.items.len);
+    for (parsed.value.items, 0..) |item, i| {
+        out[i] = .{
+            .start = item.start,
+            .end = item.end,
+            .mode = try parseSwitchMode(item.mode),
+            .weight_num = item.weight_num orelse 1,
+            .weight_den = item.weight_den orelse 2,
+        };
+    }
+    return out;
+}
+
 pub const EstimateOptions = struct {
     access_list: AccessList = .{},
     assume_words: u64 = 1,
@@ -124,6 +182,8 @@ pub const EstimateOptions = struct {
     branch_weight_num: u64 = 1,
     branch_weight_den: u64 = 2,
     switch_mode: SwitchMode = .worst_case,
+    branch_overrides: []const BranchOverride = &.{},
+    switch_overrides: []const SwitchOverride = &.{},
 };
 
 pub const BranchMode = enum {
@@ -141,6 +201,39 @@ pub const SwitchMode = enum {
     assume_first,
     assume_none,
 };
+
+pub const BranchOverride = struct {
+    start: u32,
+    end: u32,
+    mode: BranchMode,
+    weight_num: u64 = 1,
+    weight_den: u64 = 2,
+};
+
+pub const SwitchOverride = struct {
+    start: u32,
+    end: u32,
+    mode: SwitchMode,
+    weight_num: u64 = 1,
+    weight_den: u64 = 2,
+};
+
+pub fn optionsForVersion(version: ast.EvmVersion) EstimateOptions {
+    return switch (version) {
+        .homestead, .tangerine_whistle, .spurious_dragon, .byzantium, .constantinople, .petersburg, .istanbul => .{
+            .refund_sstore_clear = 15000,
+            .refund_selfdestruct = 24000,
+            .max_refund_divisor = 2,
+            .base_access_list_costs = false,
+        },
+        .berlin, .london, .paris, .shanghai, .cancun, .prague => .{
+            .refund_sstore_clear = 4800,
+            .refund_selfdestruct = 0,
+            .max_refund_divisor = 5,
+            .base_access_list_costs = true,
+        },
+    };
+}
 
 pub fn estimateWithOptions(root: ast.AST, opts: EstimateOptions) GasEstimate {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -235,7 +328,8 @@ fn visitStatement(stmt: ast.Statement, out: *GasEstimate, ctx: *EstimatorContext
             var ctx_clone = cloneContext(ctx, arena.allocator());
             var body_estimate = GasEstimate{};
             visitBlock(s.body, &body_estimate, &ctx_clone);
-            addBranchEstimate(out, body_estimate, ctx.opts);
+            const branch_opts = resolveBranchOverride(ctx.opts, s.location);
+            addBranchEstimate(out, body_estimate, branch_opts);
         },
         .switch_statement => |s| {
             visitExpression(s.expression, out, ctx);
@@ -275,10 +369,11 @@ fn visitStatement(stmt: ast.Statement, out: *GasEstimate, ctx: *EstimatorContext
                 addEstimate(&total, case_est);
                 count += 1;
             }
-            switch (ctx.opts.switch_mode) {
+            const switch_opts = resolveSwitchOverride(ctx.opts, s.location);
+            switch (switch_opts.switch_mode) {
                 .worst_case => addEstimate(out, worst),
                 .sum => addEstimate(out, total),
-                .average => if (count > 0) addScaledEstimateFraction(out, total, 1, count) else {},
+                .average => if (count > 0) addScaledEstimateFraction(out, total, switch_opts.branch_weight_num, switch_opts.branch_weight_den) else {},
                 .assume_first => if (count > 0) addEstimate(out, first_case) else {},
                 .assume_none => {},
             }
@@ -794,6 +889,24 @@ fn parseU256String(value: []const u8) !ast.U256 {
     return std.fmt.parseInt(ast.U256, trimmed, 10);
 }
 
+fn parseBranchMode(value: []const u8) !BranchMode {
+    if (std.mem.eql(u8, value, "worst")) return .worst_case;
+    if (std.mem.eql(u8, value, "sum")) return .sum;
+    if (std.mem.eql(u8, value, "average")) return .average;
+    if (std.mem.eql(u8, value, "assume_true")) return .assume_true;
+    if (std.mem.eql(u8, value, "assume_false")) return .assume_false;
+    return error.InvalidBranchMode;
+}
+
+fn parseSwitchMode(value: []const u8) !SwitchMode {
+    if (std.mem.eql(u8, value, "worst")) return .worst_case;
+    if (std.mem.eql(u8, value, "sum")) return .sum;
+    if (std.mem.eql(u8, value, "average")) return .average;
+    if (std.mem.eql(u8, value, "assume_first")) return .assume_first;
+    if (std.mem.eql(u8, value, "assume_none")) return .assume_none;
+    return error.InvalidSwitchMode;
+}
+
 fn wordsForSize(size_bytes: u64) u64 {
     return if (size_bytes == 0) 0 else (size_bytes + 31) / 32;
 }
@@ -1016,6 +1129,34 @@ fn addBranchEstimate(out: *GasEstimate, body: GasEstimate, opts: EstimateOptions
     }
 }
 
+fn resolveBranchOverride(opts: EstimateOptions, loc: ast.SourceLocation) EstimateOptions {
+    if (loc.start == 0 and loc.end == 0) return opts;
+    for (opts.branch_overrides) |override| {
+        if (override.start == loc.start and override.end == loc.end) {
+            var copy = opts;
+            copy.branch_mode = override.mode;
+            copy.branch_weight_num = override.weight_num;
+            copy.branch_weight_den = override.weight_den;
+            return copy;
+        }
+    }
+    return opts;
+}
+
+fn resolveSwitchOverride(opts: EstimateOptions, loc: ast.SourceLocation) EstimateOptions {
+    if (loc.start == 0 and loc.end == 0) return opts;
+    for (opts.switch_overrides) |override| {
+        if (override.start == loc.start and override.end == loc.end) {
+            var copy = opts;
+            copy.switch_mode = override.mode;
+            copy.branch_weight_num = override.weight_num;
+            copy.branch_weight_den = override.weight_den;
+            return copy;
+        }
+    }
+    return opts;
+}
+
 test "estimate basic gas" {
     const code_block = ast.Block.init(&.{
         ast.Statement.expr(ast.Expression.builtinCall("add", &.{
@@ -1200,6 +1341,46 @@ test "estimate loop iterations" {
     const opts: EstimateOptions = .{ .loop_iterations = 3 };
     const result = estimateWithOptions(root, opts);
     try std.testing.expectEqual(@as(u64, 2), result.assumed_loop_iterations);
+}
+
+test "parse branch overrides json" {
+    const allocator = std.testing.allocator;
+    const input =
+        \\{ "items": [
+        \\  { "start": 1, "end": 2, "mode": "assume_false", "weight_num": 1, "weight_den": 4 }
+        \\] }
+    ;
+
+    const overrides = try parseBranchOverridesJson(allocator, input);
+    defer allocator.free(overrides);
+
+    try std.testing.expectEqual(@as(usize, 1), overrides.len);
+    try std.testing.expectEqual(@as(u32, 1), overrides[0].start);
+    try std.testing.expectEqual(@as(u32, 2), overrides[0].end);
+    try std.testing.expect(overrides[0].mode == .assume_false);
+    try std.testing.expectEqual(@as(u64, 1), overrides[0].weight_num);
+    try std.testing.expectEqual(@as(u64, 4), overrides[0].weight_den);
+}
+
+test "estimate branch override" {
+    var if_stmt = ast.If.init(
+        ast.Expression.id("cond"),
+        ast.Block.init(&.{
+            ast.Statement.expr(ast.Expression.builtinCall("sload", &.{
+                ast.Expression.lit(ast.Literal.number(0)),
+            })),
+        }),
+    );
+    if_stmt.location = .{ .start = 10, .end = 20 };
+
+    const code_block = ast.Block.init(&.{ast.Statement{ .if_statement = if_stmt }});
+    const obj = ast.Object.init("Gas", code_block, &.{}, &.{});
+    const root = ast.AST.init(obj);
+
+    const overrides = [_]BranchOverride{.{ .start = 10, .end = 20, .mode = .assume_false }};
+    const opts: EstimateOptions = .{ .branch_overrides = &overrides };
+    const result = estimateWithOptions(root, opts);
+    try std.testing.expectEqual(@as(u32, 0), result.cold_storage_accesses);
 }
 
 test "estimate switch worst case" {

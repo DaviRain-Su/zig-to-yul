@@ -1,6 +1,6 @@
 • 目前的 TODO 清单（汇总自 docs/libyul-comparison.md 的未完成/部分实现项）：
 
--  Gas 估算仍缺完整动态因素（退费规则按 EVM 版本细分/分支概率与路径权重标注）（5.3）
+-  Gas 估算仍缺完整动态因素（退费规则按 EVM 版本精确细分/分支权重与路径概率外部标注）（5.3）
 - EOF Prague 指令未实现（5.1）
 - abi-export for front to call by api
 - compare with https://github.com/Vectorized/solady to optimize
