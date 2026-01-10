@@ -485,6 +485,11 @@ test "anvil tx send (legacy + eip1559)" {
     };
     defer stopAnvil(&anvil);
 
+    waitForAnvilReady(allocator) catch |err| switch (err) {
+        error.ConnectionRefused => return,
+        else => return err,
+    };
+
     const rpc_url = "http://127.0.0.1:8545";
     const private_key = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
 
@@ -540,8 +545,24 @@ fn startAnvil(allocator: std.mem.Allocator) !std.process.Child {
     child.stderr_behavior = .Ignore;
     try child.spawn();
 
-    std.Thread.sleep(std.time.ns_per_s);
     return child;
+}
+
+fn waitForAnvilReady(allocator: std.mem.Allocator) !void {
+    const max_attempts: usize = 50;
+    var attempt: usize = 0;
+    while (attempt < max_attempts) : (attempt += 1) {
+        if (std.net.tcpConnectToHost(allocator, "127.0.0.1", 8545)) |stream| {
+            stream.close();
+            return;
+        } else |err| switch (err) {
+            error.ConnectionRefused => {
+                std.Thread.sleep(100 * std.time.ns_per_ms);
+            },
+            else => return err,
+        }
+    }
+    return error.ConnectionRefused;
 }
 
 fn stopAnvil(child: *std.process.Child) void {
