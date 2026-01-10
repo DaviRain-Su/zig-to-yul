@@ -8,6 +8,7 @@
   - ABI 导出：`abi-export` 供前端调用
   - 网络 profiles：name → RPC + chainId（deploy/call 直接用 name）
   - CLI `call` 支持与 Solidity 合约交互
+  - Zig SDK：支持调用已部署的 Solidity 合约（ABI/encoding + RPC 调用）
 - 优化研究：对比 https://github.com/Vectorized/solady
 - 生态整合：
   - JSON-RPC 兼容（Anvil/Hardhat/Foundry/Alchemy/Infura/QuickNode）
