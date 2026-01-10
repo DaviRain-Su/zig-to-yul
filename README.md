@@ -115,6 +115,9 @@ cd tools/z2y && zig build
 # Deploy to remote RPC (reads PRIVATE_KEY env)
 ./tools/z2y/zig-out/bin/z2y deploy --rpc-url https://rpc.example
 
+# End-to-end profile test (instrument -> collect -> estimate)
+./tools/z2y/zig-out/bin/z2y profile-test
+
 # Initialize a new contract project (current directory)
 ./tools/z2y/zig-out/bin/z2y init .
 

@@ -64,8 +64,9 @@
 5. Restricted SDK exports to the evm module
 6. Added release CI artifacts for zig-to-yul and z2y
 7. Added consolidated test target with conditional evm coverage
-8. Implemented block/statement processing and loop handling in the transformer
-9. Fixed struct literal initialization and return-struct ownership in transformer
+8. Added z2y end-to-end profile-test command
+9. Implemented block/statement processing and loop handling in the transformer
+10. Fixed struct literal initialization and return-struct ownership in transformer
 
 #### Test Results
 - Unit tests: `zig build test --summary all`

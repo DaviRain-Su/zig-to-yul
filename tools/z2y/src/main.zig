@@ -217,6 +217,15 @@ pub fn main() !void {
         return;
     }
 
+    if (std.mem.eql(u8, command, "profile-test")) {
+        if (args.len > 2) {
+            try printUsage();
+            return;
+        }
+        try runProfileTest(allocator);
+        return;
+    }
+
     try printUsage();
 }
 
@@ -232,6 +241,7 @@ fn printUsage() !void {
             "  z2y build\n" ++
             "  z2y build-abi\n" ++
             "  z2y test\n" ++
+            "  z2y profile-test\n" ++
             "  z2y deploy [--rpc-url <url>]\n",
         .{},
     );
@@ -429,6 +439,77 @@ fn runLocalTest(allocator: std.mem.Allocator) !void {
     try stdout.print("Deployed: {s}\n", .{address});
     try stdout.print("get() => {s}\n", .{trimmed});
     try stdout.flush();
+}
+
+fn runProfileTest(allocator: std.mem.Allocator) !void {
+    var anvil_argv: std.ArrayList([]const u8) = .empty;
+    defer anvil_argv.deinit(allocator);
+
+    try anvil_argv.append(allocator, "anvil");
+
+    var anvil_child = std.process.Child.init(anvil_argv.items, allocator);
+    anvil_child.stderr_behavior = .Ignore;
+    anvil_child.stdout_behavior = .Ignore;
+
+    try anvil_child.spawn();
+    defer {
+        _ = anvil_child.kill() catch {};
+    }
+
+    std.Thread.sleep(500 * std.time.ns_per_ms);
+
+    try ensureOutDir();
+
+    const profile_json = try runZigToYulProfile(allocator);
+    defer allocator.free(profile_json);
+
+    const estimate_json = try runZigToYulEstimate(allocator);
+    defer allocator.free(estimate_json);
+
+    var stdout_buffer: [1024]u8 = undefined;
+    var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
+    const stdout: *std.Io.Writer = &stdout_writer.interface;
+    try stdout.print("Profile written: out/profile.json\n", .{});
+    try stdout.print("Estimate output:\n{s}\n", .{estimate_json});
+    try stdout.flush();
+}
+
+fn runZigToYulProfile(allocator: std.mem.Allocator) ![]u8 {
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(allocator);
+
+    try argv.append(allocator, "zig-to-yul");
+    try argv.append(allocator, "profile");
+    try argv.append(allocator, "--project");
+    try argv.append(allocator, ".");
+    try argv.append(allocator, "--rpc-url");
+    try argv.append(allocator, default_rpc_url);
+    try argv.append(allocator, "--call-data");
+    try argv.append(allocator, "0x");
+    try argv.append(allocator, "--runs");
+    try argv.append(allocator, "1");
+    try argv.append(allocator, "--profile-out");
+    try argv.append(allocator, "out/profile.json");
+    try argv.append(allocator, "src/Contract.zig");
+
+    const output = try runCommandCapture(allocator, argv.items);
+    defer allocator.free(output);
+    return try readTrimmedFile(allocator, "out/profile.json");
+}
+
+fn runZigToYulEstimate(allocator: std.mem.Allocator) ![]u8 {
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(allocator);
+
+    try argv.append(allocator, "zig-to-yul");
+    try argv.append(allocator, "estimate");
+    try argv.append(allocator, "--project");
+    try argv.append(allocator, ".");
+    try argv.append(allocator, "--profile");
+    try argv.append(allocator, "out/profile.json");
+    try argv.append(allocator, "src/Contract.zig");
+
+    return try runCommandCapture(allocator, argv.items);
 }
 
 fn deployRemote(allocator: std.mem.Allocator, rpc_url: []const u8) !void {
