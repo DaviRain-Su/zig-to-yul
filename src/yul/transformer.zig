@@ -1871,6 +1871,13 @@ pub const Transformer = struct {
                 const helper = try self.ensureSaturatingMulHelper();
                 return try self.builder.call(helper, args.items);
             }
+            if (std.mem.eql(u8, builtin_name, "ffs")) {
+                if (args.items.len != 1) {
+                    try self.addError("ffs expects 1 argument", self.nodeLocation(call_info.ast.fn_expr), .unsupported_feature);
+                }
+                const helper = try self.ensureFfsHelper();
+                return try self.builder.call(helper, args.items);
+            }
         }
 
         // Regular function call
@@ -1964,6 +1971,41 @@ pub const Transformer = struct {
 
         const body = try self.builder.block(stmts.items);
         const func = try self.builder.funcDef(helper_name, &.{ "x", "y" }, &.{"result"}, body);
+        try self.extra_functions.append(self.allocator, func);
+
+        return helper_name;
+    }
+
+    fn ensureFfsHelper(self: *Self) ![]const u8 {
+        const key_name = "ffs";
+        if (self.math_helpers.get(key_name)) |helper| return helper;
+
+        const helper_name = try std.fmt.allocPrint(self.allocator, "__zig2yul$ffs", .{});
+        const key = try self.allocator.dupe(u8, key_name);
+        try self.math_helpers.put(key, helper_name);
+
+        var stmts: std.ArrayList(ast.Statement) = .empty;
+        defer stmts.deinit(self.allocator);
+
+        const neg_expr = try self.builder.builtinCall("sub", &.{
+            ast.Expression.lit(ast.Literal.number(0)),
+            ast.Expression.id("x"),
+        });
+        const and_expr = try self.builder.builtinCall("and", &.{ ast.Expression.id("x"), neg_expr });
+        const magic = ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0xb6db6db6ddddddddd34d34d349249249210842108c6318c639ce739cffffffff)));
+        const mul_expr = try self.builder.builtinCall("mul", &.{ and_expr, magic });
+        const shr_expr = try self.builder.builtinCall("shr", &.{
+            ast.Expression.lit(ast.Literal.number(250)),
+            mul_expr,
+        });
+        const shl_expr = try self.builder.builtinCall("shl", &.{
+            ast.Expression.lit(ast.Literal.number(2)),
+            shr_expr,
+        });
+        try stmts.append(self.allocator, try self.builder.assign(&.{"r"}, shl_expr));
+
+        const body = try self.builder.block(stmts.items);
+        const func = try self.builder.funcDef(helper_name, &.{"x"}, &.{"r"}, body);
         try self.extra_functions.append(self.allocator, func);
 
         return helper_name;
@@ -3577,6 +3619,36 @@ test "saturating mul helper" {
     try std.testing.expect(std.mem.indexOf(u8, output, "__zig2yul$saturating_mul") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "function __zig2yul$saturating_mul") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "not(0)") != null);
+}
+
+test "ffs helper" {
+    const allocator = std.testing.allocator;
+    const printer = @import("printer.zig");
+
+    const source =
+        \\pub const Counter = struct {
+        \\    pub fn f(self: *Counter, x: u256) u256 {
+        \\        _ = self;
+        \\        return evm.ffs(x);
+        \\    }
+        \\};
+    ;
+
+    const source_z = try allocator.dupeZ(u8, source);
+    defer allocator.free(source_z);
+
+    var transformer = Transformer.init(allocator);
+    defer transformer.deinit();
+
+    const yul_ast = try transformer.transform(source_z);
+    const output = try printer.format(allocator, yul_ast);
+    defer allocator.free(output);
+
+    try std.testing.expect(std.mem.indexOf(u8, output, "__zig2yul$ffs") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "function __zig2yul$ffs") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "sub(0, x)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "mul") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "shr(250") != null);
 }
 
 test "dispatcher with parameterized function" {

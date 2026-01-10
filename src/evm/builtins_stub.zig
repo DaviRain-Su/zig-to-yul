@@ -108,6 +108,10 @@ pub fn tload(_: U256) U256 {
 }
 pub fn tstore(_: U256, _: U256) void {}
 
+pub fn ffs(_: U256) U256 {
+    return 0;
+}
+
 // Execution context
 pub fn caller() Address {
     return 0;
