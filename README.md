@@ -122,6 +122,15 @@ cd tools/z2y && zig build
 # Deploy to remote RPC (reads PRIVATE_KEY env)
 ./tools/z2y/zig-out/bin/z2y deploy --rpc-url https://rpc.example
 
+# Call a Solidity-compatible function
+./tools/z2y/zig-out/bin/z2y call --address 0xabc... --sig "get()(uint256)"
+
+# Call using ABI + function name
+./tools/z2y/zig-out/bin/z2y call --address 0xabc... --abi out/Contract.abi.json --func get
+
+# Use a named profile from profiles.json
+./tools/z2y/zig-out/bin/z2y call --profile local --address 0xabc... --sig "get()(uint256)"
+
 # End-to-end profile test (instrument -> collect -> estimate)
 ./tools/z2y/zig-out/bin/z2y profile-test
 
@@ -130,6 +139,18 @@ cd tools/z2y && zig build
 
 # Or create a new directory
 ./tools/z2y/zig-out/bin/z2y init my-contract
+```
+
+Example `profiles.json`:
+
+```json
+{
+  "local": {
+    "rpc_url": "http://127.0.0.1:8545",
+    "chain_id": 31337,
+    "private_key_env": "PRIVATE_KEY"
+  }
+}
 ```
 
 ### Gas Estimation

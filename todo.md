@@ -8,10 +8,9 @@
     - Gas/执行语义：补充 gas table 与语义规则
     - 测试：对齐上游向量与单元测试
 - SDK 主线（方向C）：
-  - SDK：storage / abi / event / precompile
-  - ABI 导出：`abi-export` 供前端调用
-  - 网络 profiles：name → RPC + chainId（deploy/call 直接用 name）
-  - CLI `call` 支持与 Solidity 合约交互
+  - SDK：storage / abi / event / precompile（基础导出已完成）
+  - 网络 profiles：name → RPC + chainId（已完成：profiles.json）
+  - CLI `call` 支持与 Solidity 合约交互（已完成）
   - Zig SDK：支持调用已部署的 Solidity 合约（ABI/encoding + RPC 调用）
   - 总体实现规划（SDK）：
     - RPC：统一 JSON-RPC 客户端与重试/超时策略

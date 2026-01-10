@@ -119,6 +119,7 @@ const Template = struct {
 
 const default_rpc_url = "http://localhost:8545";
 const default_anvil_private_key = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+const default_private_key_env = "PRIVATE_KEY";
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -181,7 +182,8 @@ pub fn main() !void {
     }
 
     if (std.mem.eql(u8, command, "deploy")) {
-        var rpc_url: []const u8 = default_rpc_url;
+        var rpc_url: ?[]const u8 = null;
+        var profile_name: ?[]const u8 = null;
         var i: usize = 2;
         while (i < args.len) : (i += 1) {
             const arg = args[i];
@@ -194,10 +196,126 @@ pub fn main() !void {
                 rpc_url = args[i];
                 continue;
             }
+            if (std.mem.eql(u8, arg, "--profile")) {
+                i += 1;
+                if (i >= args.len) {
+                    try printUsage();
+                    return;
+                }
+                profile_name = args[i];
+                continue;
+            }
             try printUsage();
             return;
         }
-        try deployRemote(allocator, rpc_url);
+        var resolved = try resolveRpcSettings(allocator, profile_name, rpc_url);
+        defer resolved.deinit(allocator);
+        try deployRemote(allocator, resolved.rpc_url, resolved.private_key_env);
+        return;
+    }
+
+    if (std.mem.eql(u8, command, "call")) {
+        var rpc_url: ?[]const u8 = null;
+        var profile_name: ?[]const u8 = null;
+        var address: ?[]const u8 = null;
+        var signature: ?[]const u8 = null;
+        var abi_path: ?[]const u8 = null;
+        var func_name: ?[]const u8 = null;
+        var args_start: ?usize = null;
+
+        var i: usize = 2;
+        while (i < args.len) : (i += 1) {
+            const arg = args[i];
+            if (std.mem.eql(u8, arg, "--rpc-url")) {
+                i += 1;
+                if (i >= args.len) {
+                    try printUsage();
+                    return;
+                }
+                rpc_url = args[i];
+                continue;
+            }
+            if (std.mem.eql(u8, arg, "--profile")) {
+                i += 1;
+                if (i >= args.len) {
+                    try printUsage();
+                    return;
+                }
+                profile_name = args[i];
+                continue;
+            }
+            if (std.mem.eql(u8, arg, "--address")) {
+                i += 1;
+                if (i >= args.len) {
+                    try printUsage();
+                    return;
+                }
+                address = args[i];
+                continue;
+            }
+            if (std.mem.eql(u8, arg, "--sig")) {
+                i += 1;
+                if (i >= args.len) {
+                    try printUsage();
+                    return;
+                }
+                signature = args[i];
+                continue;
+            }
+            if (std.mem.eql(u8, arg, "--abi")) {
+                i += 1;
+                if (i >= args.len) {
+                    try printUsage();
+                    return;
+                }
+                abi_path = args[i];
+                continue;
+            }
+            if (std.mem.eql(u8, arg, "--func")) {
+                i += 1;
+                if (i >= args.len) {
+                    try printUsage();
+                    return;
+                }
+                func_name = args[i];
+                continue;
+            }
+            if (std.mem.eql(u8, arg, "--args")) {
+                args_start = i + 1;
+                break;
+            }
+            try printUsage();
+            return;
+        }
+
+        if (address == null) {
+            try printUsage();
+            return;
+        }
+
+        var resolved = try resolveRpcSettings(allocator, profile_name, rpc_url);
+        defer resolved.deinit(allocator);
+
+        var owned_signature: ?[]u8 = null;
+        if (signature == null) {
+            if (abi_path == null or func_name == null) {
+                try printUsage();
+                return;
+            }
+            owned_signature = try signatureFromAbi(allocator, abi_path.?, func_name.?);
+            signature = owned_signature;
+        }
+        defer if (owned_signature) |sig| allocator.free(sig);
+
+        const call_args = if (args_start) |start| args[start..] else &.{};
+        const output = try castCallArgs(allocator, resolved.rpc_url, address.?, signature.?, call_args);
+        defer allocator.free(output);
+
+        var stdout_buffer: [1024]u8 = undefined;
+        var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
+        const stdout: *std.Io.Writer = &stdout_writer.interface;
+        try stdout.print("{s}\n", .{std.mem.trim(u8, output, " \n\r\t")});
+        try stdout.flush();
         return;
     }
 
@@ -242,7 +360,8 @@ fn printUsage() !void {
             "  z2y build-abi\n" ++
             "  z2y test\n" ++
             "  z2y profile-test\n" ++
-            "  z2y deploy [--rpc-url <url>]\n",
+            "  z2y deploy [--rpc-url <url> | --profile <name>]\n" ++
+            "  z2y call --address <addr> (--sig <signature> | --abi <file> --func <name>) [--args ...] [--rpc-url <url> | --profile <name>]\n",
         .{},
     );
 
@@ -259,7 +378,8 @@ fn printInstallInstructions() !void {
     try stdout.print("- Zig 0.15.x\n", .{});
     try stdout.print("- solc (Solidity compiler)\n", .{});
     try stdout.print("- zig-to-yul binary in PATH\n", .{});
-    try stdout.print("- Foundry (anvil/forge/cast)\n\n", .{});
+    try stdout.print("- Foundry (anvil/forge/cast)\n", .{});
+    try stdout.print("- profiles.json (optional, for named RPC profiles)\n\n", .{});
 
     switch (builtin.os.tag) {
         .macos => {
@@ -460,7 +580,7 @@ fn runProfileTest(allocator: std.mem.Allocator) !void {
 
     try ensureOutDir();
 
-    const profile_json = try runZigToYulProfile(allocator);
+    const profile_json = try runZigToYulProfile(allocator, default_rpc_url);
     defer allocator.free(profile_json);
 
     const estimate_json = try runZigToYulEstimate(allocator);
@@ -474,7 +594,7 @@ fn runProfileTest(allocator: std.mem.Allocator) !void {
     try stdout.flush();
 }
 
-fn runZigToYulProfile(allocator: std.mem.Allocator) ![]u8 {
+fn runZigToYulProfile(allocator: std.mem.Allocator, rpc_url: []const u8) ![]u8 {
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(allocator);
 
@@ -483,7 +603,7 @@ fn runZigToYulProfile(allocator: std.mem.Allocator) ![]u8 {
     try argv.append(allocator, "--project");
     try argv.append(allocator, ".");
     try argv.append(allocator, "--rpc-url");
-    try argv.append(allocator, default_rpc_url);
+    try argv.append(allocator, rpc_url);
     try argv.append(allocator, "--call-data");
     try argv.append(allocator, "0x");
     try argv.append(allocator, "--runs");
@@ -512,8 +632,18 @@ fn runZigToYulEstimate(allocator: std.mem.Allocator) ![]u8 {
     return try runCommandCapture(allocator, argv.items);
 }
 
-fn deployRemote(allocator: std.mem.Allocator, rpc_url: []const u8) !void {
-    const private_key = try getEnvRequired(allocator, "PRIVATE_KEY");
+const ProfileSettings = struct {
+    rpc_url: []u8,
+    chain_id: ?u64,
+    private_key_env: []const u8,
+
+    pub fn deinit(self: *ProfileSettings, allocator: std.mem.Allocator) void {
+        allocator.free(self.rpc_url);
+    }
+};
+
+fn deployRemote(allocator: std.mem.Allocator, rpc_url: []const u8, private_key_env: []const u8) !void {
+    const private_key = try getEnvRequired(allocator, private_key_env);
     defer allocator.free(private_key);
 
     const bytecode = try buildBytecode(allocator);
@@ -639,6 +769,175 @@ fn getEnvRequired(allocator: std.mem.Allocator, key: []const u8) ![]u8 {
         },
         else => return err,
     };
+}
+
+fn resolveRpcSettings(
+    allocator: std.mem.Allocator,
+    profile_name: ?[]const u8,
+    rpc_url: ?[]const u8,
+) !ProfileSettings {
+    if (profile_name != null and rpc_url != null) {
+        std.debug.print("Error: --profile and --rpc-url are mutually exclusive\n", .{});
+        return error.InvalidArgs;
+    }
+
+    if (profile_name) |name| {
+        const profile = try loadProfile(allocator, name) orelse {
+            std.debug.print("Profile not found: {s}\n", .{name});
+            return error.ProfileNotFound;
+        };
+        return profile;
+    }
+
+    const url = rpc_url orelse default_rpc_url;
+    return .{
+        .rpc_url = try allocator.dupe(u8, url),
+        .chain_id = null,
+        .private_key_env = default_private_key_env,
+    };
+}
+
+fn loadProfile(allocator: std.mem.Allocator, name: []const u8) !?ProfileSettings {
+    const file = std.fs.cwd().openFile("profiles.json", .{}) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer file.close();
+
+    const json_bytes = try file.readToEndAlloc(allocator, 1024 * 1024);
+    defer allocator.free(json_bytes);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_bytes, .{});
+    defer parsed.deinit();
+
+    const root = parsed.value;
+    const profiles_value = try selectProfilesObject(root);
+    if (profiles_value.object.get(name)) |entry| {
+        if (entry != .object) return error.InvalidProfile;
+        return try parseProfileObject(allocator, entry.object);
+    }
+
+    return null;
+}
+
+fn selectProfilesObject(value: std.json.Value) !std.json.Value {
+    if (value != .object) return error.InvalidProfile;
+    if (value.object.get("profiles")) |profiles| {
+        if (profiles != .object) return error.InvalidProfile;
+        return profiles;
+    }
+    return value;
+}
+
+fn parseProfileObject(allocator: std.mem.Allocator, obj: std.json.ObjectMap) !ProfileSettings {
+    const rpc_value = obj.get("rpc_url") orelse return error.InvalidProfile;
+    if (rpc_value != .string) return error.InvalidProfile;
+    const rpc_url = try allocator.dupe(u8, rpc_value.string);
+
+    var chain_id: ?u64 = null;
+    if (obj.get("chain_id")) |value| {
+        switch (value) {
+            .integer => |v| {
+                if (v < 0) return error.InvalidProfile;
+                chain_id = @intCast(v);
+            },
+            .string => |s| {
+                chain_id = try std.fmt.parseInt(u64, s, 10);
+            },
+            else => return error.InvalidProfile,
+        }
+    }
+
+    var private_key_env: []const u8 = default_private_key_env;
+    if (obj.get("private_key_env")) |value| {
+        if (value != .string) return error.InvalidProfile;
+        private_key_env = value.string;
+    }
+
+    return .{
+        .rpc_url = rpc_url,
+        .chain_id = chain_id,
+        .private_key_env = private_key_env,
+    };
+}
+
+fn signatureFromAbi(allocator: std.mem.Allocator, path: []const u8, func_name: []const u8) ![]u8 {
+    const file = try std.fs.cwd().openFile(path, .{});
+    defer file.close();
+
+    const json_bytes = try file.readToEndAlloc(allocator, 1024 * 1024);
+    defer allocator.free(json_bytes);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_bytes, .{});
+    defer parsed.deinit();
+
+    if (parsed.value != .array) return error.InvalidAbi;
+    for (parsed.value.array.items) |entry| {
+        if (entry != .object) continue;
+        const obj = entry.object;
+        const type_field = obj.get("type") orelse continue;
+        if (type_field != .string) continue;
+        if (!std.mem.eql(u8, type_field.string, "function")) continue;
+        const name_field = obj.get("name") orelse continue;
+        if (name_field != .string) continue;
+        if (!std.mem.eql(u8, name_field.string, func_name)) continue;
+
+        var args_list: std.ArrayList([]const u8) = .empty;
+        defer args_list.deinit(allocator);
+        if (obj.get("inputs")) |inputs| {
+            if (inputs == .array) {
+                for (inputs.array.items) |input| {
+                    if (input != .object) continue;
+                    if (input.object.get("type")) |type_value| {
+                        if (type_value == .string) {
+                            try args_list.append(allocator, type_value.string);
+                        }
+                    }
+                }
+            }
+        }
+
+        return try buildSignature(allocator, func_name, args_list.items);
+    }
+
+    return error.FunctionNotFound;
+}
+
+fn buildSignature(allocator: std.mem.Allocator, name: []const u8, types: []const []const u8) ![]u8 {
+    var buffer: std.ArrayList(u8) = .empty;
+    defer buffer.deinit(allocator);
+
+    try buffer.appendSlice(allocator, name);
+    try buffer.append(allocator, '(');
+    for (types, 0..) |t, idx| {
+        if (idx > 0) try buffer.append(allocator, ',');
+        try buffer.appendSlice(allocator, t);
+    }
+    try buffer.append(allocator, ')');
+    return try buffer.toOwnedSlice(allocator);
+}
+
+fn castCallArgs(
+    allocator: std.mem.Allocator,
+    rpc_url: []const u8,
+    address: []const u8,
+    signature: []const u8,
+    args: []const []const u8,
+) ![]u8 {
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(allocator);
+
+    try argv.append(allocator, "cast");
+    try argv.append(allocator, "call");
+    try argv.append(allocator, "--rpc-url");
+    try argv.append(allocator, rpc_url);
+    try argv.append(allocator, address);
+    try argv.append(allocator, signature);
+    for (args) |arg| {
+        try argv.append(allocator, arg);
+    }
+
+    return try runCommandCapture(allocator, argv.items);
 }
 
 fn runCommandCapture(allocator: std.mem.Allocator, argv: []const []const u8) ![]u8 {
