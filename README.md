@@ -127,6 +127,9 @@ cd tools/z2y && zig build
 # Call a Solidity-compatible function
 ./tools/z2y/zig-out/bin/z2y call --address 0xabc... --sig "get()(uint256)"
 
+# Generate on-chain ABI wrapper (static types only)
+./tools/z2y/zig-out/bin/z2y abi-gen --abi out/Contract.abi.json --out src/ContractAbi.zig --name ExternalContract
+
 # Call using ABI + function name
 ./tools/z2y/zig-out/bin/z2y call --address 0xabc... --abi out/Contract.abi.json --func get
 
@@ -155,7 +158,7 @@ Example `profiles.json`:
 }
 ```
 
-SDK example (call a Solidity function):
+SDK example (call a Solidity function off-chain):
 
 ```zig
 const evm = @import("zig_to_yul").evm;
@@ -167,6 +170,18 @@ const result_hex = try evm.contract.call(
     "balanceOf(address)",
     &.{ .{ .address = some_address } },
 );
+```
+
+On-chain wrapper example (generated):
+
+```zig
+const evm = @import("evm");
+const ExternalContract = @import("ContractAbi.zig").ExternalContract;
+
+pub fn readBalance(token: evm.Address, owner: evm.Address) evm.U256 {
+    var contract = ExternalContract.init(token);
+    return contract.balanceOf(owner);
+}
 ```
 
 ### Gas Estimation

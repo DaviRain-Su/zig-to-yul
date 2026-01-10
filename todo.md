@@ -9,6 +9,7 @@
     - 测试：对齐上游向量与单元测试
 - SDK 主线（方向C）：
   - Zig SDK：支持调用已部署的 Solidity 合约（ABI/encoding + RPC 调用）（已完成基础调用）
+  - ABI wrapper 代码生成（已完成：z2y abi-gen，静态类型）
   - 总体实现规划（SDK）：
     - RPC：统一 JSON-RPC 客户端与重试/超时策略（已完成基础调用）
     - ABI：生成/解析 ABI JSON，与 ethers/Foundry 兼容（已完成基础编码）
