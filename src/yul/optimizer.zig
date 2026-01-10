@@ -368,6 +368,7 @@ fn exprEqualsSimple(a: ast.Expression, b: ast.Expression) bool {
             .hex_number => a.literal.value.hex_number == b.literal.value.hex_number,
             .boolean => a.literal.value.boolean == b.literal.value.boolean,
             .string => std.mem.eql(u8, a.literal.value.string, b.literal.value.string),
+            .hex_string => std.mem.eql(u8, a.literal.value.hex_string, b.literal.value.hex_string),
         };
     }
     return false;
