@@ -7,6 +7,7 @@ pub const evm = struct {
     pub const event_decode = @import("evm/event_decode.zig");
     pub const event_encode = @import("evm/event_encode.zig");
     pub const builtins = @import("evm/builtins.zig");
+    pub const builtins_stub = @import("evm/builtins_stub.zig");
     pub const abi = @import("evm/abi.zig");
     pub const precompile = @import("evm/precompile.zig");
     pub const rpc = @import("evm/rpc.zig");

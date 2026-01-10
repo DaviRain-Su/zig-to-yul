@@ -99,6 +99,7 @@ Available namespaces:
 - `evm.precompile`
 - `evm.rpc`
 - `evm.contract`
+- `evm.builtins_stub` (IDE-only)
 
 ### Scaffold Project (z2y)
 

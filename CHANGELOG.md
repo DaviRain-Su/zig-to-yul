@@ -66,11 +66,12 @@
 7. Added consolidated test target with conditional evm coverage
 8. Added evm abi/precompile namespaces for SDK usage
 9. Added evm rpc/contract helpers for Solidity calls
-10. Added z2y abi-gen command for on-chain wrappers
-11. Added z2y call command with ABI/profile support
-12. Added z2y end-to-end profile-test command
-13. Implemented block/statement processing and loop handling in the transformer
-14. Fixed struct literal initialization and return-struct ownership in transformer
+10. Added evm builtins stub for IDE navigation
+11. Added z2y abi-gen command for on-chain wrappers
+12. Added z2y call command with ABI/profile support
+13. Added z2y end-to-end profile-test command
+14. Implemented block/statement processing and loop handling in the transformer
+15. Fixed struct literal initialization and return-struct ownership in transformer
 
 #### Test Results
 - Unit tests: `zig build test --summary all`
