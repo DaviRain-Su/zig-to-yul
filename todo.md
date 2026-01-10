@@ -3,8 +3,8 @@
 - Gas 估算仍缺完整动态因素（动态路径执行次数精确建模已部分完成，仍需基于运行时 profile）（5.3）
   - 总体实现规划（5.3）：
     - 插桩：在 Yul 生成阶段注入 branch/switch/loop 计数逻辑（已完成）
-    - 采集（本地 VM）：执行插桩合约，提取计数并生成 profile.json
-    - 采集（RPC）：eth_call 或交易回执日志解析计数，合并成 profile.json
+    - 采集（本地 VM）：执行插桩合约，提取计数并生成 profile.json（已完成：Anvil + eth_call）
+    - 采集（RPC）：eth_call 或交易回执日志解析计数，合并成 profile.json（已完成：eth_call）
     - 多轮聚合：累加 hits，生成平均权重/迭代次数（支持 runs）（已完成）
     - 估算消费：estimate --profile 读取并应用 overrides（已完成）
     - CLI：profile 子命令输出 instrumented Yul + map + 聚合结果（已完成）

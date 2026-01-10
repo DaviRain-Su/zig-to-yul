@@ -23,10 +23,15 @@ pub const Instrumenter = struct {
     loop_cursor: usize,
     temp_counter: u32,
     temp_names: std.ArrayList([]const u8),
+    return_counts: bool,
 
     const Self = @This();
 
     pub fn init(allocator: std.mem.Allocator) Self {
+        return initWithOptions(allocator, false);
+    }
+
+    pub fn initWithOptions(allocator: std.mem.Allocator, return_counts: bool) Self {
         return .{
             .allocator = allocator,
             .builder = ast.AstBuilder.init(allocator),
@@ -39,6 +44,7 @@ pub const Instrumenter = struct {
             .loop_cursor = 0,
             .temp_counter = 0,
             .temp_names = .empty,
+            .return_counts = return_counts,
         };
     }
 
@@ -161,6 +167,13 @@ pub const Instrumenter = struct {
         for (block.statements) |stmt| {
             const expanded = try self.instrumentStatement(stmt);
             if (expanded.len > 0) try stmts.appendSlice(self.allocator, expanded);
+        }
+
+        if (with_prelude and self.return_counts and self.next_index > 0) {
+            const base_expr = ast.Expression.id("__prof_base");
+            const size_expr = ast.Expression.lit(ast.Literal.number(@as(ast.U256, self.next_index) * 32));
+            const ret_call = try self.builder.builtinCall("return", &.{ base_expr, size_expr });
+            try stmts.append(self.allocator, self.stmtWithLocation(ast.Statement.expr(ret_call), block.location));
         }
 
         var out_block = ast.Block.init(try self.builder.dupeStatements(stmts.items));

@@ -97,6 +97,10 @@ zig-to-yul profile contract.zig -o contract.profile.yul --map profile.map.json
 zig-to-yul profile contract.zig --map profile.map.json \
   --counts run1.counts.json --counts run2.counts.json \
   --profile-out profile.json
+
+# Collect via Anvil RPC (deploy + eth_call)
+zig-to-yul profile contract.zig --rpc-url http://127.0.0.1:8545 \
+  --call-data 0x1234 --runs 5 --profile-out profile.json
 ```
 
 ### Options
@@ -107,6 +111,12 @@ zig-to-yul profile contract.zig --map profile.map.json \
 | `-O, --optimize` | Enable solc optimizer (build only) |
 | `--profile <file>` | Profile counts JSON (estimate only) |
 | `--evm-version <name>` | EVM version (estimate only) |
+| `--rpc-url <url>` | Collect profile via JSON-RPC (profile only) |
+| `--contract <addr>` | Use deployed contract address (profile only) |
+| `--call-data <hex|@file>` | Calldata hex for eth_call (profile only) |
+| `--runs <n>` | Repeat eth_call n times (profile only) |
+| `--no-deploy` | Skip deployment (profile only) |
+| `--return-counts` | Force return count payload (profile only) |
 | `-h, --help` | Print help |
 | `-v, --version` | Print version |
 

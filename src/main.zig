@@ -249,7 +249,8 @@ fn runProfile(allocator: std.mem.Allocator, args: []const []const u8) !void {
         std.process.exit(1);
     };
 
-    var instrumenter = profile_instrumenter.Instrumenter.init(allocator);
+    const should_return_counts = opts.return_counts or opts.rpc_url != null;
+    var instrumenter = profile_instrumenter.Instrumenter.initWithOptions(allocator, should_return_counts);
     defer instrumenter.deinit();
 
     const instrumented = try instrumenter.instrument(yul_ast_root);
@@ -285,6 +286,70 @@ fn runProfile(allocator: std.mem.Allocator, args: []const []const u8) !void {
             const counts = try profile.parseProfileCounts(allocator, counts_json);
             defer allocator.free(counts.counts);
             var run = try profile.profileFromCounts(allocator, instrumented.map, counts.counts);
+            if (aggregate) |*agg| {
+                try profile.mergeProfileData(agg, run);
+                run.deinit(allocator);
+            } else {
+                aggregate = run;
+            }
+        }
+
+        if (aggregate) |agg| {
+            const profile_json = try std.json.stringifyAlloc(allocator, agg, .{});
+            defer allocator.free(profile_json);
+            if (opts.profile_out) |path| {
+                try writeOutput(profile_json, path);
+            } else {
+                const stdout = std.fs.File.stdout();
+                stdout.writeAll(profile_json) catch {};
+                stdout.writeAll("\n") catch {};
+            }
+        }
+    }
+
+    if (opts.rpc_url) |rpc_url| {
+        const from_addr = try rpcPickFromAccount(allocator, rpc_url);
+        defer allocator.free(from_addr);
+
+        var contract_addr: ?[]u8 = null;
+        defer if (contract_addr) |addr| allocator.free(addr);
+
+        if (opts.deploy) {
+            const bytecode = try compileSolc(allocator, yul_code, opts.optimize);
+            defer allocator.free(bytecode);
+            const deploy_tx = try rpcSendTransaction(allocator, rpc_url, from_addr, bytecode);
+            defer allocator.free(deploy_tx);
+            contract_addr = try rpcWaitForContract(allocator, rpc_url, deploy_tx);
+        } else if (opts.contract_addr) |addr| {
+            contract_addr = try allocator.dupe(u8, addr);
+        }
+
+        if (contract_addr == null) {
+            std.debug.print("Error: contract address required (deploy failed or --no-deploy without --contract)\n", .{});
+            std.process.exit(1);
+        }
+
+        var call_data_buf: ?[]u8 = null;
+        defer if (call_data_buf) |buf| allocator.free(buf);
+        const call_data = if (opts.call_data) |raw| blk: {
+            call_data_buf = try resolveCallData(allocator, raw);
+            break :blk call_data_buf.?;
+        } else "0x";
+
+        var aggregate: ?profile.ProfileData = null;
+        defer if (aggregate) |*agg| agg.deinit(allocator);
+
+        var run_index: u64 = 0;
+        while (run_index < opts.runs) : (run_index += 1) {
+            const return_hex = try rpcCall(allocator, rpc_url, from_addr, contract_addr.?, call_data);
+            defer allocator.free(return_hex);
+
+            const raw_bytes = try parseHexAlloc(allocator, return_hex);
+            defer allocator.free(raw_bytes);
+            const counts = try countsFromReturn(allocator, raw_bytes, instrumented.map.counter_count);
+            defer allocator.free(counts);
+
+            var run = try profile.profileFromCounts(allocator, instrumented.map, counts);
             if (aggregate) |*agg| {
                 try profile.mergeProfileData(agg, run);
                 run.deinit(allocator);
@@ -483,6 +548,117 @@ fn parseHexAlloc(allocator: std.mem.Allocator, text: []const u8) ![]const u8 {
     return out;
 }
 
+fn countsFromReturn(allocator: std.mem.Allocator, raw: []const u8, expected: u32) ![]u64 {
+    if (raw.len < @as(usize, expected) * 32) return error.InvalidArgument;
+    const count_len: usize = @intCast(expected);
+    var out = try allocator.alloc(u64, count_len);
+    errdefer allocator.free(out);
+    var idx: usize = 0;
+    while (idx < count_len) : (idx += 1) {
+        const offset = idx * 32 + 24;
+        const slice = raw[offset .. offset + 8];
+        out[idx] = std.mem.readInt(u64, slice, .big);
+    }
+    return out;
+}
+
+fn resolveCallData(allocator: std.mem.Allocator, arg: []const u8) ![]u8 {
+    if (arg.len > 0 and arg[0] == '@') {
+        const data = try readFile(allocator, arg[1..]);
+        const trimmed = std.mem.trim(u8, data, " \n\r\t");
+        const out = try allocator.dupe(u8, trimmed);
+        allocator.free(data);
+        return out;
+    }
+    return try allocator.dupe(u8, arg);
+}
+
+fn rpcPickFromAccount(allocator: std.mem.Allocator, url: []const u8) ![]u8 {
+    const parsed = try rpcCallValue(allocator, url, "eth_accounts", "[]");
+    defer parsed.deinit();
+    const result = try rpcGetResult(parsed.value);
+    if (result != .array or result.array.items.len == 0) return error.RpcNoAccounts;
+    if (result.array.items[0] != .string) return error.RpcInvalidResult;
+    return try allocator.dupe(u8, result.array.items[0].string);
+}
+
+fn rpcSendTransaction(allocator: std.mem.Allocator, url: []const u8, from: []const u8, bytecode: []const u8) ![]u8 {
+    const data = try std.fmt.allocPrint(allocator, "0x{s}", .{bytecode});
+    defer allocator.free(data);
+    const params = try std.fmt.allocPrint(allocator, "[{{\"from\":\"{s}\",\"data\":\"{s}\"}}]", .{ from, data });
+    defer allocator.free(params);
+    const parsed = try rpcCallValue(allocator, url, "eth_sendTransaction", params);
+    defer parsed.deinit();
+    const result = try rpcGetResult(parsed.value);
+    if (result != .string) return error.RpcInvalidResult;
+    return try allocator.dupe(u8, result.string);
+}
+
+fn rpcWaitForContract(allocator: std.mem.Allocator, url: []const u8, tx_hash: []const u8) ![]u8 {
+    var attempts: usize = 0;
+    while (attempts < 20) : (attempts += 1) {
+        const params = try std.fmt.allocPrint(allocator, "[\"{s}\"]", .{tx_hash});
+        defer allocator.free(params);
+        const parsed = try rpcCallValue(allocator, url, "eth_getTransactionReceipt", params);
+        defer parsed.deinit();
+        const result = try rpcGetResult(parsed.value);
+        if (result == .null) {
+            std.time.sleep(200 * std.time.ns_per_ms);
+            continue;
+        }
+        if (result != .object) return error.RpcInvalidResult;
+        if (result.object.get("contractAddress")) |addr_val| {
+            if (addr_val != .string) return error.RpcInvalidResult;
+            return try allocator.dupe(u8, addr_val.string);
+        }
+        return error.RpcInvalidResult;
+    }
+    return error.RpcTimeout;
+}
+
+fn rpcCall(allocator: std.mem.Allocator, url: []const u8, from: []const u8, to: []const u8, data: []const u8) ![]u8 {
+    const params = try std.fmt.allocPrint(allocator, "[{{\"from\":\"{s}\",\"to\":\"{s}\",\"data\":\"{s}\"}},\"latest\"]", .{ from, to, data });
+    defer allocator.free(params);
+    const parsed = try rpcCallValue(allocator, url, "eth_call", params);
+    defer parsed.deinit();
+    const result = try rpcGetResult(parsed.value);
+    if (result != .string) return error.RpcInvalidResult;
+    return try allocator.dupe(u8, result.string);
+}
+
+fn rpcCallValue(allocator: std.mem.Allocator, url: []const u8, method: []const u8, params_json: []const u8) !std.json.Parsed(std.json.Value) {
+    var client: std.http.Client = .{ .allocator = allocator };
+    defer client.deinit();
+
+    const uri = try std.Uri.parse(url);
+    var req = try client.request(.POST, uri, .{
+        .extra_headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
+    });
+    defer req.deinit();
+
+    const body = try std.fmt.allocPrint(allocator, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"{s}\",\"params\":{s}}", .{ method, params_json });
+    defer allocator.free(body);
+
+    try req.sendBodyComplete(@constCast(body));
+
+    var head_buf: [4096]u8 = undefined;
+    var response = try req.receiveHead(&head_buf);
+    if (response.head.status != .ok) return error.RpcFailed;
+
+    var reader = response.reader(&head_buf);
+    const resp_body = try reader.allocRemaining(allocator, std.Io.Limit.limited(1024 * 1024));
+    defer allocator.free(resp_body);
+
+    return try std.json.parseFromSlice(std.json.Value, allocator, resp_body, .{});
+}
+
+fn rpcGetResult(root: std.json.Value) !std.json.Value {
+    if (root != .object) return error.RpcInvalidResult;
+    if (root.object.get("error") != null) return error.RpcFailed;
+    if (root.object.get("result")) |result| return result;
+    return error.RpcInvalidResult;
+}
+
 fn parseHex32(text: []const u8) ![32]u8 {
     const hex = trimHexPrefix(text);
     if (hex.len != 64) return error.InvalidArgument;
@@ -543,6 +719,13 @@ const ProfileCliOptions = struct {
     map_file: ?[]const u8 = null,
     profile_out: ?[]const u8 = null,
     counts_files: std.ArrayList([]const u8) = .empty,
+    rpc_url: ?[]const u8 = null,
+    call_data: ?[]const u8 = null,
+    contract_addr: ?[]const u8 = null,
+    runs: u64 = 1,
+    return_counts: bool = false,
+    optimize: bool = false,
+    deploy: bool = true,
 
     pub fn deinit(self: *ProfileCliOptions, allocator: std.mem.Allocator) void {
         self.counts_files.deinit(allocator);
@@ -634,6 +817,47 @@ fn parseProfileOptions(allocator: std.mem.Allocator, args: []const []const u8) !
                 std.debug.print("Error: --counts requires a file\n", .{});
                 std.process.exit(1);
             }
+        } else if (std.mem.eql(u8, arg, "--rpc-url")) {
+            i += 1;
+            if (i < args.len) {
+                opts.rpc_url = args[i];
+            } else {
+                std.debug.print("Error: --rpc-url requires a value\n", .{});
+                std.process.exit(1);
+            }
+        } else if (std.mem.eql(u8, arg, "--call-data")) {
+            i += 1;
+            if (i < args.len) {
+                opts.call_data = args[i];
+            } else {
+                std.debug.print("Error: --call-data requires hex\n", .{});
+                std.process.exit(1);
+            }
+        } else if (std.mem.eql(u8, arg, "--contract")) {
+            i += 1;
+            if (i < args.len) {
+                opts.contract_addr = args[i];
+            } else {
+                std.debug.print("Error: --contract requires address\n", .{});
+                std.process.exit(1);
+            }
+        } else if (std.mem.eql(u8, arg, "--runs")) {
+            i += 1;
+            if (i < args.len) {
+                opts.runs = std.fmt.parseInt(u64, args[i], 10) catch {
+                    std.debug.print("Error: --runs must be a number\n", .{});
+                    std.process.exit(1);
+                };
+            } else {
+                std.debug.print("Error: --runs requires a value\n", .{});
+                std.process.exit(1);
+            }
+        } else if (std.mem.eql(u8, arg, "--return-counts")) {
+            opts.return_counts = true;
+        } else if (std.mem.eql(u8, arg, "--optimize")) {
+            opts.optimize = true;
+        } else if (std.mem.eql(u8, arg, "--no-deploy")) {
+            opts.deploy = false;
         } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
             printProfileUsageStderr();
             std.process.exit(0);
@@ -1003,6 +1227,13 @@ fn printProfileUsageStderr() void {
         \\    --map <file>            Write profile map JSON to <file>
         \\    --counts <file>         Raw counter JSON (repeatable)
         \\    --profile-out <file>    Write aggregated profile.json
+        \\    --rpc-url <url>         Collect via JSON-RPC (Anvil compatible)
+        \\    --contract <addr>       Use deployed contract address
+        \\    --call-data <hex|@file> Calldata hex for eth_call
+        \\    --runs <n>              Repeat eth_call n times
+        \\    --optimize             Enable solc optimizer
+        \\    --no-deploy             Skip deployment (requires --contract)
+        \\    --return-counts         Force return count payload
         \\    -h, --help              Print help
         \\
     , .{});
