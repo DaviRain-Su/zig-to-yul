@@ -14,15 +14,13 @@
     - 优化点：映射、scratch 复用、SLOAD/SSTORE 合并
     - 回归测试：确保语义一致与指标提升
 - 生态整合：
-  - JSON-RPC 兼容（Anvil/Hardhat/Foundry/Alchemy/Infura/QuickNode）
+  - JSON-RPC 兼容（待覆盖更多 provider 差异）
   - ABI JSON 输出（ethers.js/Foundry/Hardhat 兼容）
-  - EIP-1559 交易参数支持（maxFee/maxPriority）
   - keystore/私钥签名兼容
   - SourceMap 格式对齐 solidity 生态
   - 总体实现规划（生态）：
     - RPC：覆盖常见 provider 兼容性差异
     - ABI：输出 schema 与字段排序一致性
-    - 交易：EIP-1559 与签名/nonce 处理
     - SourceMap：对齐 Solidity map 格式与工具链
 
 如果你想继续：建议优先推进 5.1 EOF Prague → SDK/生态。

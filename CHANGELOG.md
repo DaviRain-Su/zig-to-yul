@@ -78,3 +78,17 @@
 - Unit tests: `zig build test --summary all`
 
 - Fix CLI help test to avoid writing to stdout so `zig build test` does not hang when run with `--listen`.
+
+### Session 2026-01-10-005
+
+**Date**: 2026-01-10
+**Goal**: Finish Foundry SDK test and RPC/EIP-1559 docs
+
+#### Completed Work
+1. Added Foundry SDK integration test (anvil + cast + SDK call)
+2. Added EIP-1559 signing example in README
+3. Added JSON-RPC compatibility helpers and optional test
+4. Made Anvil tx tests wait for readiness
+
+#### Test Results
+- Unit tests: `zig build test --summary all`
