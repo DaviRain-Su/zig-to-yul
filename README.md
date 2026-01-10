@@ -83,6 +83,19 @@ zig-to-yul build -O contract.zig -o contract.bin
 | `version` | Print version information |
 | `help` | Print help message |
 
+### Scaffold Project (z2y)
+
+```bash
+# Build the z2y tool
+zig build -C tools/z2y
+
+# Initialize a new contract project (current directory)
+./tools/z2y/zig-out/bin/z2y init .
+
+# Or create a new directory
+./tools/z2y/zig-out/bin/z2y init my-contract
+```
+
 ### Gas Estimation
 
 ```bash

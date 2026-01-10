@@ -51,4 +51,17 @@
 - [ ] Add log-based count export for RPC receipts
 - [ ] Expand ABI coverage (struct tuple fields)
 
+### Session 2026-01-10-004
+
+**Date**: 2026-01-10
+**Goal**: Add z2y scaffolding tool and fix transformer block handling
+
+#### Completed Work
+1. Added standalone z2y CLI to scaffold contract project templates
+2. Implemented block/statement processing and loop handling in the transformer
+3. Fixed struct literal initialization and return-struct ownership in transformer
+
+#### Test Results
+- Unit tests: `zig build test --summary all`
+
 - Fix CLI help test to avoid writing to stdout so `zig build test` does not hang when run with `--listen`.
