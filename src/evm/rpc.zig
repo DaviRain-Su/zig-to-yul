@@ -16,17 +16,7 @@ pub fn ethCall(allocator: std.mem.Allocator, rpc_url: []const u8, to: []const u8
     );
     defer allocator.free(payload);
 
-    const response = try rpcRequest(allocator, rpc_url, payload);
-    defer allocator.free(response);
-
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
-    defer parsed.deinit();
-
-    if (parsed.value != .object) return RpcError.InvalidResponse;
-    const result_value = parsed.value.object.get("result") orelse return RpcError.MissingResult;
-    if (result_value != .string) return RpcError.InvalidResponse;
-
-    return try allocator.dupe(u8, result_value.string);
+    return try rpcRequestString(allocator, rpc_url, payload);
 }
 
 pub fn ethSendRawTransaction(allocator: std.mem.Allocator, rpc_url: []const u8, raw_tx: []const u8) ![]u8 {
@@ -37,17 +27,22 @@ pub fn ethSendRawTransaction(allocator: std.mem.Allocator, rpc_url: []const u8, 
     );
     defer allocator.free(payload);
 
-    const response = try rpcRequest(allocator, rpc_url, payload);
-    defer allocator.free(response);
+    return try rpcRequestString(allocator, rpc_url, payload);
+}
 
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
-    defer parsed.deinit();
+pub fn web3ClientVersion(allocator: std.mem.Allocator, rpc_url: []const u8) ![]u8 {
+    const payload = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"web3_clientVersion\",\"params\":[]}";
+    return try rpcRequestString(allocator, rpc_url, payload);
+}
 
-    if (parsed.value != .object) return RpcError.InvalidResponse;
-    const result_value = parsed.value.object.get("result") orelse return RpcError.MissingResult;
-    if (result_value != .string) return RpcError.InvalidResponse;
+pub fn ethChainId(allocator: std.mem.Allocator, rpc_url: []const u8) ![]u8 {
+    const payload = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_chainId\",\"params\":[]}";
+    return try rpcRequestString(allocator, rpc_url, payload);
+}
 
-    return try allocator.dupe(u8, result_value.string);
+pub fn netVersion(allocator: std.mem.Allocator, rpc_url: []const u8) ![]u8 {
+    const payload = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"net_version\",\"params\":[]}";
+    return try rpcRequestString(allocator, rpc_url, payload);
 }
 
 fn rpcRequest(allocator: std.mem.Allocator, rpc_url: []const u8, payload: []const u8) ![]u8 {
@@ -78,4 +73,40 @@ fn rpcRequest(allocator: std.mem.Allocator, rpc_url: []const u8, payload: []cons
     }
 
     return body;
+}
+
+fn rpcRequestString(allocator: std.mem.Allocator, rpc_url: []const u8, payload: []const u8) ![]u8 {
+    const response = try rpcRequest(allocator, rpc_url, payload);
+    defer allocator.free(response);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+    defer parsed.deinit();
+
+    if (parsed.value != .object) return RpcError.InvalidResponse;
+    const result_value = parsed.value.object.get("result") orelse return RpcError.MissingResult;
+    if (result_value != .string) return RpcError.InvalidResponse;
+
+    return try allocator.dupe(u8, result_value.string);
+}
+
+test "rpc compatibility (clientVersion/chainId/net_version)" {
+    const allocator = std.testing.allocator;
+
+    const rpc_url = std.process.getEnvVarOwned(allocator, "RPC_URL") catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => return,
+        else => return err,
+    };
+    defer allocator.free(rpc_url);
+
+    const client_version = try web3ClientVersion(allocator, rpc_url);
+    defer allocator.free(client_version);
+    try std.testing.expect(client_version.len > 0);
+
+    const chain_id = try ethChainId(allocator, rpc_url);
+    defer allocator.free(chain_id);
+    try std.testing.expect(chain_id.len > 0);
+
+    const net_version = try netVersion(allocator, rpc_url);
+    defer allocator.free(net_version);
+    try std.testing.expect(net_version.len > 0);
 }

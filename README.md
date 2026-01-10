@@ -190,6 +190,24 @@ const raw = try evm.tx.signLegacy(allocator, .{
 }, "0x<private_key>");
 ```
 
+SDK example (sign EIP-1559 transaction):
+
+```zig
+const evm = @import("zig_to_yul").evm;
+
+const raw = try evm.tx.signEip1559(allocator, .{
+    .chain_id = 1,
+    .nonce = 0,
+    .max_priority_fee_per_gas = 1_000_000_000,
+    .max_fee_per_gas = 2_000_000_000,
+    .gas_limit = 21000,
+    .to = 0x1234,
+    .value = 0,
+    .data = &.{},
+    .access_list = &.{},
+}, "0x<private_key>");
+```
+
 On-chain wrapper example (generated):
 
 ```zig
@@ -317,6 +335,38 @@ See the [`examples/`](./examples) directory:
 
 ```bash
 zig build test --summary all
+```
+
+### Foundry SDK Test (Anvil + Cast)
+
+Requires [Foundry](https://getfoundry.sh/) (anvil, cast). The test spawns `anvil`, deploys a minimal contract with `cast`, then calls it via the SDK.
+
+```bash
+# Optionally override Foundry binaries
+export ANVIL_BIN=anvil
+export CAST_BIN=cast
+
+zig build test --summary all
+```
+
+### JSON-RPC Compatibility Check
+
+Use any RPC provider (Anvil/Hardhat/Alchemy) to verify baseline methods.
+
+```bash
+export RPC_URL=http://127.0.0.1:8545
+
+curl -s -X POST "$RPC_URL" \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"web3_clientVersion","params":[]}'
+
+curl -s -X POST "$RPC_URL" \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}'
+
+curl -s -X POST "$RPC_URL" \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"net_version","params":[]}'
 ```
 
 ### Deploy to Local Testnet
