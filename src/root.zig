@@ -3,9 +3,18 @@
 
 pub const evm = struct {
     pub const types = @import("evm/types.zig");
+    pub const storage = @import("evm/storage.zig");
     pub const event_decode = @import("evm/event_decode.zig");
     pub const event_encode = @import("evm/event_encode.zig");
     pub const builtins = @import("evm/builtins.zig");
+    pub const abi = @import("evm/abi.zig");
+    pub const precompile = @import("evm/precompile.zig");
+
+    pub const event = struct {
+        pub const encode = event_encode;
+        pub const decode = event_decode;
+    };
+
     pub const U256 = types.U256;
     pub const Address = types.Address;
     pub const EvmType = types.EvmType;

@@ -91,6 +91,13 @@ Only the `evm` module is intended for contract code (other modules are internal 
 const evm = @import("zig_to_yul").evm;
 ```
 
+Available namespaces:
+- `evm.types`
+- `evm.storage`
+- `evm.event` (alias for `evm.event_encode`/`evm.event_decode`)
+- `evm.abi`
+- `evm.precompile`
+
 ### Scaffold Project (z2y)
 
 ```bash
