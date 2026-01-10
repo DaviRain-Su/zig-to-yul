@@ -89,6 +89,12 @@ zig-to-yul build -O contract.zig -o contract.bin
 # Build the z2y tool
 zig build -C tools/z2y
 
+# Install prerequisites (prints commands)
+./tools/z2y/zig-out/bin/z2y install
+
+# Check tool availability (zig, zig-to-yul, solc, anvil, forge)
+./tools/z2y/zig-out/bin/z2y info
+
 # Initialize a new contract project (current directory)
 ./tools/z2y/zig-out/bin/z2y init .
 

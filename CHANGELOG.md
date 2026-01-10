@@ -58,8 +58,10 @@
 
 #### Completed Work
 1. Added standalone z2y CLI to scaffold contract project templates
-2. Implemented block/statement processing and loop handling in the transformer
-3. Fixed struct literal initialization and return-struct ownership in transformer
+2. Added z2y `install`/`info` commands for tool setup checks (including anvil/forge)
+3. Seeded z2y template with zig_to_yul git dependency
+4. Implemented block/statement processing and loop handling in the transformer
+5. Fixed struct literal initialization and return-struct ownership in transformer
 
 #### Test Results
 - Unit tests: `zig build test --summary all`
