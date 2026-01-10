@@ -518,11 +518,8 @@ fn installReleaseBinaries(allocator: std.mem.Allocator, bin_dir: []const u8) !vo
 
     const zig_to_yul_target = try std.fs.path.join(allocator, &.{ bin_dir, "zig_to_yul" });
     defer allocator.free(zig_to_yul_target);
-    const z2y_target = try std.fs.path.join(allocator, &.{ bin_dir, "z2y" });
-    defer allocator.free(z2y_target);
 
     try runCommand(allocator, &.{ "cp", zig_to_yul_bin, zig_to_yul_target });
-    try runCommand(allocator, &.{ "cp", z2y_bin, z2y_target });
 }
 
 fn runCommand(allocator: std.mem.Allocator, argv: []const []const u8) !void {
