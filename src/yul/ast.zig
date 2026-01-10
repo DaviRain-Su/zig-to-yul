@@ -779,6 +779,12 @@ pub const AstBuilder = struct {
         return Statement.varDecl(typed, value);
     }
 
+    /// Create a typed variable declaration
+    pub fn varDeclTyped(self: *AstBuilder, names: []const TypedName, value: ?Expression) !Statement {
+        const typed = try self.dupeTypedNames(names);
+        return Statement.varDecl(typed, value);
+    }
+
     /// Create an assignment
     pub fn assign(self: *AstBuilder, names: []const []const u8, value: Expression) !Statement {
         const ids = try self.allocator.alloc(Identifier, names.len);
@@ -817,6 +823,18 @@ pub const AstBuilder = struct {
         // Track allocation for cleanup
         try self.typed_names.append(self.allocator, return_typed);
 
+        return Statement.funcDef(name, param_typed, return_typed, body);
+    }
+
+    pub fn funcDefTyped(
+        self: *AstBuilder,
+        name: YulName,
+        params: []const TypedName,
+        returns: []const TypedName,
+        body: Block,
+    ) !Statement {
+        const param_typed = try self.dupeTypedNames(params);
+        const return_typed = try self.dupeTypedNames(returns);
         return Statement.funcDef(name, param_typed, return_typed, body);
     }
 

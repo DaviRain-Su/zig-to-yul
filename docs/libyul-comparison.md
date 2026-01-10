@@ -354,7 +354,7 @@ Zig 源代码 → [zig-to-yul] → Yul 代码 → [solc] → EVM 字节码
 | 问题 | libyul 行为 | 当前实现 | 影响 |
 |------|-------------|----------|------|
 | **BuiltinCall 区分** | 区分 `BuiltinCall` 和 `FunctionCall` 两种节点 | Builtin/Function 已区分 | ✅ 已对齐 |
-| **Typed 节点** | 严格区分 builtin/identifier/typed | 统一处理 | 类型信息丢失 |
+| **Typed 节点** | 严格区分 builtin/identifier/typed | 变量/函数参数/返回已填充 TypedName | ✅ 已对齐 |
 
 ### 6.2 Dialect 验证缺失 (已修复)
 

@@ -522,6 +522,9 @@ pub const Transformer = struct {
             var params: std.ArrayList([]const u8) = .empty;
             defer params.deinit(self.allocator);
 
+            var param_typed: std.ArrayList(ast.TypedName) = .empty;
+            defer param_typed.deinit(self.allocator);
+
             var param_types: std.ArrayList([]const u8) = .empty;
             defer param_types.deinit(self.allocator);
 
@@ -542,6 +545,11 @@ pub const Transformer = struct {
                     try params.append(self.allocator, param_info.name);
                     // Map Zig type to Solidity ABI type
                     const zig_type = if (param_info.type_expr) |te| p.getNodeSource(te) else "u256";
+                    if (param_info.type_expr != null) {
+                        try param_typed.append(self.allocator, ast.TypedName.withType(param_info.name, self.yulTypeNameForZig(zig_type)));
+                    } else {
+                        try param_typed.append(self.allocator, ast.TypedName.init(param_info.name));
+                    }
                     if (self.parseArrayElemType(zig_type)) |elem_type| {
                         try self.setLocalArrayElemType(param_info.name, elem_type);
                     }
@@ -567,6 +575,8 @@ pub const Transformer = struct {
             var return_struct_len: usize = 0;
             var return_is_dynamic = false;
             var return_struct_name: ?[]const u8 = null;
+            var return_typed_buf: [1]ast.TypedName = undefined;
+            var return_typed: []const ast.TypedName = &.{};
             const has_return = blk: {
                 if (proto.return_type.unwrap()) |ret_type| {
                     const ret_src = p.getNodeSource(ret_type);
@@ -574,10 +584,14 @@ pub const Transformer = struct {
                     if (self.struct_defs.get(ret_src)) |fields| {
                         return_struct_len = fields.len;
                         return_struct_name = ret_src;
+                        return_typed_buf[0] = ast.TypedName.withType("result", ret_src);
+                        return_typed = return_typed_buf[0..1];
                     } else {
                         const abi = mapZigTypeToAbi(ret_src);
                         return_abi = try self.allocator.dupe(u8, abi);
                         return_is_dynamic = isDynamicAbiType(abi);
+                        return_typed_buf[0] = ast.TypedName.withType("result", self.yulTypeNameForZig(ret_src));
+                        return_typed = return_typed_buf[0..1];
                     }
                     break :blk true;
                 }
@@ -586,7 +600,7 @@ pub const Transformer = struct {
 
             self.current_return_struct = return_struct_name;
             // Generate function AST
-            const fn_stmt = try self.generateFunction(name, params.items, is_public, has_return, proto.body_node);
+            const fn_stmt = try self.generateFunction(name, param_typed.items, return_typed, is_public, has_return, proto.body_node);
             try self.functions.append(self.allocator, fn_stmt);
             self.current_return_struct = null;
 
@@ -639,6 +653,13 @@ pub const Transformer = struct {
         return "uint256";
     }
 
+    fn yulTypeNameForZig(self: *Self, zig_type: []const u8) []const u8 {
+        if (self.struct_defs.get(zig_type) != null) {
+            return zig_type;
+        }
+        return mapZigTypeToAbi(zig_type);
+    }
+
     fn isDynamicAbiType(abi: []const u8) bool {
         return std.mem.eql(u8, abi, "bytes") or std.mem.eql(u8, abi, "string") or std.mem.endsWith(u8, abi, "[]");
     }
@@ -650,7 +671,8 @@ pub const Transformer = struct {
     fn generateFunction(
         self: *Self,
         name: []const u8,
-        params: []const []const u8,
+        params: []const ast.TypedName,
+        returns: []const ast.TypedName,
         is_public: bool,
         has_return: bool,
         body_index: ZigAst.Node.Index,
@@ -666,8 +688,8 @@ pub const Transformer = struct {
         const body = try self.builder.block(body_stmts.items);
 
         // Only add return variable if function has a return value
-        const returns: []const []const u8 = if (has_return) &.{"result"} else &.{};
-        return try self.builder.funcDef(name, params, returns, body);
+        const final_returns: []const ast.TypedName = if (has_return) returns else &.{};
+        return try self.builder.funcDefTyped(name, params, final_returns, body);
     }
 
     const TransformProcessError = std.mem.Allocator.Error;
@@ -770,6 +792,7 @@ pub const Transformer = struct {
                 if (self.isStructInitTag(init_tag) or self.isArrayInitTag(init_tag)) {
                     if (try self.structInitTypeName(init_idx)) |explicit_type| {
                         try self.setLocalStructVar(name, explicit_type);
+                        type_name = explicit_type;
                         value = try self.translateStructInitWithType(init_idx, explicit_type);
                     } else if (type_name) |override_type| {
                         value = try self.translateStructInitWithType(init_idx, override_type);
@@ -781,7 +804,10 @@ pub const Transformer = struct {
                 }
             }
 
-            const stmt = try self.builder.varDecl(&.{name}, value);
+            const stmt = if (type_name) |resolved| blk: {
+                const typed = [_]ast.TypedName{ast.TypedName.withType(name, self.yulTypeNameForZig(resolved))};
+                break :blk try self.builder.varDeclTyped(&typed, value);
+            } else try self.builder.varDecl(&.{name}, value);
             try stmts.append(self.allocator, self.stmtWithLocation(stmt, self.nodeLocation(index)));
         }
     }
@@ -3335,7 +3361,7 @@ test "dispatcher with parameterized function" {
     try std.testing.expect(std.mem.indexOf(u8, output, "calldataload(36)") != null);
 
     // Verify function definition with parameters
-    try std.testing.expect(std.mem.indexOf(u8, output, "function transfer(to, amount)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "function transfer(to:uint256, amount:uint256)") != null);
 }
 
 test "dispatcher with dynamic params and return" {
