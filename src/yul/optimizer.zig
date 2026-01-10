@@ -1858,8 +1858,11 @@ test "unroll small for loop" {
     var opt = Optimizer.init(allocator);
     defer opt.deinit();
     const optimized = try opt.optimize(root);
-    try std.testing.expectEqual(@as(usize, 4), optimized.root.code.statements.len);
-    try std.testing.expect(optimized.root.code.statements[1] == .expression_statement);
+    try std.testing.expectEqual(@as(usize, 1), optimized.root.code.statements.len);
+    const stmt = optimized.root.code.statements[0];
+    try std.testing.expect(stmt == .block);
+    try std.testing.expectEqual(@as(usize, 4), stmt.block.statements.len);
+    try std.testing.expect(stmt.block.statements[1] == .expression_statement);
 }
 
 test "merge packed sstore sequence" {
