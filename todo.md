@@ -1,7 +1,20 @@
 • 目前的 TODO 清单（汇总自 docs/libyul-comparison.md 的未完成/部分实现项）：
 
 - Gas 估算仍缺完整动态因素（动态路径执行次数精确建模已部分完成，仍需基于运行时 profile）（5.3）
+  - 总体实现规划（5.3）：
+    - 插桩：在 Yul 生成阶段注入 branch/switch/loop 计数逻辑
+    - 采集（本地 VM）：执行插桩合约，提取计数并生成 profile.json
+    - 采集（RPC）：eth_call 或交易回执日志解析计数，合并成 profile.json
+    - 多轮聚合：累加 hits，生成平均权重/迭代次数（支持 runs）
+    - 估算消费：estimate --profile 读取并应用 overrides（已完成）
+    - 测试：插桩/采集/聚合/估算端到端用例
 - EOF Prague 指令未实现（5.1）
+  - 总体实现规划（5.1）：
+    - 指令清单：按 EIP/EOF 规范建立缺失指令矩阵
+    - 解析与 AST：扩展 Yul builtin/IR 支持 Prague 指令
+    - 代码生成：Yul→EVM bytecode 支持新 opcode
+    - Gas/执行语义：补充 gas table 与语义规则
+    - 测试：对齐上游向量与单元测试
 - CLI/SDK 主线（方向C）：
   - CLI：`build` / `deploy` / `call` / `profile`
   - SDK：storage / abi / event / precompile
@@ -9,11 +22,32 @@
   - 网络 profiles：name → RPC + chainId（deploy/call 直接用 name）
   - CLI `call` 支持与 Solidity 合约交互
   - Zig SDK：支持调用已部署的 Solidity 合约（ABI/encoding + RPC 调用）
+  - 总体实现规划（CLI/SDK）：
+    - CLI：建立 deploy/call/profile 子命令与配置解析
+    - RPC 层：统一 JSON-RPC 客户端与重试/超时策略
+    - ABI：生成/解析 ABI JSON，与 ethers/Foundry 兼容
+    - 交易：支持 EIP-1559/Legacy 参数与签名
+    - SDK：提供高层调用封装与类型映射
+    - 测试：本地 Anvil/Foundry 集成测试
 - 优化研究：对比 https://github.com/Vectorized/solady
+  - 总体实现规划（优化）：
+    - 选基准：确定 Solady/参考合约与基准指标
+    - Profiling：对齐 gas/size/部署成本
+    - 优化点：映射、scratch 复用、SLOAD/SSTORE 合并
+    - 回归测试：确保语义一致与指标提升
 - 生态整合：
   - JSON-RPC 兼容（Anvil/Hardhat/Foundry/Alchemy/Infura/QuickNode）
   - ABI JSON 输出（ethers.js/Foundry/Hardhat 兼容）
   - EIP-1559 交易参数支持（maxFee/maxPriority）
   - keystore/私钥签名兼容
   - SourceMap 格式对齐 solidity 生态
+  - 总体实现规划（生态）：
+    - RPC：覆盖常见 provider 兼容性差异
+    - ABI：输出 schema 与字段排序一致性
+    - 交易：EIP-1559 与签名/nonce 处理
+    - SourceMap：对齐 Solidity map 格式与工具链
 如果你想继续：建议按 5.3（工具特性）→ 6.5（SourceLocation）→ 5.1（EOF Prague 指令）的优先级推进。
+
+- 文档同步：
+  - `docs/ROADMAP.md`
+  - `docs/stories/v0.1.0-runtime-profile.md`
