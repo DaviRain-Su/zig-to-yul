@@ -16,7 +16,7 @@
 - 生态整合：
   - JSON-RPC 兼容（已覆盖 Hardhat/Alchemy/Infura/QuickNode 基础差异）
   - ABI JSON 输出（已补全 stateMutability/tuple components）
-  - keystore/私钥签名兼容
+  - keystore/私钥签名兼容（已完成）
   - SourceMap 格式对齐 solidity 生态（已完成）
   - 总体实现规划（生态）：
     - RPC：覆盖常见 provider 兼容性差异

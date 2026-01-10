@@ -22,13 +22,17 @@ pub const LegacyTx = struct {
 };
 
 pub fn signLegacy(allocator: std.mem.Allocator, tx: LegacyTx, private_key_hex: []const u8) ![]u8 {
+    const priv_bytes = try decodeHex32(private_key_hex);
+    return try signLegacyWithKey(allocator, tx, priv_bytes);
+}
+
+fn signLegacyWithKey(allocator: std.mem.Allocator, tx: LegacyTx, priv_bytes: [32]u8) ![]u8 {
     const signing_rlp = try encodeLegacyForSign(allocator, tx);
     defer allocator.free(signing_rlp);
 
     var hash: [32]u8 = undefined;
     std.crypto.hash.sha3.Keccak256.hash(signing_rlp, &hash, .{});
 
-    const priv_bytes = try decodeHex32(private_key_hex);
     const secret = try Scheme.SecretKey.fromBytes(priv_bytes);
     const key_pair = try Scheme.KeyPair.fromSecretKey(secret);
 
@@ -75,6 +79,11 @@ pub const Eip1559Tx = struct {
 };
 
 pub fn signEip1559(allocator: std.mem.Allocator, tx: Eip1559Tx, private_key_hex: []const u8) ![]u8 {
+    const priv_bytes = try decodeHex32(private_key_hex);
+    return try signEip1559WithKey(allocator, tx, priv_bytes);
+}
+
+fn signEip1559WithKey(allocator: std.mem.Allocator, tx: Eip1559Tx, priv_bytes: [32]u8) ![]u8 {
     const signing_rlp = try encodeEip1559ForSign(allocator, tx);
     defer allocator.free(signing_rlp);
 
@@ -86,7 +95,6 @@ pub fn signEip1559(allocator: std.mem.Allocator, tx: Eip1559Tx, private_key_hex:
     var hash: [32]u8 = undefined;
     std.crypto.hash.sha3.Keccak256.hash(payload.items, &hash, .{});
 
-    const priv_bytes = try decodeHex32(private_key_hex);
     const secret = try Scheme.SecretKey.fromBytes(priv_bytes);
     const key_pair = try Scheme.KeyPair.fromSecretKey(secret);
 
@@ -118,6 +126,143 @@ pub fn sendEip1559(allocator: std.mem.Allocator, rpc_url: []const u8, tx: Eip155
     const raw = try signEip1559(allocator, tx, private_key_hex);
     defer allocator.free(raw);
     return try rpc.ethSendRawTransaction(allocator, rpc_url, raw);
+}
+
+pub const KeystoreError = error{
+    InvalidKeystore,
+    UnsupportedCipher,
+    UnsupportedKdf,
+    InvalidMac,
+    InvalidParams,
+    InvalidCiphertext,
+};
+
+pub fn signLegacyKeystore(
+    allocator: std.mem.Allocator,
+    tx: LegacyTx,
+    keystore_json: []const u8,
+    password: []const u8,
+) ![]u8 {
+    const key = try decryptKeystore(allocator, keystore_json, password);
+    return try signLegacyWithKey(allocator, tx, key);
+}
+
+pub fn sendLegacyKeystore(
+    allocator: std.mem.Allocator,
+    rpc_url: []const u8,
+    tx: LegacyTx,
+    keystore_json: []const u8,
+    password: []const u8,
+) ![]u8 {
+    const raw = try signLegacyKeystore(allocator, tx, keystore_json, password);
+    defer allocator.free(raw);
+    return try rpc.ethSendRawTransaction(allocator, rpc_url, raw);
+}
+
+pub fn signEip1559Keystore(
+    allocator: std.mem.Allocator,
+    tx: Eip1559Tx,
+    keystore_json: []const u8,
+    password: []const u8,
+) ![]u8 {
+    const key = try decryptKeystore(allocator, keystore_json, password);
+    return try signEip1559WithKey(allocator, tx, key);
+}
+
+pub fn sendEip1559Keystore(
+    allocator: std.mem.Allocator,
+    rpc_url: []const u8,
+    tx: Eip1559Tx,
+    keystore_json: []const u8,
+    password: []const u8,
+) ![]u8 {
+    const raw = try signEip1559Keystore(allocator, tx, keystore_json, password);
+    defer allocator.free(raw);
+    return try rpc.ethSendRawTransaction(allocator, rpc_url, raw);
+}
+
+pub fn decryptKeystore(allocator: std.mem.Allocator, keystore_json: []const u8, password: []const u8) ![32]u8 {
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, keystore_json, .{});
+    defer parsed.deinit();
+
+    if (parsed.value != .object) return KeystoreError.InvalidKeystore;
+    const root = parsed.value.object;
+
+    const crypto_value = if (root.get("crypto")) |val| val else root.get("Crypto") orelse return KeystoreError.InvalidKeystore;
+    if (crypto_value != .object) return KeystoreError.InvalidKeystore;
+    const crypto_obj = crypto_value.object;
+
+    const cipher = try getStringField(crypto_obj, "cipher");
+    if (!std.mem.eql(u8, cipher, "aes-128-ctr")) return KeystoreError.UnsupportedCipher;
+
+    const ciphertext_hex = try getStringField(crypto_obj, "ciphertext");
+    const cipherparams_value = try getObjectField(crypto_obj, "cipherparams");
+    const iv_hex = try getStringField(cipherparams_value, "iv");
+
+    const kdf = try getStringField(crypto_obj, "kdf");
+    const kdfparams = try getObjectField(crypto_obj, "kdfparams");
+    const dklen = try getU32Field(kdfparams, "dklen");
+    if (dklen < 32) return KeystoreError.InvalidParams;
+
+    const salt_hex = try getStringField(kdfparams, "salt");
+    const salt = try decodeHexAlloc(allocator, salt_hex);
+    defer allocator.free(salt);
+
+    var derived_key = try allocator.alloc(u8, dklen);
+    defer allocator.free(derived_key);
+
+    if (std.mem.eql(u8, kdf, "scrypt")) {
+        const n = try getU64Field(kdfparams, "n");
+        const r = try getU64Field(kdfparams, "r");
+        const p = try getU64Field(kdfparams, "p");
+        if (!std.math.isPowerOfTwo(n)) return KeystoreError.InvalidParams;
+        const ln = std.math.log2_int(u64, n);
+        const params: std.crypto.pwhash.scrypt.Params = .{
+            .ln = @intCast(ln),
+            .r = @intCast(r),
+            .p = @intCast(p),
+        };
+        try std.crypto.pwhash.scrypt.kdf(allocator, derived_key, password, salt, params);
+    } else if (std.mem.eql(u8, kdf, "pbkdf2")) {
+        const prf = try getStringField(kdfparams, "prf");
+        if (!std.mem.eql(u8, prf, "hmac-sha256")) return KeystoreError.UnsupportedKdf;
+        const rounds = try getU32Field(kdfparams, "c");
+        try std.crypto.pwhash.pbkdf2(derived_key, password, salt, rounds, std.crypto.auth.hmac.sha2.HmacSha256);
+    } else {
+        return KeystoreError.UnsupportedKdf;
+    }
+
+    const mac_hex = try getStringField(crypto_obj, "mac");
+    const mac = try decodeHexFixed(32, mac_hex);
+
+    const ciphertext = try decodeHexAlloc(allocator, ciphertext_hex);
+    defer allocator.free(ciphertext);
+
+    var mac_input = try allocator.alloc(u8, 16 + ciphertext.len);
+    defer allocator.free(mac_input);
+    @memcpy(mac_input[0..16], derived_key[16..32]);
+    @memcpy(mac_input[16..], ciphertext);
+
+    var mac_hash: [32]u8 = undefined;
+    std.crypto.hash.sha3.Keccak256.hash(mac_input, &mac_hash, .{});
+    if (!std.mem.eql(u8, &mac_hash, &mac)) return KeystoreError.InvalidMac;
+
+    const iv = try decodeHexFixed(16, iv_hex);
+    var key_bytes: [16]u8 = undefined;
+    @memcpy(&key_bytes, derived_key[0..16]);
+
+    var plain = try allocator.alloc(u8, ciphertext.len);
+    defer allocator.free(plain);
+
+    const aes = std.crypto.core.aes.Aes128;
+    const ctr = std.crypto.core.modes.ctr;
+    const ctx = aes.initEnc(key_bytes);
+    ctr(std.crypto.core.aes.AesEncryptCtx(aes), ctx, plain, ciphertext, iv, .big);
+
+    if (plain.len != 32) return KeystoreError.InvalidCiphertext;
+    var out: [32]u8 = undefined;
+    @memcpy(&out, plain[0..32]);
+    return out;
 }
 
 fn encodeLegacyForSign(allocator: std.mem.Allocator, tx: LegacyTx) ![]u8 {
@@ -373,6 +518,65 @@ fn decodeHex32(text: []const u8) ![32]u8 {
         out[i] = try parseHexByte(hex[i * 2], hex[i * 2 + 1]);
     }
     return out;
+}
+
+fn decodeHexFixed(comptime N: usize, text: []const u8) ![N]u8 {
+    const hex = trimHexPrefix(text);
+    if (hex.len != N * 2) return KeystoreError.InvalidParams;
+
+    var out: [N]u8 = undefined;
+    var i: usize = 0;
+    while (i < N) : (i += 1) {
+        out[i] = try parseHexByte(hex[i * 2], hex[i * 2 + 1]);
+    }
+    return out;
+}
+
+fn decodeHexAlloc(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    const hex = trimHexPrefix(text);
+    if (hex.len % 2 != 0) return KeystoreError.InvalidParams;
+
+    var out = try allocator.alloc(u8, hex.len / 2);
+    var i: usize = 0;
+    while (i < hex.len) : (i += 2) {
+        out[i / 2] = try parseHexByte(hex[i], hex[i + 1]);
+    }
+    return out;
+}
+
+fn getObjectField(obj: std.json.ObjectMap, name: []const u8) !std.json.ObjectMap {
+    const value = obj.get(name) orelse return KeystoreError.InvalidKeystore;
+    if (value != .object) return KeystoreError.InvalidKeystore;
+    return value.object;
+}
+
+fn getStringField(obj: std.json.ObjectMap, name: []const u8) ![]const u8 {
+    const value = obj.get(name) orelse return KeystoreError.InvalidKeystore;
+    if (value != .string) return KeystoreError.InvalidKeystore;
+    return value.string;
+}
+
+fn getU64Field(obj: std.json.ObjectMap, name: []const u8) !u64 {
+    const value = obj.get(name) orelse return KeystoreError.InvalidKeystore;
+    switch (value) {
+        .integer => |num| {
+            if (num < 0) return KeystoreError.InvalidParams;
+            return @intCast(num);
+        },
+        .float => |num| {
+            if (num < 0) return KeystoreError.InvalidParams;
+            const rounded = std.math.floor(num);
+            if (rounded != num) return KeystoreError.InvalidParams;
+            return @intFromFloat(rounded);
+        },
+        else => return KeystoreError.InvalidParams,
+    }
+}
+
+fn getU32Field(obj: std.json.ObjectMap, name: []const u8) !u32 {
+    const value = try getU64Field(obj, name);
+    if (value > std.math.maxInt(u32)) return KeystoreError.InvalidParams;
+    return @intCast(value);
 }
 
 fn parseHexByte(a: u8, b: u8) !u8 {

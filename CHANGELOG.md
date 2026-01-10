@@ -15,6 +15,19 @@
 #### Test Results
 - Unit tests: `zig build test --summary all`
 
+### Session 2026-01-10-010
+
+**Date**: 2026-01-10
+**Goal**: Add keystore signing compatibility
+
+#### Completed Work
+1. Added keystore JSON decrypt helpers (scrypt/pbkdf2, AES-128-CTR)
+2. Added keystore signing helpers for legacy and EIP-1559
+3. Documented keystore signing usage in README
+
+#### Test Results
+- Unit tests: `zig build test --summary all`
+
 ### Session 2026-01-10-008
 
 **Date**: 2026-01-10

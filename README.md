@@ -208,6 +208,27 @@ const raw = try evm.tx.signEip1559(allocator, .{
 }, "0x<private_key>");
 ```
 
+SDK example (sign from keystore):
+
+```zig
+const evm = @import("zig_to_yul").evm;
+
+const keystore_json = try std.fs.cwd().readFileAlloc(allocator, "wallet.json", 1024 * 1024);
+defer allocator.free(keystore_json);
+
+const raw = try evm.tx.signEip1559Keystore(allocator, .{
+    .chain_id = 1,
+    .nonce = 0,
+    .max_priority_fee_per_gas = 1_000_000_000,
+    .max_fee_per_gas = 2_000_000_000,
+    .gas_limit = 21000,
+    .to = 0x1234,
+    .value = 0,
+    .data = &.{},
+    .access_list = &.{},
+}, keystore_json, "password");
+```
+
 On-chain wrapper example (generated):
 
 ```zig
