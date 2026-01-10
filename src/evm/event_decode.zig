@@ -24,6 +24,7 @@ pub const Event = struct {
     name: []const u8,
     params: []const EventParam,
     anonymous: bool = false,
+    signature_hash: ?[32]u8 = null,
 };
 
 pub fn decodeAbi(allocator: Allocator, abi_types: []const []const u8, data: []const u8) DecodeErrorSet!DecodedEvent {
@@ -214,7 +215,7 @@ pub fn decodeEvent(
     if (topics.len > required_topics) return error.ExtraTopics;
 
     if (!event.anonymous) {
-        const expected = try eventSignatureHash(allocator, event);
+        const expected = if (event.signature_hash) |sig| sig else try eventSignatureHash(allocator, event);
         if (!std.mem.eql(u8, expected[0..], topics[0][0..])) {
             return error.InvalidSignature;
         }

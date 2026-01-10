@@ -15,6 +15,19 @@
 #### Test Results
 - Unit tests: `zig build test --summary all`
 
+### Session 2026-01-10-011
+
+**Date**: 2026-01-10
+**Goal**: Apply P0 Solady optimizations
+
+#### Completed Work
+1. Added custom error selector for invalid function dispatch
+2. Sanitized address calldata decoding via high-bit clear
+3. Allowed precomputed event signature hash in event decoding
+
+#### Test Results
+- Unit tests: `zig build test --summary all`
+
 ### Session 2026-01-10-010
 
 **Date**: 2026-01-10

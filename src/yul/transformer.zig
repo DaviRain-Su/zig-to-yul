@@ -2610,12 +2610,20 @@ pub const Transformer = struct {
             try cases.append(self.allocator, case);
         }
 
-        // Add default revert case
-        const revert_call = try self.builder.builtinCall("revert", &.{
+        // Add default revert case (custom error selector)
+        const invalid_selector = try FunctionInfo.calculateSelector(self.allocator, "InvalidSelector", &.{});
+        const store_selector = try self.builder.builtinCall("mstore", &.{
             ast.Expression.lit(ast.Literal.number(0)),
-            ast.Expression.lit(ast.Literal.number(0)),
+            ast.Expression.lit(ast.Literal.number(invalid_selector)),
         });
-        const default_body = try self.builder.block(&.{ast.Statement.expr(revert_call)});
+        const revert_call = try self.builder.builtinCall("revert", &.{
+            ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0x1c))),
+            ast.Expression.lit(ast.Literal.number(@as(ast.U256, 4))),
+        });
+        const default_body = try self.builder.block(&.{
+            ast.Statement.expr(store_selector),
+            ast.Statement.expr(revert_call),
+        });
         try cases.append(self.allocator, ast.Case.default(default_body));
 
         const switch_stmt = try self.builder.switchStmt(selector, cases.items);
@@ -2764,7 +2772,14 @@ pub const Transformer = struct {
                 const load_call = try self.builder.builtinCall("calldataload", &.{
                     ast.Expression.lit(ast.Literal.number(offset)),
                 });
-                const var_decl = try self.builder.varDecl(&.{param_name}, load_call);
+                const value_expr = if (std.mem.eql(u8, abi_type, "address"))
+                    try self.builder.builtinCall("shr", &.{
+                        ast.Expression.lit(ast.Literal.number(@as(ast.U256, 96))),
+                        load_call,
+                    })
+                else
+                    load_call;
+                const var_decl = try self.builder.varDecl(&.{param_name}, value_expr);
                 try case_stmts.append(self.allocator, var_decl);
                 try call_args.append(self.allocator, ast.Expression.id(param_name));
                 head_offset += @as(ast.U256, 32);
@@ -3066,7 +3081,15 @@ pub const Transformer = struct {
                 try stmts.append(self.allocator, ast.Statement.expr(store_ptr));
             } else {
                 const val = try self.builder.builtinCall("calldataload", &.{head_slot});
-                const store = try self.builder.builtinCall("mstore", &.{ field_slot, val });
+                const field_abi = mapZigTypeToAbi(field.type_name);
+                const stored = if (std.mem.eql(u8, field_abi, "address"))
+                    try self.builder.builtinCall("shr", &.{
+                        ast.Expression.lit(ast.Literal.number(@as(ast.U256, 96))),
+                        val,
+                    })
+                else
+                    val;
+                const store = try self.builder.builtinCall("mstore", &.{ field_slot, stored });
                 try stmts.append(self.allocator, ast.Statement.expr(store));
             }
 
