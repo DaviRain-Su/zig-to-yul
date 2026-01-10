@@ -38,10 +38,15 @@ jobs:
         run: |
           rm -rf dist
           mkdir -p dist
-          cp zig-out/bin/zig_to_yul dist/
-          cp tools/z2y/zig-out/bin/z2y dist/
-          if [ -d sdk ]; then
-            cp -r sdk dist/sdk
+          if [ -f zig-out/bin/zig_to_yul ]; then
+            cp zig-out/bin/zig_to_yul dist/
+          elif [ -f zig-out/bin/zig_to_yul.exe ]; then
+            cp zig-out/bin/zig_to_yul.exe dist/
+          fi
+          if [ -f tools/z2y/zig-out/bin/z2y ]; then
+            cp tools/z2y/zig-out/bin/z2y dist/
+          elif [ -f tools/z2y/zig-out/bin/z2y.exe ]; then
+            cp tools/z2y/zig-out/bin/z2y.exe dist/
           fi
           tar -czf zig-to-yul-${{ matrix.os }}.tar.gz -C dist .
 
