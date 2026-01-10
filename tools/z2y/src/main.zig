@@ -35,6 +35,12 @@ const Template = struct {
         \\    });
         \\    _ = contract_mod;
         \\
+        \\    const out_step = b.addSystemCommand(&.{
+        \\        "mkdir",
+        \\        "-p",
+        \\        "out",
+        \\    });
+        \\
         \\    const build_step = b.addSystemCommand(&.{
         \\        "zig_to_yul",
         \\        "build",
@@ -46,9 +52,25 @@ const Template = struct {
         \\        "out/Contract.bin",
         \\        "src/Contract.zig",
         \\    });
+        \\    build_step.step.dependOn(&out_step.step);
+        \\
+        \\    const abi_step = b.addSystemCommand(&.{
+        \\        "zig_to_yul",
+        \\        "compile",
+        \\        "--project",
+        \\        ".",
+        \\        "--abi",
+        \\        "out/Contract.abi.json",
+        \\        "-o",
+        \\        "out/Contract.yul",
+        \\        "src/Contract.zig",
+        \\    });
+        \\    abi_step.step.dependOn(&out_step.step);
         \\
         \\    const contract_step = b.step("contract", "Build contract bytecode");
         \\    contract_step.dependOn(&build_step.step);
+        \\    const abi_only_step = b.step("abi", "Generate ABI JSON");
+        \\    abi_only_step.dependOn(&abi_step.step);
         \\    b.getInstallStep().dependOn(&build_step.step);
         \\}
     ;
