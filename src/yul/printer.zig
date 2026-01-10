@@ -126,10 +126,6 @@ pub const Printer = struct {
         for (decl.variables, 0..) |v, i| {
             if (i > 0) try self.write(", ");
             try self.write(v.name);
-            if (v.type_name) |t| {
-                try self.write(":");
-                try self.write(t);
-            }
         }
 
         if (decl.value) |val| {
@@ -190,10 +186,6 @@ pub const Printer = struct {
         for (func.parameters, 0..) |p, i| {
             if (i > 0) try self.write(", ");
             try self.write(p.name);
-            if (p.type_name) |t| {
-                try self.write(":");
-                try self.write(t);
-            }
         }
 
         try self.write(")");
@@ -203,10 +195,6 @@ pub const Printer = struct {
             for (func.return_variables, 0..) |r, i| {
                 if (i > 0) try self.write(", ");
                 try self.write(r.name);
-                if (r.type_name) |t| {
-                    try self.write(":");
-                    try self.write(t);
-                }
             }
         }
 

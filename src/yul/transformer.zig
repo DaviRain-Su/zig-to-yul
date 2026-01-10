@@ -3859,7 +3859,7 @@ test "dispatcher with parameterized function" {
     try std.testing.expect(std.mem.indexOf(u8, output, "calldataload(36)") != null);
 
     // Verify function definition with parameters
-    try std.testing.expect(std.mem.indexOf(u8, output, "function transfer(to:uint256, amount:uint256)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "function transfer(to, amount)") != null);
 }
 
 test "dispatcher with dynamic params and return" {

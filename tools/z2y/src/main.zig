@@ -36,7 +36,7 @@ const Template = struct {
         \\    _ = contract_mod;
         \\
         \\    const compile_step = b.addSystemCommand(&.{
-        \\        "zig-to-yul",
+        \\        "zig_to_yul",
         \\        "compile",
         \\        "--project",
         \\        ".",
@@ -69,13 +69,13 @@ const Template = struct {
         \\.{
         \\    .name = .contract,
         \\    .version = "0.1.0",
-        \\    .fingerprint = 0x0000000000000001,
+        \\    .fingerprint = 0xe98f285936ce0bb3,
         \\    .minimum_zig_version = "0.15.2",
         \\    .paths = .{"."},
         \\    .dependencies = .{
         \\        .zig_to_yul = .{
-        \\            .url = "https://github.com/DaviRain-Su/zig-to-yul/archive/refs/heads/main.tar.gz",
-        \\            .hash = "zig_to_yul-0.0.0-Gzz9gPBbCQCeGdLoAHlmk4bZvxtzRt1xWYqNsrVq4Eg1",
+        \\            .url = "https://github.com/DaviRain-Su/zig-to-yul/archive/refs/tags/v0.1.0.tar.gz",
+        \\            .hash = "zig_to_yul-0.1.0-Gzz9gG-JCwAJ83VLKjBL6GhWOsre03bs3Z_BRV1LrSLl",
         \\        },
         \\    },
         \\}
