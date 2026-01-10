@@ -23,6 +23,7 @@ pub const GasEstimate = struct {
     refund_capped: u64 = 0,
     assumed_dynamic_ops: u32 = 0,
     assumed_loop_iterations: u64 = 0,
+    max_stack_depth: u64 = 0,
 };
 
 pub fn estimate(root: ast.AST) GasEstimate {
@@ -253,8 +254,12 @@ fn visitStatement(stmt: ast.Statement, out: *GasEstimate, ctx: *EstimatorContext
             if (cond_value == false) return;
             visitBlock(s.body, out, ctx);
             visitBlock(s.post, out, ctx);
-            if (ctx.opts.loop_iterations > 1) {
-                out.assumed_loop_iterations += ctx.opts.loop_iterations - 1;
+            const inferred = inferLoopIterations(s.pre, s.condition, s.post);
+            const total_iters = inferred orelse ctx.opts.loop_iterations;
+            if (inferred == null and total_iters > 1) {
+                out.assumed_loop_iterations += total_iters - 1;
+            }
+            if (total_iters > 1) {
                 var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
                 defer arena.deinit();
                 var ctx_clone = cloneContext(ctx, arena.allocator());
@@ -262,7 +267,7 @@ fn visitStatement(stmt: ast.Statement, out: *GasEstimate, ctx: *EstimatorContext
                 visitExpression(s.condition, &step, &ctx_clone);
                 visitBlock(s.body, &step, &ctx_clone);
                 visitBlock(s.post, &step, &ctx_clone);
-                addScaledEstimate(out, step, ctx.opts.loop_iterations - 1);
+                addScaledEstimate(out, step, total_iters - 1);
             }
         },
         .function_definition => {},
@@ -271,6 +276,10 @@ fn visitStatement(stmt: ast.Statement, out: *GasEstimate, ctx: *EstimatorContext
 }
 
 fn visitExpression(expr: ast.Expression, out: *GasEstimate, ctx: *EstimatorContext) void {
+    const usage = exprStackUsage(expr);
+    if (usage.max > out.max_stack_depth) {
+        out.max_stack_depth = usage.max;
+    }
     switch (expr) {
         .literal => {},
         .identifier => {},
@@ -645,6 +654,77 @@ fn constEvalBool(expr: ast.Expression) ?bool {
     return null;
 }
 
+fn exprStackUsage(expr: ast.Expression) struct { max: u64, result: u64 } {
+    switch (expr) {
+        .literal, .identifier => return .{ .max = 1, .result = 1 },
+        .function_call => |call| return stackUsageForArgs(call.arguments),
+        .builtin_call => |call| return stackUsageForArgs(call.arguments),
+    }
+}
+
+fn stackUsageForArgs(args: []const ast.Expression) struct { max: u64, result: u64 } {
+    var current: u64 = 0;
+    var max_depth: u64 = 0;
+    for (args) |arg| {
+        const usage = exprStackUsage(arg);
+        if (current + usage.max > max_depth) {
+            max_depth = current + usage.max;
+        }
+        current += usage.result;
+    }
+    if (current > max_depth) max_depth = current;
+    return .{ .max = max_depth, .result = 1 };
+}
+
+fn inferLoopIterations(pre: ast.Block, cond: ast.Expression, post: ast.Block) ?u64 {
+    if (pre.statements.len != 1 or post.statements.len != 1) return null;
+    const pre_stmt = pre.statements[0];
+    if (pre_stmt != .variable_declaration) return null;
+    if (pre_stmt.variable_declaration.variables.len != 1) return null;
+    const var_name = pre_stmt.variable_declaration.variables[0].name;
+    const start_expr = pre_stmt.variable_declaration.value orelse return null;
+    const start = constEvalU256(start_expr) orelse return null;
+
+    const cond_call = if (cond == .builtin_call) cond.builtin_call else return null;
+    if (cond_call.arguments.len != 2) return null;
+    const cond_name = cond_call.builtin_name.name;
+    const cond_left = cond_call.arguments[0];
+    const cond_right = cond_call.arguments[1];
+    if (cond_left != .identifier) return null;
+    if (!std.mem.eql(u8, cond_left.identifier.name, var_name)) return null;
+    const end = constEvalU256(cond_right) orelse return null;
+
+    const post_stmt = post.statements[0];
+    if (post_stmt != .assignment) return null;
+    if (post_stmt.assignment.variable_names.len != 1) return null;
+    if (!std.mem.eql(u8, post_stmt.assignment.variable_names[0].name, var_name)) return null;
+    const post_expr = post_stmt.assignment.value;
+    const post_call = if (post_expr == .builtin_call) post_expr.builtin_call else return null;
+    if (post_call.arguments.len != 2) return null;
+    const post_left = post_call.arguments[0];
+    const post_right = post_call.arguments[1];
+    if (post_left != .identifier or !std.mem.eql(u8, post_left.identifier.name, var_name)) return null;
+    const step_val = constEvalU256(post_right) orelse return null;
+    if (step_val == 0) return null;
+
+    if (std.mem.eql(u8, cond_name, "lt")) {
+        if (start >= end) return 0;
+        return iterationsCeil(end - start, step_val);
+    }
+    if (std.mem.eql(u8, cond_name, "gt")) {
+        if (start <= end) return 0;
+        return iterationsCeil(start - end, step_val);
+    }
+    return null;
+}
+
+fn iterationsCeil(delta: ast.U256, step: ast.U256) ?u64 {
+    if (step == 0) return null;
+    const d = bytesToU64(delta) orelse return null;
+    const s = bytesToU64(step) orelse return null;
+    return (d + s - 1) / s;
+}
+
 fn literalValueEquals(lit: ast.Literal, value: ast.U256) bool {
     return switch (lit.kind) {
         .number => lit.value.number == value,
@@ -835,6 +915,9 @@ fn addScaledEstimate(out: *GasEstimate, step: GasEstimate, scale: u64) void {
     out.refund_estimate += step.refund_estimate * scale;
     out.refund_capped = std.math.min(out.refund_estimate, out.total / 5);
     out.assumed_dynamic_ops += @intCast(step.assumed_dynamic_ops * @as(u32, @intCast(scale)));
+    if (step.max_stack_depth > out.max_stack_depth) {
+        out.max_stack_depth = step.max_stack_depth;
+    }
 }
 
 fn addEstimate(out: *GasEstimate, step: GasEstimate) void {
@@ -850,6 +933,9 @@ fn addEstimate(out: *GasEstimate, step: GasEstimate) void {
     out.refund_estimate += step.refund_estimate;
     out.refund_capped = std.math.min(out.refund_estimate, if (out.total > 0) out.total / 5 else 0);
     out.assumed_dynamic_ops += step.assumed_dynamic_ops;
+    if (step.max_stack_depth > out.max_stack_depth) {
+        out.max_stack_depth = step.max_stack_depth;
+    }
 }
 
 test "estimate basic gas" {
@@ -1050,4 +1136,35 @@ test "estimate switch worst case" {
 
     const result = estimate(root);
     try std.testing.expectEqual(@as(u32, 2), result.cold_storage_accesses);
+}
+
+test "infer loop iterations" {
+    const code_block = ast.Block.init(&.{
+        ast.Statement.forStmt(
+            ast.Block.init(&.{
+                ast.Statement.varDecl(&.{ast.TypedName.init("i")}, ast.Expression.lit(ast.Literal.number(0))),
+            }),
+            ast.Expression.builtinCall("lt", &.{
+                ast.Expression.id("i"),
+                ast.Expression.lit(ast.Literal.number(4)),
+            }),
+            ast.Block.init(&.{
+                ast.Statement.assign(&.{ast.Identifier.init("i")}, ast.Expression.builtinCall("add", &.{
+                    ast.Expression.id("i"),
+                    ast.Expression.lit(ast.Literal.number(1)),
+                })),
+            }),
+            ast.Block.init(&.{
+                ast.Statement.expr(ast.Expression.builtinCall("mload", &.{
+                    ast.Expression.lit(ast.Literal.number(0)),
+                })),
+            }),
+        ),
+    });
+
+    const obj = ast.Object.init("Gas", code_block, &.{}, &.{});
+    const root = ast.AST.init(obj);
+
+    const result = estimate(root);
+    try std.testing.expectEqual(@as(u64, 0), result.assumed_loop_iterations);
 }
