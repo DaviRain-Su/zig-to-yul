@@ -114,6 +114,9 @@ pub const EstimateOptions = struct {
     assume_exp_bytes: u64 = 1,
     assume_unknown_storage_zero: bool = true,
     loop_iterations: u64 = 1,
+    max_refund_divisor: u64 = 5,
+    base_access_list_costs: bool = true,
+    enable_refund_clamp: bool = true,
 };
 
 pub fn estimateWithOptions(root: ast.AST, opts: EstimateOptions) GasEstimate {
@@ -123,8 +126,16 @@ pub fn estimateWithOptions(root: ast.AST, opts: EstimateOptions) GasEstimate {
     defer ctx.deinit();
 
     var out = GasEstimate{};
+    if (opts.base_access_list_costs) {
+        out.total += 2400 * ctx.account_addrs.items.len;
+        out.total += 1900 * ctx.storage_slots.items.len;
+    }
     visitObject(root.root, &out, &ctx);
-    out.refund_capped = std.math.min(out.refund_estimate, out.total / 5);
+    if (opts.enable_refund_clamp and opts.max_refund_divisor > 0) {
+        out.refund_capped = std.math.min(out.refund_estimate, out.total / opts.max_refund_divisor);
+    } else {
+        out.refund_capped = out.refund_estimate;
+    }
     return out;
 }
 
@@ -187,14 +198,53 @@ fn visitStatement(stmt: ast.Statement, out: *GasEstimate, ctx: *EstimatorContext
         .assignment => |s| visitExpression(s.value, out, ctx),
         .block => |s| visitBlock(s, out, ctx),
         .if_statement => |s| {
+            const cond_value = constEvalBool(s.condition);
             visitExpression(s.condition, out, ctx);
-            visitBlock(s.body, out, ctx);
+            if (cond_value) |is_true| {
+                if (is_true) {
+                    visitBlock(s.body, out, ctx);
+                }
+                return;
+            }
+
+            var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer arena.deinit();
+            var ctx_clone = cloneContext(ctx, arena.allocator());
+            var body_estimate = GasEstimate{};
+            visitBlock(s.body, &body_estimate, &ctx_clone);
+            addEstimate(out, body_estimate);
         },
         .switch_statement => |s| {
             visitExpression(s.expression, out, ctx);
-            for (s.cases) |case_| {
-                visitBlock(case_.body, out, ctx);
+            if (constEvalU256(s.expression)) |value| {
+                for (s.cases) |case_| {
+                    if (case_.value) |lit| {
+                        if (literalValueEquals(lit, value)) {
+                            visitBlock(case_.body, out, ctx);
+                            return;
+                        }
+                    } else {
+                        visitBlock(case_.body, out, ctx);
+                        return;
+                    }
+                }
+                return;
             }
+
+            var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer arena.deinit();
+            var ctx_clone = cloneContext(ctx, arena.allocator());
+            var worst = GasEstimate{};
+            var first = true;
+            for (s.cases) |case_| {
+                var case_est = GasEstimate{};
+                visitBlock(case_.body, &case_est, &ctx_clone);
+                if (first or case_est.total > worst.total) {
+                    worst = case_est;
+                    first = false;
+                }
+            }
+            addEstimate(out, worst);
         },
         .for_loop => |s| {
             visitBlock(s.pre, out, ctx);
@@ -595,6 +645,15 @@ fn constEvalBool(expr: ast.Expression) ?bool {
     return null;
 }
 
+fn literalValueEquals(lit: ast.Literal, value: ast.U256) bool {
+    return switch (lit.kind) {
+        .number => lit.value.number == value,
+        .hex_number => lit.value.hex_number == value,
+        .boolean => (if (lit.value.boolean) 1 else 0) == value,
+        else => false,
+    };
+}
+
 fn bytesToU64(value: ast.U256) ?u64 {
     return std.math.cast(u64, value);
 }
@@ -778,6 +837,21 @@ fn addScaledEstimate(out: *GasEstimate, step: GasEstimate, scale: u64) void {
     out.assumed_dynamic_ops += @intCast(step.assumed_dynamic_ops * @as(u32, @intCast(scale)));
 }
 
+fn addEstimate(out: *GasEstimate, step: GasEstimate) void {
+    out.total += step.total;
+    out.dynamic_ops += step.dynamic_ops;
+    out.unknown_ops += step.unknown_ops;
+    out.memory_words = @max(out.memory_words, step.memory_words);
+    out.memory_gas = @max(out.memory_gas, step.memory_gas);
+    out.cold_storage_accesses += step.cold_storage_accesses;
+    out.warm_storage_accesses += step.warm_storage_accesses;
+    out.cold_account_accesses += step.cold_account_accesses;
+    out.warm_account_accesses += step.warm_account_accesses;
+    out.refund_estimate += step.refund_estimate;
+    out.refund_capped = std.math.min(out.refund_estimate, if (out.total > 0) out.total / 5 else 0);
+    out.assumed_dynamic_ops += step.assumed_dynamic_ops;
+}
+
 test "estimate basic gas" {
     const code_block = ast.Block.init(&.{
         ast.Statement.expr(ast.Expression.builtinCall("add", &.{
@@ -947,4 +1021,33 @@ test "estimate loop iterations" {
     const opts: EstimateOptions = .{ .loop_iterations = 3 };
     const result = estimateWithOptions(root, opts);
     try std.testing.expectEqual(@as(u64, 2), result.assumed_loop_iterations);
+}
+
+test "estimate switch worst case" {
+    const code_block = ast.Block.init(&.{
+        ast.Statement.switchStmt(
+            ast.Expression.id("x"),
+            &.{
+                ast.Case.init(ast.Literal.number(0), ast.Block.init(&.{
+                    ast.Statement.expr(ast.Expression.builtinCall("sload", &.{
+                        ast.Expression.lit(ast.Literal.number(0)),
+                    })),
+                })),
+                ast.Case.init(ast.Literal.number(1), ast.Block.init(&.{
+                    ast.Statement.expr(ast.Expression.builtinCall("sload", &.{
+                        ast.Expression.lit(ast.Literal.number(0)),
+                    })),
+                    ast.Statement.expr(ast.Expression.builtinCall("sload", &.{
+                        ast.Expression.lit(ast.Literal.number(1)),
+                    })),
+                })),
+            },
+        ),
+    });
+
+    const obj = ast.Object.init("Gas", code_block, &.{}, &.{});
+    const root = ast.AST.init(obj);
+
+    const result = estimate(root);
+    try std.testing.expectEqual(@as(u32, 2), result.cold_storage_accesses);
 }
