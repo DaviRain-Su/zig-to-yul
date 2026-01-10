@@ -21,6 +21,7 @@ pub const evm = struct {
 
     pub const U256 = types.U256;
     pub const Address = types.Address;
+    pub const Mapping = types.Mapping;
     pub const EvmType = types.EvmType;
 };
 

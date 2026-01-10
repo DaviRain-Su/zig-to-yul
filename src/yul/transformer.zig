@@ -49,6 +49,7 @@ pub const Transformer = struct {
         slot: evm_types.U256,
         size_bits: u16,
         offset_bits: u16,
+        is_mapping: bool,
     };
 
     pub const StructFieldDef = struct {
@@ -410,6 +411,14 @@ pub const Transformer = struct {
         return "u256";
     }
 
+    fn isMappingTypeName(self: *Self, type_name: []const u8) bool {
+        _ = self;
+        const trimmed = std.mem.trim(u8, type_name, " \t\r\n");
+        return std.mem.startsWith(u8, trimmed, "evm.Mapping(") or
+            std.mem.startsWith(u8, trimmed, "Mapping(") or
+            std.mem.startsWith(u8, trimmed, "evm.types.Mapping(");
+    }
+
     fn structHasDynamicField(self: *Self, fields: []const StructFieldDef) bool {
         for (fields) |field| {
             if (self.struct_defs.get(field.type_name)) |nested| {
@@ -746,6 +755,9 @@ pub const Transformer = struct {
             .assign => {
                 try self.processAssign(index, stmts);
             },
+            .assign_add => {
+                try self.processAssignAdd(index, stmts);
+            },
             .@"return" => {
                 try self.processReturn(index, stmts);
             },
@@ -842,6 +854,28 @@ pub const Transformer = struct {
 
             if (std.mem.eql(u8, obj_src, "self")) {
                 if (self.storageVarFor(field_name)) |sv| {
+                    if (sv.is_mapping) {
+                        try self.reportUnsupportedStmt(index, "mapping assignment requires key");
+                        return;
+                    }
+                    if (sv.size_bits < 256) {
+                        try self.genPackedWrite(sv, value, stmts, index);
+                        return;
+                    }
+                    const sstore_call = try self.builder.builtinCall("sstore", &.{
+                        ast.Expression.lit(ast.Literal.number(sv.slot)),
+                        value,
+                    });
+                    try stmts.append(self.allocator, self.stmtWithLocation(ast.Statement.expr(sstore_call), self.nodeLocation(index)));
+                    return;
+                }
+            } else if (std.mem.startsWith(u8, obj_src, "self.")) {
+                const base_name = obj_src["self.".len..];
+                if (self.storageVarForNested(base_name, field_name)) |sv| {
+                    if (sv.is_mapping) {
+                        try self.reportUnsupportedStmt(index, "mapping assignment requires key");
+                        return;
+                    }
                     if (sv.size_bits < 256) {
                         try self.genPackedWrite(sv, value, stmts, index);
                         return;
@@ -878,7 +912,111 @@ pub const Transformer = struct {
         }
 
         const target_name = p.getNodeSource(target_node);
+        if (std.mem.eql(u8, target_name, "_")) {
+            if (value_tag == .identifier) {
+                const value_name = p.getNodeSource(value_node);
+                if (std.mem.eql(u8, value_name, "self")) {
+                    return;
+                }
+            }
+            try stmts.append(self.allocator, self.stmtWithLocation(ast.Statement.expr(value), self.nodeLocation(index)));
+            return;
+        }
         const stmt = try self.builder.assign(&.{target_name}, value);
+        try stmts.append(self.allocator, self.stmtWithLocation(stmt, self.nodeLocation(index)));
+    }
+
+    fn processAssignAdd(self: *Self, index: ZigAst.Node.Index, stmts: *std.ArrayList(ast.Statement)) TransformProcessError!void {
+        const p = &self.zig_parser.?;
+        const data = p.ast.nodeData(index);
+        const nodes = data.node_and_node;
+
+        const target_node = nodes[0];
+        const target_tag = p.getNodeTag(target_node);
+        const value_node = nodes[1];
+        const value_tag = p.getNodeTag(value_node);
+
+        const target_expr = try self.translateExpression(target_node);
+        const value_expr = try self.translateExpression(value_node);
+        const add_expr = try self.builder.builtinCall("add", &.{ target_expr, value_expr });
+
+        if (target_tag == .field_access) {
+            const target_data = p.ast.nodeData(target_node).node_and_token;
+            const obj_src = p.getNodeSource(target_data[0]);
+            const field_token = target_data[1];
+            const field_name = p.getIdentifier(field_token);
+
+            if (std.mem.eql(u8, obj_src, "self")) {
+                if (self.storageVarFor(field_name)) |sv| {
+                    if (sv.is_mapping) {
+                        try self.reportUnsupportedStmt(index, "mapping assignment requires key");
+                        return;
+                    }
+                    if (sv.size_bits < 256) {
+                        try self.genPackedWrite(sv, add_expr, stmts, index);
+                        return;
+                    }
+                    const sstore_call = try self.builder.builtinCall("sstore", &.{
+                        ast.Expression.lit(ast.Literal.number(sv.slot)),
+                        add_expr,
+                    });
+                    try stmts.append(self.allocator, self.stmtWithLocation(ast.Statement.expr(sstore_call), self.nodeLocation(index)));
+                    return;
+                }
+            } else if (std.mem.startsWith(u8, obj_src, "self.")) {
+                const base_name = obj_src["self.".len..];
+                if (self.storageVarForNested(base_name, field_name)) |sv| {
+                    if (sv.is_mapping) {
+                        try self.reportUnsupportedStmt(index, "mapping assignment requires key");
+                        return;
+                    }
+                    if (sv.size_bits < 256) {
+                        try self.genPackedWrite(sv, add_expr, stmts, index);
+                        return;
+                    }
+                    const sstore_call = try self.builder.builtinCall("sstore", &.{
+                        ast.Expression.lit(ast.Literal.number(sv.slot)),
+                        add_expr,
+                    });
+                    try stmts.append(self.allocator, self.stmtWithLocation(ast.Statement.expr(sstore_call), self.nodeLocation(index)));
+                    return;
+                }
+            }
+
+            if (self.local_struct_vars.get(obj_src)) |struct_name| {
+                if (self.struct_defs.get(struct_name)) |fields| {
+                    if (self.structFieldOffset(fields, field_name)) |offset| {
+                        const addr = try self.builder.builtinCall("add", &.{
+                            ast.Expression.id(obj_src),
+                            ast.Expression.lit(ast.Literal.number(offset)),
+                        });
+                        const mstore_call = try self.builder.builtinCall("mstore", &.{ addr, add_expr });
+                        try stmts.append(self.allocator, self.stmtWithLocation(ast.Statement.expr(mstore_call), self.nodeLocation(index)));
+                        return;
+                    }
+                }
+            }
+        }
+
+        if (target_tag == .array_access) {
+            if (try self.translateArrayAccessStore(target_node, add_expr)) |stmt| {
+                try stmts.append(self.allocator, self.stmtWithLocation(stmt, self.nodeLocation(index)));
+                return;
+            }
+        }
+
+        const target_name = p.getNodeSource(target_node);
+        if (std.mem.eql(u8, target_name, "_")) {
+            if (value_tag == .identifier) {
+                const value_name = p.getNodeSource(value_node);
+                if (std.mem.eql(u8, value_name, "self")) {
+                    return;
+                }
+            }
+            try stmts.append(self.allocator, self.stmtWithLocation(ast.Statement.expr(add_expr), self.nodeLocation(index)));
+            return;
+        }
+        const stmt = try self.builder.assign(&.{target_name}, add_expr);
         try stmts.append(self.allocator, self.stmtWithLocation(stmt, self.nodeLocation(index)));
     }
 
@@ -1995,6 +2133,43 @@ pub const Transformer = struct {
         return helper_name;
     }
 
+    fn ensureMappingSlotHelper(self: *Self) ![]const u8 {
+        const key_name = "mapping_slot";
+        if (self.math_helpers.get(key_name)) |helper| return helper;
+
+        const helper_name = try std.fmt.allocPrint(self.allocator, "__zig2yul$mapping_slot", .{});
+        const key = try self.allocator.dupe(u8, key_name);
+        try self.math_helpers.put(key, helper_name);
+
+        var stmts: std.ArrayList(ast.Statement) = .empty;
+        defer stmts.deinit(self.allocator);
+
+        const mstore_key = try self.builder.builtinCall("mstore", &.{
+            ast.Expression.lit(ast.Literal.number(0x00)),
+            ast.Expression.id("key"),
+        });
+        try stmts.append(self.allocator, ast.Statement.expr(mstore_key));
+
+        const mstore_base = try self.builder.builtinCall("mstore", &.{
+            ast.Expression.lit(ast.Literal.number(0x20)),
+            ast.Expression.id("base"),
+        });
+        try stmts.append(self.allocator, ast.Statement.expr(mstore_base));
+
+        const keccak_expr = try self.builder.builtinCall("keccak256", &.{
+            ast.Expression.lit(ast.Literal.number(0x00)),
+            ast.Expression.lit(ast.Literal.number(0x40)),
+        });
+        const assign_slot = try self.builder.assign(&.{"slot"}, keccak_expr);
+        try stmts.append(self.allocator, assign_slot);
+
+        const body = try self.builder.block(stmts.items);
+        const func = try self.builder.funcDef(helper_name, &.{ "key", "base" }, &.{"slot"}, body);
+        try self.extra_functions.append(self.allocator, func);
+
+        return helper_name;
+    }
+
     fn ensureFfsHelper(self: *Self) ![]const u8 {
         const key_name = "ffs";
         if (self.math_helpers.get(key_name)) |helper| return helper;
@@ -2073,6 +2248,24 @@ pub const Transformer = struct {
         // Check if accessing storage
         if (std.mem.eql(u8, obj_src, "self")) {
             if (self.storageVarFor(field_name)) |sv| {
+                if (sv.is_mapping) {
+                    try self.addError("mapping access requires key", self.nodeLocation(index), .unsupported_feature);
+                    return ast.Expression.lit(ast.Literal.number(0));
+                }
+                if (sv.size_bits < 256) {
+                    return try self.genPackedRead(sv);
+                }
+                return try self.builder.builtinCall("sload", &.{
+                    ast.Expression.lit(ast.Literal.number(sv.slot)),
+                });
+            }
+        } else if (std.mem.startsWith(u8, obj_src, "self.")) {
+            const base_name = obj_src["self.".len..];
+            if (self.storageVarForNested(base_name, field_name)) |sv| {
+                if (sv.is_mapping) {
+                    try self.addError("mapping access requires key", self.nodeLocation(index), .unsupported_feature);
+                    return ast.Expression.lit(ast.Literal.number(0));
+                }
                 if (sv.size_bits < 256) {
                     return try self.genPackedRead(sv);
                 }
@@ -2111,6 +2304,29 @@ pub const Transformer = struct {
             if (std.mem.eql(u8, obj_src, "self")) {
                 if (self.storageVarFor(field_name)) |sv| {
                     const idx_expr = try self.translateExpression(index_node);
+                    if (sv.is_mapping) {
+                        const helper = try self.ensureMappingSlotHelper();
+                        const slot_expr = try self.builder.call(helper, &.{
+                            idx_expr,
+                            ast.Expression.lit(ast.Literal.number(sv.slot)),
+                        });
+                        return try self.builder.builtinCall("sload", &.{slot_expr});
+                    }
+                    const addr = try self.indexedStorageSlot(sv.slot, idx_expr);
+                    return try self.builder.builtinCall("sload", &.{addr});
+                }
+            } else if (std.mem.startsWith(u8, obj_src, "self.")) {
+                const base_name = obj_src["self.".len..];
+                if (self.storageVarForNested(base_name, field_name)) |sv| {
+                    const idx_expr = try self.translateExpression(index_node);
+                    if (sv.is_mapping) {
+                        const helper = try self.ensureMappingSlotHelper();
+                        const slot_expr = try self.builder.call(helper, &.{
+                            idx_expr,
+                            ast.Expression.lit(ast.Literal.number(sv.slot)),
+                        });
+                        return try self.builder.builtinCall("sload", &.{slot_expr});
+                    }
                     const addr = try self.indexedStorageSlot(sv.slot, idx_expr);
                     return try self.builder.builtinCall("sload", &.{addr});
                 }
@@ -2175,6 +2391,32 @@ pub const Transformer = struct {
             if (std.mem.eql(u8, obj_src, "self")) {
                 if (self.storageVarFor(field_name)) |sv| {
                     const idx_expr = try self.translateExpression(index_node);
+                    if (sv.is_mapping) {
+                        const helper = try self.ensureMappingSlotHelper();
+                        const slot_expr = try self.builder.call(helper, &.{
+                            idx_expr,
+                            ast.Expression.lit(ast.Literal.number(sv.slot)),
+                        });
+                        const store = try self.builder.builtinCall("sstore", &.{ slot_expr, value });
+                        return ast.Statement.expr(store);
+                    }
+                    const addr = try self.indexedStorageSlot(sv.slot, idx_expr);
+                    const store = try self.builder.builtinCall("sstore", &.{ addr, value });
+                    return ast.Statement.expr(store);
+                }
+            } else if (std.mem.startsWith(u8, obj_src, "self.")) {
+                const base_name = obj_src["self.".len..];
+                if (self.storageVarForNested(base_name, field_name)) |sv| {
+                    const idx_expr = try self.translateExpression(index_node);
+                    if (sv.is_mapping) {
+                        const helper = try self.ensureMappingSlotHelper();
+                        const slot_expr = try self.builder.call(helper, &.{
+                            idx_expr,
+                            ast.Expression.lit(ast.Literal.number(sv.slot)),
+                        });
+                        const store = try self.builder.builtinCall("sstore", &.{ slot_expr, value });
+                        return ast.Statement.expr(store);
+                    }
                     const addr = try self.indexedStorageSlot(sv.slot, idx_expr);
                     const store = try self.builder.builtinCall("sstore", &.{ addr, value });
                     return ast.Statement.expr(store);
@@ -2270,8 +2512,22 @@ pub const Transformer = struct {
     }
 
     fn storageVarFor(self: *Self, field_name: []const u8) ?StorageVar {
+        return self.storageVarByName(field_name);
+    }
+
+    fn storageVarByName(self: *Self, name: []const u8) ?StorageVar {
         for (self.storage_vars.items) |sv| {
-            if (std.mem.eql(u8, sv.name, field_name)) return sv;
+            if (std.mem.eql(u8, sv.name, name)) return sv;
+        }
+        return null;
+    }
+
+    fn storageVarForNested(self: *Self, base_name: []const u8, field_name: []const u8) ?StorageVar {
+        for (self.storage_vars.items) |sv| {
+            if (sv.name.len != base_name.len + 1 + field_name.len) continue;
+            if (!std.mem.startsWith(u8, sv.name, base_name)) continue;
+            if (sv.name[base_name.len] != '.') continue;
+            if (std.mem.eql(u8, sv.name[base_name.len + 1 ..], field_name)) return sv;
         }
         return null;
     }
@@ -2295,6 +2551,65 @@ pub const Transformer = struct {
         return try self.builder.builtinCall("add", &.{ base, offset });
     }
 
+    fn fieldTypeForName(fields: []const evm_storage.StructField, name: []const u8) ?[]const u8 {
+        for (fields) |field| {
+            if (std.mem.eql(u8, field.name, name)) return field.type_name;
+        }
+        return null;
+    }
+
+    fn storageTypeSizeBits(type_name: []const u8) u16 {
+        if (std.mem.eql(u8, type_name, "bool")) return 8;
+        if (std.mem.eql(u8, type_name, "u8")) return 8;
+        if (std.mem.eql(u8, type_name, "u16")) return 16;
+        if (std.mem.eql(u8, type_name, "u32")) return 32;
+        if (std.mem.eql(u8, type_name, "u64")) return 64;
+        if (std.mem.eql(u8, type_name, "u128")) return 128;
+        if (std.mem.eql(u8, type_name, "u256")) return 256;
+        if (std.mem.eql(u8, type_name, "Address") or std.mem.eql(u8, type_name, "evm.Address") or std.mem.eql(u8, type_name, "[20]u8")) return 160;
+        return 256;
+    }
+
+    fn appendStructStorageVars(self: *Self, base_name: []const u8, struct_name: []const u8, base_slot: evm_types.U256) !evm_types.U256 {
+        const fields = self.struct_defs.get(struct_name) orelse return 0;
+
+        var layout_fields: std.ArrayList(evm_storage.StructField) = .empty;
+        defer layout_fields.deinit(self.allocator);
+
+        for (fields) |field| {
+            try layout_fields.append(self.allocator, .{ .name = field.name, .type_name = field.type_name });
+        }
+
+        var packer = evm_storage.StoragePacker.init(self.allocator);
+        const slots = try packer.analyzeStruct(layout_fields.items);
+        defer {
+            for (slots) |slot_info| {
+                self.allocator.free(slot_info.fields);
+            }
+            self.allocator.free(slots);
+        }
+
+        var max_slot: evm_types.U256 = 0;
+        for (slots) |slot_info| {
+            if (slot_info.slot > max_slot) max_slot = slot_info.slot;
+            for (slot_info.fields) |field| {
+                const field_type = fieldTypeForName(layout_fields.items, field.name) orelse "u256";
+                const full_name = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ base_name, field.name });
+                try self.temp_strings.append(self.allocator, full_name);
+                const is_mapping = self.isMappingTypeName(field_type);
+                try self.storage_vars.append(self.allocator, .{
+                    .name = full_name,
+                    .slot = base_slot + slot_info.slot,
+                    .size_bits = field.size_bits,
+                    .offset_bits = field.offset_bits,
+                    .is_mapping = is_mapping,
+                });
+            }
+        }
+
+        return max_slot + 1;
+    }
+
     fn collectStorageLayout(self: *Self, members: []const ZigAst.Node.Index) !void {
         var fields: std.ArrayList(evm_storage.StructField) = .empty;
         defer fields.deinit(self.allocator);
@@ -2312,29 +2627,44 @@ pub const Transformer = struct {
 
         if (fields.items.len == 0) return;
 
-        var packer = evm_storage.StoragePacker.init(self.allocator);
-        const slots = try packer.analyzeStruct(fields.items);
-        defer {
-            for (slots) |slot_info| {
-                self.allocator.free(slot_info.fields);
+        var current_slot: evm_types.U256 = 0;
+        var current_offset: u16 = 0;
+
+        for (fields.items) |field| {
+            if (self.struct_defs.get(field.type_name)) |struct_fields| {
+                _ = struct_fields;
+                if (current_offset != 0) {
+                    current_slot += 1;
+                    current_offset = 0;
+                }
+                const consumed = try self.appendStructStorageVars(field.name, field.type_name, current_slot);
+                current_slot += consumed;
+                continue;
             }
-            self.allocator.free(slots);
+
+            const field_bits = storageTypeSizeBits(field.type_name);
+            if (current_offset + field_bits > 256) {
+                current_slot += 1;
+                current_offset = 0;
+            }
+
+            const is_mapping = self.isMappingTypeName(field.type_name);
+            try self.storage_vars.append(self.allocator, .{
+                .name = field.name,
+                .slot = current_slot,
+                .size_bits = field_bits,
+                .offset_bits = current_offset,
+                .is_mapping = is_mapping,
+            });
+
+            current_offset += field_bits;
+            if (current_offset == 256) {
+                current_slot += 1;
+                current_offset = 0;
+            }
         }
 
-        var max_slot: evm_types.U256 = 0;
-        for (slots) |slot_info| {
-            if (slot_info.slot > max_slot) max_slot = slot_info.slot;
-            for (slot_info.fields) |field| {
-                try self.storage_vars.append(self.allocator, .{
-                    .name = field.name,
-                    .slot = slot_info.slot,
-                    .size_bits = field.size_bits,
-                    .offset_bits = field.offset_bits,
-                });
-            }
-        }
-
-        self.symbol_table.next_storage_slot = max_slot + 1;
+        self.symbol_table.next_storage_slot = if (current_offset == 0) current_slot else current_slot + 1;
     }
 
     fn genPackedRead(self: *Self, sv: StorageVar) TransformProcessError!ast.Expression {

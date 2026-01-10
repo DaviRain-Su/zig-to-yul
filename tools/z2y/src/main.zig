@@ -110,6 +110,7 @@ const Template = struct {
         \\pub const contract = sdk.contract;
         \\pub const U256 = sdk.U256;
         \\pub const Address = sdk.Address;
+        \\pub const Mapping = sdk.Mapping;
         \\pub const EvmType = sdk.EvmType;
     ;
 

@@ -16,6 +16,14 @@ pub const Address = @Type(.{ .int = .{
     .bits = 160,
 } });
 
+/// Defines a Solidity-style mapping type for contracts.
+pub fn Mapping(comptime Key: type, comptime Value: type) type {
+    return struct {
+        pub const KeyType = Key;
+        pub const ValueType = Value;
+    };
+}
+
 /// Alias for convenience
 pub const Word = U256;
 
