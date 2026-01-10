@@ -24,6 +24,7 @@ pub const Transformer = struct {
     struct_init_helpers: std.StringHashMap([]const u8),
     local_struct_vars: std.StringHashMap([]const u8),
     local_array_elem_types: std.StringHashMap([]const u8),
+    function_param_structs: std.StringHashMap([]const []const u8),
     extra_functions: std.ArrayList(ast.Statement),
 
     // State tracking
@@ -33,6 +34,7 @@ pub const Transformer = struct {
     function_infos: std.ArrayList(FunctionInfo),
     temp_counter: u32, // Counter for generating unique temp variable names
     loop_break_flags: std.ArrayList(?[]const u8),
+    current_return_struct: ?[]const u8,
 
     // Track allocated strings for cleanup
     temp_strings: std.ArrayList([]const u8),
@@ -127,6 +129,7 @@ pub const Transformer = struct {
             .struct_init_helpers = std.StringHashMap([]const u8).init(allocator),
             .local_struct_vars = std.StringHashMap([]const u8).init(allocator),
             .local_array_elem_types = std.StringHashMap([]const u8).init(allocator),
+            .function_param_structs = std.StringHashMap([]const []const u8).init(allocator),
             .extra_functions = .empty,
             .current_contract = null,
             .functions = .empty,
@@ -134,6 +137,7 @@ pub const Transformer = struct {
             .function_infos = .empty,
             .temp_counter = 0,
             .loop_break_flags = .empty,
+            .current_return_struct = null,
             .temp_strings = .empty,
         };
     }
@@ -175,6 +179,15 @@ pub const Transformer = struct {
             self.allocator.free(entry.value_ptr.*);
         }
         self.local_array_elem_types.deinit();
+        var func_it = self.function_param_structs.iterator();
+        while (func_it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            for (entry.value_ptr.*) |name| {
+                if (name.len > 0) self.allocator.free(name);
+            }
+            self.allocator.free(entry.value_ptr.*);
+        }
+        self.function_param_structs.deinit();
 
         // Free function info param arrays
         for (self.function_infos.items) |fi| {
@@ -412,6 +425,12 @@ pub const Transformer = struct {
         var buf: [2]ZigAst.Node.Index = undefined;
         if (p.ast.fullContainerDecl(&buf, index)) |container| {
             for (container.ast.members) |member| {
+                if (@intFromEnum(member) == 0) continue;
+                if (p.getNodeTag(member) == .fn_decl) {
+                    try self.collectFunctionSignature(member);
+                }
+            }
+            for (container.ast.members) |member| {
                 // Skip invalid/none indices
                 if (@intFromEnum(member) == 0) continue;
                 try self.processContractMember(member);
@@ -450,6 +469,33 @@ pub const Transformer = struct {
                 .name = name,
                 .slot = self.symbol_table.next_storage_slot - 1,
             });
+        }
+    }
+
+    fn collectFunctionSignature(self: *Self, index: ZigAst.Node.Index) !void {
+        const p = &self.zig_parser.?;
+        if (p.getFnProto(index)) |proto| {
+            const name_token = proto.name_token orelse return;
+            const name = p.getIdentifier(name_token);
+
+            var param_struct_names: std.ArrayList([]const u8) = .empty;
+            defer param_struct_names.deinit(self.allocator);
+
+            const param_infos = try p.getFnParams(self.allocator, proto.proto_node);
+            defer self.allocator.free(param_infos);
+
+            for (param_infos) |param_info| {
+                if (param_info.name.len > 0 and !std.mem.eql(u8, param_info.name, "self")) {
+                    const zig_type = if (param_info.type_expr) |te| p.getNodeSource(te) else "u256";
+                    if (self.struct_defs.get(zig_type) != null) {
+                        try param_struct_names.append(self.allocator, zig_type);
+                    } else {
+                        try param_struct_names.append(self.allocator, "");
+                    }
+                }
+            }
+
+            try self.setFunctionParamStructs(name, param_struct_names.items);
         }
     }
 
@@ -511,12 +557,14 @@ pub const Transformer = struct {
             var return_abi: ?[]const u8 = null;
             var return_struct_len: usize = 0;
             var return_is_dynamic = false;
+            var return_struct_name: ?[]const u8 = null;
             const has_return = blk: {
                 if (proto.return_type.unwrap()) |ret_type| {
                     const ret_src = p.getNodeSource(ret_type);
                     if (std.mem.eql(u8, ret_src, "void")) break :blk false;
                     if (self.struct_defs.get(ret_src)) |fields| {
                         return_struct_len = fields.len;
+                        return_struct_name = ret_src;
                     } else {
                         const abi = mapZigTypeToAbi(ret_src);
                         return_abi = try self.allocator.dupe(u8, abi);
@@ -527,9 +575,11 @@ pub const Transformer = struct {
                 break :blk false;
             };
 
+            self.current_return_struct = return_struct_name;
             // Generate function AST
             const fn_stmt = try self.generateFunction(name, params.items, is_public, has_return, proto.body_node);
             try self.functions.append(self.allocator, fn_stmt);
+            self.current_return_struct = null;
 
             // Track public functions for dispatcher
             if (is_public) {
@@ -818,7 +868,17 @@ pub const Transformer = struct {
         const opt_node = data.opt_node;
 
         if (opt_node.unwrap()) |ret_node| {
-            const value = try self.translateExpression(ret_node);
+            const tag = p.getNodeTag(ret_node);
+            var value: ast.Expression = undefined;
+            if ((self.isStructInitTag(tag) or self.isArrayInitTag(tag)) and self.current_return_struct != null) {
+                if (try self.structInitTypeName(ret_node)) |explicit_type| {
+                    value = try self.translateStructInitWithType(ret_node, explicit_type);
+                } else {
+                    value = try self.translateStructInitWithType(ret_node, self.current_return_struct.?);
+                }
+            } else {
+                value = try self.translateExpression(ret_node);
+            }
             const assign = try self.builder.assign(&.{"result"}, value);
             try stmts.append(self.allocator, self.stmtWithLocation(assign, self.nodeLocation(index)));
         }
@@ -1794,12 +1854,32 @@ pub const Transformer = struct {
         const call_info = p.ast.fullCall(&call_buf, index) orelse return ast.Expression.lit(ast.Literal.number(0));
 
         const callee_src = p.getNodeSource(call_info.ast.fn_expr);
+        var call_lookup = callee_src;
+        if (p.getNodeTag(call_info.ast.fn_expr) == .field_access) {
+            const data = p.ast.nodeData(call_info.ast.fn_expr).node_and_token;
+            const obj_src = p.getNodeSource(data[0]);
+            if (std.mem.eql(u8, obj_src, "self")) {
+                call_lookup = p.getIdentifier(data[1]);
+            }
+        }
 
         // Collect all arguments
         var args: std.ArrayList(ast.Expression) = .empty;
         defer args.deinit(self.allocator);
 
-        for (call_info.ast.params) |param_node| {
+        const param_structs = self.function_param_structs.get(call_lookup);
+        for (call_info.ast.params, 0..) |param_node, i| {
+            const tag = p.getNodeTag(param_node);
+            if (param_structs) |structs| {
+                if (i < structs.len and structs[i].len > 0 and (self.isStructInitTag(tag) or self.isArrayInitTag(tag))) {
+                    if (try self.structInitTypeName(param_node)) |explicit_type| {
+                        try args.append(self.allocator, try self.translateStructInitWithType(param_node, explicit_type));
+                    } else {
+                        try args.append(self.allocator, try self.translateStructInitWithType(param_node, structs[i]));
+                    }
+                    continue;
+                }
+            }
             try args.append(self.allocator, try self.translateExpression(param_node));
         }
 
@@ -1955,9 +2035,9 @@ pub const Transformer = struct {
                         const field_type = self.structFieldType(fields, field_name);
                         if (field_type) |type_name| {
                             if (self.parseArrayElemType(type_name)) |elem_type| {
-                                if (self.struct_defs.get(elem_type) != null) {
-                                    try self.addError("array store for struct elements is not supported", self.nodeLocation(target), .unsupported_feature);
-                                    return null;
+                                if (self.struct_defs.get(elem_type)) |elem_fields| {
+                                    const stmt = try self.buildStructArrayStore(base_addr, idx_expr, elem_fields, value, self.nodeLocation(target));
+                                    return stmt;
                                 }
                                 const stride = self.elementStrideBytes(elem_type);
                                 const addr = if (stride == 32)
@@ -1979,9 +2059,9 @@ pub const Transformer = struct {
         const base_expr = try self.translateExpression(base_node);
         const idx_expr = try self.translateExpression(index_node);
         if (self.arrayElemTypeForNode(base_node)) |elem_type| {
-            if (self.struct_defs.get(elem_type) != null) {
-                try self.addError("array store for struct elements is not supported", self.nodeLocation(target), .unsupported_feature);
-                return null;
+            if (self.struct_defs.get(elem_type)) |elem_fields| {
+                const stmt = try self.buildStructArrayStore(base_expr, idx_expr, elem_fields, value, self.nodeLocation(target));
+                return stmt;
             }
             const stride = self.elementStrideBytes(elem_type);
             const addr = if (stride == 32)
@@ -1994,6 +2074,43 @@ pub const Transformer = struct {
         const addr = try self.indexedMemoryAddress(base_expr, idx_expr);
         const store = try self.builder.builtinCall("mstore", &.{ addr, value });
         return ast.Statement.expr(store);
+    }
+
+    fn buildStructArrayStore(
+        self: *Self,
+        base_addr: ast.Expression,
+        idx_expr: ast.Expression,
+        fields: []const StructFieldDef,
+        value: ast.Expression,
+        loc: ast.SourceLocation,
+    ) TransformProcessError!ast.Statement {
+        var stmts: std.ArrayList(ast.Statement) = .empty;
+        defer stmts.deinit(self.allocator);
+
+        const elem_ptr = try self.makeTemp("arr_elem");
+        const val_ptr = try self.makeTemp("arr_val");
+
+        const elem_addr = try self.indexedMemoryAddressStride(base_addr, idx_expr, @intCast(fields.len * 32));
+        try stmts.append(self.allocator, try self.builder.varDecl(&.{elem_ptr}, elem_addr));
+        try stmts.append(self.allocator, try self.builder.varDecl(&.{val_ptr}, value));
+
+        for (fields, 0..) |_, i| {
+            const offset: ast.U256 = @intCast(i * 32);
+            const src_addr = try self.builder.builtinCall("add", &.{
+                ast.Expression.id(val_ptr),
+                ast.Expression.lit(ast.Literal.number(offset)),
+            });
+            const val_expr = try self.builder.builtinCall("mload", &.{src_addr});
+            const dst_addr = try self.builder.builtinCall("add", &.{
+                ast.Expression.id(elem_ptr),
+                ast.Expression.lit(ast.Literal.number(offset)),
+            });
+            const store = try self.builder.builtinCall("mstore", &.{ dst_addr, val_expr });
+            try stmts.append(self.allocator, ast.Statement.expr(store));
+        }
+
+        const block = try self.builder.block(stmts.items);
+        return self.stmtWithLocation(ast.Statement{ .block = block }, loc);
     }
 
     fn storageSlotFor(self: *Self, field_name: []const u8) ?ast.U256 {
@@ -2325,6 +2442,27 @@ pub const Transformer = struct {
         const key = try self.allocator.dupe(u8, name);
         const val = try self.allocator.dupe(u8, elem_type);
         try self.local_array_elem_types.put(key, val);
+    }
+
+    fn setFunctionParamStructs(self: *Self, name: []const u8, items: []const []const u8) !void {
+        if (self.function_param_structs.getEntry(name)) |entry| {
+            for (entry.value_ptr.*) |s| {
+                if (s.len > 0) self.allocator.free(s);
+            }
+            self.allocator.free(entry.value_ptr.*);
+            self.allocator.free(entry.key_ptr.*);
+            _ = self.function_param_structs.remove(name);
+        }
+        const key = try self.allocator.dupe(u8, name);
+        const list = try self.allocator.alloc([]const u8, items.len);
+        for (items, 0..) |s, i| {
+            if (s.len > 0) {
+                list[i] = try self.allocator.dupe(u8, s);
+            } else {
+                list[i] = "";
+            }
+        }
+        try self.function_param_structs.put(key, list);
     }
 
     fn stripTypeQualifiers(src: []const u8) []const u8 {
@@ -3422,8 +3560,14 @@ test "transform expression coverage" {
         \\        var x = (p.a + self.value) * (offset - 1);
         \\        var y = p.b[1];
         \\        var z = pairs[1].a;
-        \\        self.value = x + self.helper(p.a, y) + q.a;
+        \\        pairs[0] = q;
+        \\        const r = self.make_pair(.{ 9, 10 });
+        \\        self.value = x + self.helper(p.a, y) + q.a + r.b + z;
         \\        return x + y;
+        \\    }
+        \\
+        \\    pub fn make_pair(self: *Counter, v: Pair) Pair {
+        \\        return .{ v.a + 1, v.b + 2 };
         \\    }
         \\};
     ;

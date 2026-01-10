@@ -394,8 +394,8 @@ pub fn hasBuiltin(self: Dialect, name: []const u8) bool { ... }
 | continue | ✅ | 不支持 label/value |
 | if-else | ✅ | 通过 `iszero` 翻转 |
 | 复杂表达式 | ✅ | 递归翻译算术/调用/访问 |
-| 数组索引 | ✅ | 支持内存数组/切片、结构体数组索引（字段访问通过结构体指针 + stride 计算）；存储数组仍按 slot+index |
-| 结构体字面量 | ✅ | 支持显式类型与上下文推断（如 `const s: T = .{...}`），支持具名/位置字段 |
+| 数组索引 | ✅ | 支持内存数组/切片、结构体数组索引/写入（stride + field offset）；存储数组仍按 slot+index |
+| 结构体字面量 | ✅ | 支持显式类型与上下文推断（var/assign/参数/返回），支持具名/位置字段 |
 
 ### 6.4 ABI 编解码限制
 
