@@ -61,8 +61,10 @@
 2. Added z2y `install`/`info` commands for tool setup checks (including anvil/forge/cast)
 3. Added z2y `build`, `build-abi`, `test`, and `deploy` workflows
 4. Seeded z2y template with zig_to_yul git dependency and evm shim
-5. Implemented block/statement processing and loop handling in the transformer
-6. Fixed struct literal initialization and return-struct ownership in transformer
+5. Restricted SDK exports to the evm module
+6. Added release CI artifacts for zig-to-yul and z2y
+7. Implemented block/statement processing and loop handling in the transformer
+8. Fixed struct literal initialization and return-struct ownership in transformer
 
 #### Test Results
 - Unit tests: `zig build test --summary all`

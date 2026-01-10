@@ -1,39 +1,5 @@
 //! Zig-to-Yul Compiler Library
-//! Public API for compiling Zig smart contracts to Yul.
-
-pub const Compiler = @import("compiler.zig").Compiler;
-
-pub const ast = struct {
-    pub const Parser = @import("ast/parser.zig").Parser;
-};
-
-pub const sema = struct {
-    pub const symbols = @import("sema/symbols.zig");
-    pub const SymbolTable = symbols.SymbolTable;
-    pub const Symbol = symbols.Symbol;
-};
-
-pub const yul = struct {
-    // Legacy IR (to be deprecated)
-    pub const ir = @import("yul/ir.zig");
-    pub const codegen = @import("yul/codegen.zig");
-    pub const Expression = ir.Expression;
-    pub const Statement = ir.Statement;
-    pub const Object = ir.Object;
-    pub const Builder = ir.Builder;
-    pub const CodeGenerator = codegen.CodeGenerator;
-
-    // New AST-based architecture
-    pub const yul_ast = @import("yul/ast.zig");
-    pub const printer = @import("yul/printer.zig");
-    pub const transformer = @import("yul/transformer.zig");
-    pub const gas_estimator = @import("yul/gas_estimator.zig");
-    pub const optimizer = @import("yul/optimizer.zig");
-    pub const AST = yul_ast.AST;
-    pub const AstBuilder = yul_ast.AstBuilder;
-    pub const Printer = printer.Printer;
-    pub const Transformer = transformer.Transformer;
-};
+//! Public SDK surface for Zig contracts.
 
 pub const evm = struct {
     pub const types = @import("evm/types.zig");
@@ -45,6 +11,40 @@ pub const evm = struct {
     pub const EvmType = types.EvmType;
 };
 
+const internal = struct {
+    const Compiler = @import("compiler.zig").Compiler;
+
+    const ast = struct {
+        const Parser = @import("ast/parser.zig").Parser;
+    };
+
+    const sema = struct {
+        const symbols = @import("sema/symbols.zig");
+        const SymbolTable = symbols.SymbolTable;
+        const Symbol = symbols.Symbol;
+    };
+
+    const yul = struct {
+        const ir = @import("yul/ir.zig");
+        const codegen = @import("yul/codegen.zig");
+        const Expression = ir.Expression;
+        const Statement = ir.Statement;
+        const Object = ir.Object;
+        const Builder = ir.Builder;
+        const CodeGenerator = codegen.CodeGenerator;
+
+        const yul_ast = @import("yul/ast.zig");
+        const printer = @import("yul/printer.zig");
+        const transformer = @import("yul/transformer.zig");
+        const gas_estimator = @import("yul/gas_estimator.zig");
+        const optimizer = @import("yul/optimizer.zig");
+        const AST = yul_ast.AST;
+        const AstBuilder = yul_ast.AstBuilder;
+        const Printer = printer.Printer;
+        const Transformer = transformer.Transformer;
+    };
+};
+
 test {
-    @import("std").testing.refAllDecls(@This());
+    @import("std").testing.refAllDecls(internal);
 }

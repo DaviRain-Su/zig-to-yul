@@ -83,6 +83,14 @@ zig-to-yul build -O contract.zig -o contract.bin
 | `version` | Print version information |
 | `help` | Print help message |
 
+### SDK Surface
+
+Only the `evm` module is intended for contract code:
+
+```zig
+const evm = @import("zig_to_yul").evm;
+```
+
 ### Scaffold Project (z2y)
 
 ```bash

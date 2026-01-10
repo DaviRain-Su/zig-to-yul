@@ -195,26 +195,37 @@ jobs:
         run: |
           zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-linux
           tar -czvf zig-to-yul-linux-x86_64.tar.gz -C zig-out/bin zig_to_yul
+          cd tools/z2y
+          zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-linux
+          cd ../..
+          tar -czvf z2y-linux-x86_64.tar.gz -C tools/z2y/zig-out/bin z2y
 
       - name: Build Release (Linux aarch64)
         run: |
           zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-linux
           tar -czvf zig-to-yul-linux-aarch64.tar.gz -C zig-out/bin zig_to_yul
+          cd tools/z2y
+          zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-linux
+          cd ../..
+          tar -czvf z2y-linux-aarch64.tar.gz -C tools/z2y/zig-out/bin z2y
 
       - name: Build Release (macOS x86_64)
         run: |
           zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-macos
           tar -czvf zig-to-yul-macos-x86_64.tar.gz -C zig-out/bin zig_to_yul
+          cd tools/z2y
+          zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-macos
+          cd ../..
+          tar -czvf z2y-macos-x86_64.tar.gz -C tools/z2y/zig-out/bin z2y
 
       - name: Build Release (macOS aarch64)
         run: |
           zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-macos
           tar -czvf zig-to-yul-macos-aarch64.tar.gz -C zig-out/bin zig_to_yul
-
-      - name: Build Release (Windows x86_64)
-        run: |
-          zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-windows
-          zip -j zig-to-yul-windows-x86_64.zip zig-out/bin/zig_to_yul.exe
+          cd tools/z2y
+          zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-macos
+          cd ../..
+          tar -czvf z2y-macos-aarch64.tar.gz -C tools/z2y/zig-out/bin z2y
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
@@ -224,7 +235,10 @@ jobs:
             zig-to-yul-linux-aarch64.tar.gz
             zig-to-yul-macos-x86_64.tar.gz
             zig-to-yul-macos-aarch64.tar.gz
-            zig-to-yul-windows-x86_64.zip
+            z2y-linux-x86_64.tar.gz
+            z2y-linux-aarch64.tar.gz
+            z2y-macos-x86_64.tar.gz
+            z2y-macos-aarch64.tar.gz
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
