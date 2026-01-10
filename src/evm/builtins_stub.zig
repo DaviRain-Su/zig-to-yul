@@ -120,6 +120,8 @@ pub fn gas_stipend_no_grief() U256 {
     return 100000;
 }
 
+pub fn erc20_check_success(_: U256) void {}
+
 // Execution context
 pub fn caller() Address {
     return 0;

@@ -1890,6 +1890,13 @@ pub const Transformer = struct {
                 }
                 return ast.Expression.lit(ast.Literal.number(100000));
             }
+            if (std.mem.eql(u8, builtin_name, "erc20_check_success")) {
+                if (args.items.len != 1) {
+                    try self.addError("erc20_check_success expects 1 argument", self.nodeLocation(call_info.ast.fn_expr), .unsupported_feature);
+                }
+                const helper = try self.ensureErc20CheckHelper();
+                return try self.builder.call(helper, args.items);
+            }
         }
 
         // Regular function call
@@ -2018,6 +2025,37 @@ pub const Transformer = struct {
 
         const body = try self.builder.block(stmts.items);
         const func = try self.builder.funcDef(helper_name, &.{"x"}, &.{"r"}, body);
+        try self.extra_functions.append(self.allocator, func);
+
+        return helper_name;
+    }
+
+    fn ensureErc20CheckHelper(self: *Self) ![]const u8 {
+        const key_name = "erc20_check_success";
+        if (self.math_helpers.get(key_name)) |helper| return helper;
+
+        const helper_name = try std.fmt.allocPrint(self.allocator, "__zig2yul$erc20_check_success", .{});
+        const key = try self.allocator.dupe(u8, key_name);
+        try self.math_helpers.put(key, helper_name);
+
+        var stmts: std.ArrayList(ast.Statement) = .empty;
+        defer stmts.deinit(self.allocator);
+
+        const load_expr = try self.builder.builtinCall("mload", &.{ast.Expression.lit(ast.Literal.number(0))});
+        const eq_expr = try self.builder.builtinCall("eq", &.{ load_expr, ast.Expression.lit(ast.Literal.number(1)) });
+        const and_expr = try self.builder.builtinCall("and", &.{ eq_expr, ast.Expression.id("success") });
+        const cond = try self.builder.builtinCall("iszero", &.{and_expr});
+        const revert_expr = try self.builder.builtinCall("revert", &.{
+            ast.Expression.lit(ast.Literal.number(0)),
+            ast.Expression.lit(ast.Literal.number(0)),
+        });
+        const revert_stmt = ast.Statement.expr(revert_expr);
+        const revert_block = try self.builder.block(&.{revert_stmt});
+        const if_stmt = self.builder.ifStmt(cond, revert_block);
+        try stmts.append(self.allocator, if_stmt);
+
+        const body = try self.builder.block(stmts.items);
+        const func = try self.builder.funcDef(helper_name, &.{"success"}, &.{}, body);
         try self.extra_functions.append(self.allocator, func);
 
         return helper_name;
@@ -3688,6 +3726,34 @@ test "gas stipend constants" {
 
     try std.testing.expect(std.mem.indexOf(u8, output, "2300") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "100000") != null);
+}
+
+test "erc20 return check helper" {
+    const allocator = std.testing.allocator;
+    const printer = @import("printer.zig");
+
+    const source =
+        \\pub const Token = struct {
+        \\    pub fn check(self: *Token, success: u256) void {
+        \\        _ = self;
+        \\        evm.erc20_check_success(success);
+        \\    }
+        \\};
+    ;
+
+    const source_z = try allocator.dupeZ(u8, source);
+    defer allocator.free(source_z);
+
+    var transformer = Transformer.init(allocator);
+    defer transformer.deinit();
+
+    const yul_ast = try transformer.transform(source_z);
+    const output = try printer.format(allocator, yul_ast);
+    defer allocator.free(output);
+
+    try std.testing.expect(std.mem.indexOf(u8, output, "__zig2yul$erc20_check_success") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "revert(0, 0)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "mload(0)") != null);
 }
 
 test "dispatcher with parameterized function" {
