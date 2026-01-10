@@ -66,6 +66,7 @@ pub const Optimizer = struct {
         return switch (stmt) {
             .expression_statement => |s| blk: {
                 const expr = try self.optimizeExpression(s.expression);
+                if (isNoOpExpression(expr)) break :blk null;
                 var out = s;
                 out.expression = expr;
                 break :blk ast.Statement{ .expression_statement = out };
@@ -120,6 +121,9 @@ pub const Optimizer = struct {
                 out.condition = try self.optimizeExpression(s.condition);
                 out.post = try self.optimizeBlock(s.post);
                 out.body = try self.optimizeBlock(s.body);
+                if (literalBoolValue(out.condition)) |is_true| {
+                    if (!is_true) break :blk ast.Statement{ .block = out.pre };
+                }
                 break :blk ast.Statement{ .for_loop = out };
             },
             .function_definition => |s| blk: {
@@ -187,6 +191,7 @@ pub const Optimizer = struct {
 
         if (std.mem.eql(u8, name, "sub") and args.len == 2) {
             if (isZero(args[1])) return args[0];
+            if (exprEqualsSimple(args[0], args[1])) return makeLiteralNumber(0);
             if (literalU256(args[0])) |a| {
                 if (literalU256(args[1])) |b| {
                     return makeLiteralNumber(a -% b);
@@ -207,6 +212,7 @@ pub const Optimizer = struct {
 
         if (std.mem.eql(u8, name, "and") and args.len == 2) {
             if (isZero(args[0]) or isZero(args[1])) return makeLiteral(false);
+            if (exprEqualsSimple(args[0], args[1])) return args[0];
             if (literalU256(args[0])) |a| {
                 if (literalU256(args[1])) |b| {
                     return makeLiteralNumber(a & b);
@@ -217,6 +223,7 @@ pub const Optimizer = struct {
         if (std.mem.eql(u8, name, "or") and args.len == 2) {
             if (isZero(args[0])) return args[1];
             if (isZero(args[1])) return args[0];
+            if (exprEqualsSimple(args[0], args[1])) return args[0];
             if (literalU256(args[0])) |a| {
                 if (literalU256(args[1])) |b| {
                     return makeLiteralNumber(a | b);
@@ -227,6 +234,7 @@ pub const Optimizer = struct {
         if (std.mem.eql(u8, name, "xor") and args.len == 2) {
             if (isZero(args[0])) return args[1];
             if (isZero(args[1])) return args[0];
+            if (exprEqualsSimple(args[0], args[1])) return makeLiteralNumber(0);
             if (literalU256(args[0])) |a| {
                 if (literalU256(args[1])) |b| {
                     return makeLiteralNumber(a ^ b);
@@ -235,9 +243,64 @@ pub const Optimizer = struct {
         }
 
         if (std.mem.eql(u8, name, "eq") and args.len == 2) {
+            if (exprEqualsSimple(args[0], args[1])) return makeLiteral(true);
             if (literalU256(args[0])) |a| {
                 if (literalU256(args[1])) |b| {
                     return makeLiteral(a == b);
+                }
+            }
+        }
+
+        if (std.mem.eql(u8, name, "lt") and args.len == 2) {
+            if (literalU256(args[0])) |a| {
+                if (literalU256(args[1])) |b| {
+                    return makeLiteral(a < b);
+                }
+            }
+        }
+
+        if (std.mem.eql(u8, name, "gt") and args.len == 2) {
+            if (literalU256(args[0])) |a| {
+                if (literalU256(args[1])) |b| {
+                    return makeLiteral(a > b);
+                }
+            }
+        }
+
+        if (std.mem.eql(u8, name, "div") and args.len == 2) {
+            if (isZero(args[0])) return makeLiteralNumber(0);
+            if (isOne(args[1])) return args[0];
+            if (isZero(args[1])) return makeLiteralNumber(0);
+            if (literalU256(args[0])) |a| {
+                if (literalU256(args[1])) |b| {
+                    return makeLiteralNumber(a / b);
+                }
+            }
+        }
+
+        if (std.mem.eql(u8, name, "mod") and args.len == 2) {
+            if (isZero(args[0])) return makeLiteralNumber(0);
+            if (isOne(args[1]) or isZero(args[1])) return makeLiteralNumber(0);
+            if (literalU256(args[0])) |a| {
+                if (literalU256(args[1])) |b| {
+                    return makeLiteralNumber(a % b);
+                }
+            }
+        }
+
+        if (std.mem.eql(u8, name, "not") and args.len == 1) {
+            if (literalU256(args[0])) |a| {
+                return makeLiteralNumber(~a);
+            }
+        }
+
+        if ((std.mem.eql(u8, name, "shl") or std.mem.eql(u8, name, "shr")) and args.len == 2) {
+            if (literalU256(args[0])) |shift| {
+                if (literalU256(args[1])) |value| {
+                    if (shift >= 256) return makeLiteralNumber(0);
+                    const sh: u8 = @intCast(shift);
+                    const result = if (std.mem.eql(u8, name, "shl")) value << sh else value >> sh;
+                    return makeLiteralNumber(result);
                 }
             }
         }
@@ -288,6 +351,26 @@ fn isIsZero(expr: ast.Expression) ?ast.Expression {
         }
     }
     return null;
+}
+
+fn isNoOpExpression(expr: ast.Expression) bool {
+    return expr == .literal or expr == .identifier;
+}
+
+fn exprEqualsSimple(a: ast.Expression, b: ast.Expression) bool {
+    if (a == .identifier and b == .identifier) {
+        return std.mem.eql(u8, a.identifier.name, b.identifier.name);
+    }
+    if (a == .literal and b == .literal) {
+        if (a.literal.kind != b.literal.kind) return false;
+        return switch (a.literal.kind) {
+            .number => a.literal.value.number == b.literal.value.number,
+            .hex_number => a.literal.value.hex_number == b.literal.value.hex_number,
+            .boolean => a.literal.value.boolean == b.literal.value.boolean,
+            .string => std.mem.eql(u8, a.literal.value.string, b.literal.value.string),
+        };
+    }
+    return false;
 }
 
 fn makeLiteral(value: bool) ast.Expression {
@@ -345,4 +428,48 @@ test "drop if false" {
     defer opt.deinit();
     const optimized = try opt.optimize(root);
     try std.testing.expectEqual(@as(usize, 0), optimized.root.code.statements.len);
+}
+
+test "drop no-op expression statements" {
+    const allocator = std.testing.allocator;
+    const stmts = [_]ast.Statement{
+        ast.Statement.expr(ast.Expression.lit(ast.Literal.number(1))),
+        ast.Statement.expr(ast.Expression.id("x")),
+    };
+    const code_block = ast.Block.init(&stmts);
+    const obj = ast.Object.init("Opt", code_block, &.{}, &.{});
+    const root = ast.AST.init(obj);
+
+    var opt = Optimizer.init(allocator);
+    defer opt.deinit();
+    const optimized = try opt.optimize(root);
+    try std.testing.expectEqual(@as(usize, 0), optimized.root.code.statements.len);
+}
+
+test "drop for loop with false condition" {
+    const allocator = std.testing.allocator;
+    var builder = ast.AstBuilder.init(allocator);
+    defer builder.deinit();
+
+    const pre_stmt = ast.Statement.varDecl(&.{ast.TypedName.init("x")}, ast.Expression.lit(ast.Literal.number(1)));
+    const pre_block = ast.Block.init(try builder.dupeStatements(&.{pre_stmt}));
+    const post_block = ast.Block.init(&.{});
+    const body_block = ast.Block.init(&.{
+        ast.Statement.expr(ast.Expression.id("x")),
+    });
+    const loop_stmt = ast.Statement.forStmt(
+        pre_block,
+        ast.Expression.lit(ast.Literal.boolean(false)),
+        post_block,
+        body_block,
+    );
+    const code_block = ast.Block.init(try builder.dupeStatements(&.{loop_stmt}));
+    const obj = ast.Object.init("Opt", code_block, &.{}, &.{});
+    const root = ast.AST.init(obj);
+
+    var opt = Optimizer.init(allocator);
+    defer opt.deinit();
+    const optimized = try opt.optimize(root);
+    try std.testing.expectEqual(@as(usize, 1), optimized.root.code.statements.len);
+    try std.testing.expect(optimized.root.code.statements[0] == .block);
 }
