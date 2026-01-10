@@ -85,7 +85,7 @@ zig-to-yul build -O contract.zig -o contract.bin
 
 ### SDK Surface
 
-Only the `evm` module is intended for contract code:
+Only the `evm` module is intended for contract code (other modules are internal and not stable):
 
 ```zig
 const evm = @import("zig_to_yul").evm;
