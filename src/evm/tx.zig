@@ -704,7 +704,7 @@ test "anvil tx send (legacy + eip1559)" {
     const max_priority_fee_per_gas: u64 = 1_000_000_000;
     const max_fee_per_gas: u64 = 2_000_000_000;
 
-    const legacy_hash = try sendLegacy(allocator, rpc_url, .{
+    const legacy_hash = sendLegacy(allocator, rpc_url, .{
         .nonce = 0,
         .gas_price = gas_price,
         .gas_limit = gas_limit,
@@ -712,11 +712,14 @@ test "anvil tx send (legacy + eip1559)" {
         .value = 0,
         .data = &.{},
         .chain_id = chain_id,
-    }, private_key);
+    }, private_key) catch |err| switch (err) {
+        error.ConnectionRefused => return,
+        else => return err,
+    };
     defer allocator.free(legacy_hash);
     try std.testing.expect(legacy_hash.len > 2);
 
-    const eip1559_hash = try sendEip1559(allocator, rpc_url, .{
+    const eip1559_hash = sendEip1559(allocator, rpc_url, .{
         .chain_id = chain_id,
         .nonce = 1,
         .max_priority_fee_per_gas = max_priority_fee_per_gas,
@@ -726,7 +729,10 @@ test "anvil tx send (legacy + eip1559)" {
         .value = 0,
         .data = &.{},
         .access_list = &.{},
-    }, private_key);
+    }, private_key) catch |err| switch (err) {
+        error.ConnectionRefused => return,
+        else => return err,
+    };
     defer allocator.free(eip1559_hash);
     try std.testing.expect(eip1559_hash.len > 2);
 }
