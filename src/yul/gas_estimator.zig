@@ -185,6 +185,31 @@ pub fn parseSwitchOverridesJson(allocator: std.mem.Allocator, json: []const u8) 
     return out;
 }
 
+pub fn parseLoopOverridesJson(allocator: std.mem.Allocator, json: []const u8) ![]LoopOverride {
+    const OverridesJson = struct {
+        items: []const OverrideJson,
+
+        const OverrideJson = struct {
+            start: u32,
+            end: u32,
+            iterations: u64,
+        };
+    };
+
+    const parsed = try std.json.parseFromSlice(OverridesJson, allocator, json, .{});
+    defer parsed.deinit();
+
+    var out = try allocator.alloc(LoopOverride, parsed.value.items.len);
+    for (parsed.value.items, 0..) |item, i| {
+        out[i] = .{
+            .start = item.start,
+            .end = item.end,
+            .iterations = item.iterations,
+        };
+    }
+    return out;
+}
+
 pub const EstimateOptions = struct {
     access_list: AccessList = .{},
     assume_words: u64 = 1,
@@ -202,6 +227,7 @@ pub const EstimateOptions = struct {
     switch_mode: SwitchMode = .worst_case,
     branch_overrides: []const BranchOverride = &.{},
     switch_overrides: []const SwitchOverride = &.{},
+    loop_overrides: []const LoopOverride = &.{},
 };
 
 pub const BranchMode = enum {
@@ -236,6 +262,12 @@ pub const SwitchOverride = struct {
     prob: ?f64 = null,
     weight_num: u64 = 1,
     weight_den: u64 = 2,
+};
+
+pub const LoopOverride = struct {
+    start: u32,
+    end: u32,
+    iterations: u64,
 };
 
 pub fn optionsForVersion(version: ast.EvmVersion) EstimateOptions {
@@ -418,9 +450,10 @@ fn visitStatement(stmt: ast.Statement, out: *GasEstimate, ctx: *EstimatorContext
             if (cond_value == false) return;
             visitBlock(s.body, out, ctx);
             visitBlock(s.post, out, ctx);
-            const inferred = inferLoopIterations(s.pre, s.condition, s.post);
-            const total_iters = inferred orelse ctx.opts.loop_iterations;
-            if (inferred == null and total_iters > 1) {
+            const override_iters = resolveLoopOverride(ctx.opts, s.location);
+            const inferred = if (override_iters == null) inferLoopIterations(s.pre, s.condition, s.post) else null;
+            const total_iters = override_iters orelse inferred orelse ctx.opts.loop_iterations;
+            if (override_iters == null and inferred == null and total_iters > 1) {
                 out.assumed_loop_iterations += total_iters - 1;
             }
             if (total_iters > 1) {
@@ -1190,6 +1223,16 @@ fn resolveSwitchOverride(opts: EstimateOptions, loc: ast.SourceLocation) Estimat
     return opts;
 }
 
+fn resolveLoopOverride(opts: EstimateOptions, loc: ast.SourceLocation) ?u64 {
+    if (loc.start == 0 and loc.end == 0) return null;
+    for (opts.loop_overrides) |override| {
+        if (override.start == loc.start and override.end == loc.end) {
+            return override.iterations;
+        }
+    }
+    return null;
+}
+
 test "estimate basic gas" {
     const code_block = ast.Block.init(&.{
         ast.Statement.expr(ast.Expression.builtinCall("add", &.{
@@ -1414,6 +1457,53 @@ test "estimate branch override" {
     const opts: EstimateOptions = .{ .branch_overrides = &overrides };
     const result = estimateWithOptions(root, opts);
     try std.testing.expectEqual(@as(u32, 0), result.cold_storage_accesses);
+}
+
+test "parse loop overrides json" {
+    const allocator = std.testing.allocator;
+    const input =
+        \\{ "items": [
+        \\  { "start": 3, "end": 4, "iterations": 10 }
+        \\] }
+    ;
+
+    const overrides = try parseLoopOverridesJson(allocator, input);
+    defer allocator.free(overrides);
+
+    try std.testing.expectEqual(@as(usize, 1), overrides.len);
+    try std.testing.expectEqual(@as(u32, 3), overrides[0].start);
+    try std.testing.expectEqual(@as(u32, 4), overrides[0].end);
+    try std.testing.expectEqual(@as(u64, 10), overrides[0].iterations);
+}
+
+test "estimate loop override" {
+    var loop = ast.ForLoop.init(
+        ast.Block.init(&.{
+            ast.Statement.varDecl(&.{ast.TypedName.init("i")}, ast.Expression.lit(ast.Literal.number(0))),
+        }),
+        ast.Expression.id("cond"),
+        ast.Block.init(&.{
+            ast.Statement.assign(&.{ast.Identifier.init("i")}, ast.Expression.builtinCall("add", &.{
+                ast.Expression.id("i"),
+                ast.Expression.lit(ast.Literal.number(1)),
+            })),
+        }),
+        ast.Block.init(&.{
+            ast.Statement.expr(ast.Expression.builtinCall("sload", &.{
+                ast.Expression.lit(ast.Literal.number(0)),
+            })),
+        }),
+    );
+    loop.location = .{ .start = 5, .end = 6 };
+
+    const code_block = ast.Block.init(&.{ast.Statement{ .for_loop = loop }});
+    const obj = ast.Object.init("Gas", code_block, &.{}, &.{});
+    const root = ast.AST.init(obj);
+
+    const overrides = [_]LoopOverride{.{ .start = 5, .end = 6, .iterations = 3 }};
+    const opts: EstimateOptions = .{ .loop_overrides = &overrides };
+    const result = estimateWithOptions(root, opts);
+    try std.testing.expectEqual(@as(u64, 0), result.assumed_loop_iterations);
 }
 
 test "estimate switch worst case" {

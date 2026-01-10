@@ -1,6 +1,6 @@
 • 目前的 TODO 清单（汇总自 docs/libyul-comparison.md 的未完成/部分实现项）：
 
--  Gas 估算仍缺完整动态因素（动态路径执行次数精确建模）（5.3）
+-  Gas 估算仍缺完整动态因素（动态路径执行次数精确建模已部分完成，仍需基于运行时 profile）（5.3）
 - EOF Prague 指令未实现（5.1）
 - abi-export for front to call by api
 - compare with https://github.com/Vectorized/solady to optimize
