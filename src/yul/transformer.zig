@@ -1878,6 +1878,18 @@ pub const Transformer = struct {
                 const helper = try self.ensureFfsHelper();
                 return try self.builder.call(helper, args.items);
             }
+            if (std.mem.eql(u8, builtin_name, "gas_stipend_no_storage")) {
+                if (args.items.len != 0) {
+                    try self.addError("gas_stipend_no_storage expects 0 arguments", self.nodeLocation(call_info.ast.fn_expr), .unsupported_feature);
+                }
+                return ast.Expression.lit(ast.Literal.number(2300));
+            }
+            if (std.mem.eql(u8, builtin_name, "gas_stipend_no_grief")) {
+                if (args.items.len != 0) {
+                    try self.addError("gas_stipend_no_grief expects 0 arguments", self.nodeLocation(call_info.ast.fn_expr), .unsupported_feature);
+                }
+                return ast.Expression.lit(ast.Literal.number(100000));
+            }
         }
 
         // Regular function call
@@ -3649,6 +3661,33 @@ test "ffs helper" {
     try std.testing.expect(std.mem.indexOf(u8, output, "sub(0, x)") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "mul") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "shr(250") != null);
+}
+
+test "gas stipend constants" {
+    const allocator = std.testing.allocator;
+    const printer = @import("printer.zig");
+
+    const source =
+        \\pub const Counter = struct {
+        \\    pub fn gas(self: *Counter) u256 {
+        \\        _ = self;
+        \\        return evm.gas_stipend_no_storage() + evm.gas_stipend_no_grief();
+        \\    }
+        \\};
+    ;
+
+    const source_z = try allocator.dupeZ(u8, source);
+    defer allocator.free(source_z);
+
+    var transformer = Transformer.init(allocator);
+    defer transformer.deinit();
+
+    const yul_ast = try transformer.transform(source_z);
+    const output = try printer.format(allocator, yul_ast);
+    defer allocator.free(output);
+
+    try std.testing.expect(std.mem.indexOf(u8, output, "2300") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "100000") != null);
 }
 
 test "dispatcher with parameterized function" {

@@ -112,6 +112,14 @@ pub fn ffs(_: U256) U256 {
     return 0;
 }
 
+pub fn gas_stipend_no_storage() U256 {
+    return 2300;
+}
+
+pub fn gas_stipend_no_grief() U256 {
+    return 100000;
+}
+
 // Execution context
 pub fn caller() Address {
     return 0;
