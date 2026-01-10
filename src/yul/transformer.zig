@@ -3445,6 +3445,59 @@ test "packed storage generates masked sload" {
     try std.testing.expect(std.mem.indexOf(u8, output, "and") != null);
 }
 
+test "transient storage builtins" {
+    const allocator = std.testing.allocator;
+    const printer = @import("printer.zig");
+
+    const source =
+        \\pub const Counter = struct {
+        \\    value: u256,
+        \\
+        \\    pub fn set(self: *Counter, x: u256) u256 {
+        \\        _ = evm.tstore(0x00, x);
+        \\        return evm.tload(0x00);
+        \\    }
+        \\};
+    ;
+
+    const source_z = try allocator.dupeZ(u8, source);
+    defer allocator.free(source_z);
+
+    var transformer = Transformer.init(allocator);
+    defer transformer.deinit();
+
+    const yul_ast = try transformer.transform(source_z);
+    const output = try printer.format(allocator, yul_ast);
+    defer allocator.free(output);
+
+    try std.testing.expect(std.mem.indexOf(u8, output, "tstore") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "tload") != null);
+}
+
+test "transient storage requires cancun" {
+    const allocator = std.testing.allocator;
+
+    const source =
+        \\pub const Counter = struct {
+        \\    value: u256,
+        \\
+        \\    pub fn set(self: *Counter, x: u256) u256 {
+        \\        _ = evm.tstore(0x00, x);
+        \\        return evm.tload(0x00);
+        \\    }
+        \\};
+    ;
+
+    const source_z = try allocator.dupeZ(u8, source);
+    defer allocator.free(source_z);
+
+    var transformer = Transformer.init(allocator);
+    defer transformer.deinit();
+    transformer.dialect = ast.Dialect.forVersion(.shanghai);
+
+    try std.testing.expectError(error.TransformError, transformer.transform(source_z));
+}
+
 test "dispatcher with parameterized function" {
     const allocator = std.testing.allocator;
     const printer = @import("printer.zig");
