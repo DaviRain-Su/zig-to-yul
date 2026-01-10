@@ -97,6 +97,9 @@ pub const Optimizer = struct {
             if (try self.mergeErc20CallLayout(combined.items, &j, &merged)) {
                 continue;
             }
+            if (try self.mergeSloadSequence(combined.items, &j, &merged)) {
+                continue;
+            }
             try merged.append(self.allocator, combined.items[j]);
             j += 1;
         }
@@ -512,6 +515,41 @@ pub const Optimizer = struct {
         kind: CallStmtKind,
     };
 
+    fn mergeSloadSequence(
+        self: *Optimizer,
+        stmts: []const ast.Statement,
+        index: *usize,
+        out: *std.ArrayList(ast.Statement),
+    ) Error!bool {
+        const slot = firstSloadSlot(stmts[index.*]) orelse return false;
+        if (!isSimpleStmt(stmts[index.*])) return false;
+
+        var end = index.*;
+        var hits: usize = 0;
+        while (end < stmts.len) : (end += 1) {
+            if (!isSimpleStmt(stmts[end])) break;
+            if (containsSstore(stmts[end], slot)) break;
+            if (containsSload(stmts[end], slot)) {
+                hits += 1;
+            }
+        }
+
+        if (hits < 2) return false;
+
+        const temp_name = try self.makeTemp("slot_load");
+        const sload_expr = try self.builder.builtinCall("sload", &.{slot});
+        try out.append(self.allocator, try self.builder.varDecl(&.{temp_name}, sload_expr));
+
+        var k = index.*;
+        while (k < end) : (k += 1) {
+            const replaced = try self.replaceSloadInStmt(stmts[k], slot, temp_name);
+            try out.append(self.allocator, replaced);
+        }
+
+        index.* = end;
+        return true;
+    }
+
     const CallStmtKind = enum { expr, assign, var_decl };
 
     fn parseCallStatement(stmt: ast.Statement) ?CallStmt {
@@ -584,6 +622,166 @@ pub const Optimizer = struct {
         if (shift != 224) return null;
         const selector = literalU256(call.arguments[1]) orelse return null;
         return selector;
+    }
+
+    fn isSimpleStmt(stmt: ast.Statement) bool {
+        return stmt == .expression_statement or stmt == .assignment or stmt == .variable_declaration;
+    }
+
+    fn replaceSloadInStmt(
+        self: *Optimizer,
+        stmt: ast.Statement,
+        slot: ast.Expression,
+        temp_name: []const u8,
+    ) Error!ast.Statement {
+        return switch (stmt) {
+            .expression_statement => |s| blk: {
+                var out = s;
+                out.expression = try self.replaceSloadInExpr(s.expression, slot, temp_name);
+                break :blk ast.Statement{ .expression_statement = out };
+            },
+            .assignment => |s| blk: {
+                var out = s;
+                out.value = try self.replaceSloadInExpr(s.value, slot, temp_name);
+                out.variable_names = try self.builder.dupeIdentifiers(s.variable_names);
+                break :blk ast.Statement{ .assignment = out };
+            },
+            .variable_declaration => |s| blk: {
+                var out = s;
+                if (s.value) |val| {
+                    out.value = try self.replaceSloadInExpr(val, slot, temp_name);
+                }
+                out.variables = try self.builder.dupeTypedNames(s.variables);
+                break :blk ast.Statement{ .variable_declaration = out };
+            },
+            else => stmt,
+        };
+    }
+
+    fn replaceSloadInExpr(
+        self: *Optimizer,
+        expr: ast.Expression,
+        slot: ast.Expression,
+        temp_name: []const u8,
+    ) Error!ast.Expression {
+        if (expr == .builtin_call) {
+            const call = expr.builtin_call;
+            if (std.mem.eql(u8, call.builtin_name.name, "sload") and call.arguments.len == 1) {
+                if (exprEqualsSimple(call.arguments[0], slot)) {
+                    return ast.Expression.id(temp_name);
+                }
+            }
+            var args = std.ArrayList(ast.Expression).empty;
+            defer args.deinit(self.allocator);
+            for (call.arguments) |arg| {
+                try args.append(self.allocator, try self.replaceSloadInExpr(arg, slot, temp_name));
+            }
+            var out = call;
+            out.arguments = try self.builder.dupeExpressions(args.items);
+            return ast.Expression{ .builtin_call = out };
+        }
+        if (expr == .function_call) {
+            const call = expr.function_call;
+            var args = std.ArrayList(ast.Expression).empty;
+            defer args.deinit(self.allocator);
+            for (call.arguments) |arg| {
+                try args.append(self.allocator, try self.replaceSloadInExpr(arg, slot, temp_name));
+            }
+            var out = call;
+            out.arguments = try self.builder.dupeExpressions(args.items);
+            return ast.Expression{ .function_call = out };
+        }
+        return expr;
+    }
+
+    fn firstSloadSlot(stmt: ast.Statement) ?ast.Expression {
+        return switch (stmt) {
+            .expression_statement => |s| firstSloadSlotExpr(s.expression),
+            .assignment => |s| firstSloadSlotExpr(s.value),
+            .variable_declaration => |s| blk: {
+                if (s.value) |val| break :blk firstSloadSlotExpr(val);
+                break :blk null;
+            },
+            else => null,
+        };
+    }
+
+    fn firstSloadSlotExpr(expr: ast.Expression) ?ast.Expression {
+        if (expr == .builtin_call) {
+            const call = expr.builtin_call;
+            if (std.mem.eql(u8, call.builtin_name.name, "sload") and call.arguments.len == 1) {
+                return call.arguments[0];
+            }
+            for (call.arguments) |arg| {
+                if (firstSloadSlotExpr(arg)) |slot| return slot;
+            }
+        } else if (expr == .function_call) {
+            const call = expr.function_call;
+            for (call.arguments) |arg| {
+                if (firstSloadSlotExpr(arg)) |slot| return slot;
+            }
+        }
+        return null;
+    }
+
+    fn containsSload(stmt: ast.Statement, slot: ast.Expression) bool {
+        return switch (stmt) {
+            .expression_statement => |s| containsSloadExpr(s.expression, slot),
+            .assignment => |s| containsSloadExpr(s.value, slot),
+            .variable_declaration => |s| blk: {
+                if (s.value) |val| break :blk containsSloadExpr(val, slot);
+                break :blk false;
+            },
+            else => false,
+        };
+    }
+
+    fn containsSloadExpr(expr: ast.Expression, slot: ast.Expression) bool {
+        if (expr == .builtin_call) {
+            const call = expr.builtin_call;
+            if (std.mem.eql(u8, call.builtin_name.name, "sload") and call.arguments.len == 1) {
+                return exprEqualsSimple(call.arguments[0], slot);
+            }
+            for (call.arguments) |arg| {
+                if (containsSloadExpr(arg, slot)) return true;
+            }
+        } else if (expr == .function_call) {
+            const call = expr.function_call;
+            for (call.arguments) |arg| {
+                if (containsSloadExpr(arg, slot)) return true;
+            }
+        }
+        return false;
+    }
+
+    fn containsSstore(stmt: ast.Statement, slot: ast.Expression) bool {
+        return switch (stmt) {
+            .expression_statement => |s| containsSstoreExpr(s.expression, slot),
+            .assignment => |s| containsSstoreExpr(s.value, slot),
+            .variable_declaration => |s| blk: {
+                if (s.value) |val| break :blk containsSstoreExpr(val, slot);
+                break :blk false;
+            },
+            else => false,
+        };
+    }
+
+    fn containsSstoreExpr(expr: ast.Expression, slot: ast.Expression) bool {
+        if (expr == .builtin_call) {
+            const call = expr.builtin_call;
+            if (std.mem.eql(u8, call.builtin_name.name, "sstore") and call.arguments.len == 2) {
+                return exprEqualsSimple(call.arguments[0], slot);
+            }
+            for (call.arguments) |arg| {
+                if (containsSstoreExpr(arg, slot)) return true;
+            }
+        } else if (expr == .function_call) {
+            const call = expr.function_call;
+            for (call.arguments) |arg| {
+                if (containsSstoreExpr(arg, slot)) return true;
+            }
+        }
+        return false;
     }
 
     fn ensureAddressWord(self: *Optimizer, expr: ast.Expression) Error!ast.Expression {
@@ -1248,6 +1446,38 @@ test "optimize erc20 transferfrom layout" {
     try std.testing.expect(call_expr_out == .builtin_call);
     try std.testing.expectEqualStrings("call", call_expr_out.builtin_call.builtin_name.name);
     try std.testing.expectEqual(@as(ast.U256, 0x1c), call_expr_out.builtin_call.arguments[3].literal.value.number);
+}
+
+test "cache sload across statements" {
+    const allocator = std.testing.allocator;
+    var builder = ast.AstBuilder.init(allocator);
+    defer builder.deinit();
+
+    const slot = ast.Expression.lit(ast.Literal.number(0));
+    const load0 = ast.Expression.builtinCall("sload", &.{slot});
+    const expr1 = ast.Expression.builtinCall("and", &.{ load0, ast.Expression.lit(ast.Literal.number(0xff)) });
+    const decl1 = try builder.varDecl(&.{"a"}, expr1);
+
+    const load1 = ast.Expression.builtinCall("sload", &.{slot});
+    const shr = ast.Expression.builtinCall("shr", &.{ ast.Expression.lit(ast.Literal.number(8)), load1 });
+    const expr2 = ast.Expression.builtinCall("and", &.{ shr, ast.Expression.lit(ast.Literal.number(0xff)) });
+    const decl2 = try builder.varDecl(&.{"b"}, expr2);
+
+    const code_block = ast.Block.init(try builder.dupeStatements(&.{ decl1, decl2 }));
+    const obj = ast.Object.init("Opt", code_block, &.{}, &.{});
+    const root = ast.AST.init(obj);
+
+    var opt = Optimizer.init(allocator);
+    defer opt.deinit();
+    const optimized = try opt.optimize(root);
+    try std.testing.expectEqual(@as(usize, 3), optimized.root.code.statements.len);
+
+    const first = optimized.root.code.statements[0];
+    try std.testing.expect(first == .variable_declaration);
+    try std.testing.expect(Optimizer.containsSload(first, slot));
+
+    try std.testing.expect(!Optimizer.containsSload(optimized.root.code.statements[1], slot));
+    try std.testing.expect(!Optimizer.containsSload(optimized.root.code.statements[2], slot));
 }
 
 test "merge packed sstore sequence" {
