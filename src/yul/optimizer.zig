@@ -175,6 +175,9 @@ pub const Optimizer = struct {
                 if (literalBoolValue(out.condition)) |is_true| {
                     if (!is_true) break :blk ast.Statement{ .block = out.pre };
                 }
+                if (try self.unrollForLoop(out)) |unrolled| {
+                    break :blk unrolled;
+                }
                 break :blk ast.Statement{ .for_loop = out };
             },
             .function_definition => |s| blk: {
@@ -326,6 +329,131 @@ pub const Optimizer = struct {
             },
             else => expr,
         };
+    }
+
+    fn unrollForLoop(self: *Optimizer, loop: ast.ForLoop) Error!?ast.Statement {
+        if (loop.pre.statements.len != 1) return null;
+        const init_stmt = loop.pre.statements[0];
+        if (init_stmt != .variable_declaration) return null;
+        const init_decl = init_stmt.variable_declaration;
+        if (init_decl.variables.len != 1) return null;
+        const counter_name = init_decl.variables[0].name;
+        const init_val = init_decl.value orelse return null;
+        const init_literal = literalU256(init_val) orelse return null;
+        if (init_literal != 0) return null;
+
+        if (loop.post.statements.len != 1) return null;
+        const post_stmt = loop.post.statements[0];
+        if (post_stmt != .assignment) return null;
+        const post_assign = post_stmt.assignment;
+        if (post_assign.variable_names.len != 1) return null;
+        if (!std.mem.eql(u8, post_assign.variable_names[0].name, counter_name)) return null;
+        if (post_assign.value != .builtin_call) return null;
+        const post_call = post_assign.value.builtin_call;
+        if (!std.mem.eql(u8, post_call.builtin_name.name, "add")) return null;
+        if (post_call.arguments.len != 2) return null;
+        if (!exprEqualsSimple(post_call.arguments[0], ast.Expression.id(counter_name)) and
+            !exprEqualsSimple(post_call.arguments[1], ast.Expression.id(counter_name))) return null;
+        const other_arg = if (exprEqualsSimple(post_call.arguments[0], ast.Expression.id(counter_name)))
+            post_call.arguments[1]
+        else
+            post_call.arguments[0];
+        const step_literal = literalU256(other_arg) orelse return null;
+        if (step_literal != 1) return null;
+
+        if (loop.condition != .builtin_call) return null;
+        const cond_call = loop.condition.builtin_call;
+        if (!std.mem.eql(u8, cond_call.builtin_name.name, "lt")) return null;
+        if (cond_call.arguments.len != 2) return null;
+        if (!exprEqualsSimple(cond_call.arguments[0], ast.Expression.id(counter_name))) return null;
+        const limit_literal = literalU256(cond_call.arguments[1]) orelse return null;
+        if (limit_literal > 8) return null;
+
+        for (loop.body.statements) |stmt| {
+            if (stmt != .expression_statement and stmt != .assignment and stmt != .variable_declaration) return null;
+        }
+
+        var out_stmts = std.ArrayList(ast.Statement).empty;
+        defer out_stmts.deinit(self.allocator);
+        try out_stmts.appendSlice(self.allocator, loop.pre.statements);
+
+        var idx: ast.U256 = 0;
+        while (idx < limit_literal) : (idx += 1) {
+            const literal = ast.Expression.lit(ast.Literal.number(idx));
+            for (loop.body.statements) |stmt| {
+                const replaced = try self.replaceIdentifierInStmt(stmt, counter_name, literal);
+                try out_stmts.append(self.allocator, replaced);
+            }
+        }
+
+        var block = ast.Block.init(try self.builder.dupeStatements(out_stmts.items));
+        block.location = loop.location;
+        return ast.Statement{ .block = block };
+    }
+
+    fn replaceIdentifierInStmt(
+        self: *Optimizer,
+        stmt: ast.Statement,
+        name: []const u8,
+        value: ast.Expression,
+    ) Error!ast.Statement {
+        return switch (stmt) {
+            .expression_statement => |s| blk: {
+                var out = s;
+                out.expression = try self.replaceIdentifierInExpr(s.expression, name, value);
+                break :blk ast.Statement{ .expression_statement = out };
+            },
+            .assignment => |s| blk: {
+                var out = s;
+                out.value = try self.replaceIdentifierInExpr(s.value, name, value);
+                out.variable_names = try self.builder.dupeIdentifiers(s.variable_names);
+                break :blk ast.Statement{ .assignment = out };
+            },
+            .variable_declaration => |s| blk: {
+                var out = s;
+                if (s.value) |val| {
+                    out.value = try self.replaceIdentifierInExpr(val, name, value);
+                }
+                out.variables = try self.builder.dupeTypedNames(s.variables);
+                break :blk ast.Statement{ .variable_declaration = out };
+            },
+            else => stmt,
+        };
+    }
+
+    fn replaceIdentifierInExpr(
+        self: *Optimizer,
+        expr: ast.Expression,
+        name: []const u8,
+        value: ast.Expression,
+    ) Error!ast.Expression {
+        switch (expr) {
+            .identifier => |id| {
+                if (std.mem.eql(u8, id.name, name)) return value;
+                return expr;
+            },
+            .builtin_call => |call| {
+                var args = std.ArrayList(ast.Expression).empty;
+                defer args.deinit(self.allocator);
+                for (call.arguments) |arg| {
+                    try args.append(self.allocator, try self.replaceIdentifierInExpr(arg, name, value));
+                }
+                var out = call;
+                out.arguments = try self.builder.dupeExpressions(args.items);
+                return ast.Expression{ .builtin_call = out };
+            },
+            .function_call => |call| {
+                var args = std.ArrayList(ast.Expression).empty;
+                defer args.deinit(self.allocator);
+                for (call.arguments) |arg| {
+                    try args.append(self.allocator, try self.replaceIdentifierInExpr(arg, name, value));
+                }
+                var out = call;
+                out.arguments = try self.builder.dupeExpressions(args.items);
+                return ast.Expression{ .function_call = out };
+            },
+            else => return expr,
+        }
     }
 
     const IfAssignment = struct {
@@ -1701,6 +1829,37 @@ test "cache sload across statements" {
 
     try std.testing.expect(!Optimizer.containsSload(optimized.root.code.statements[1], slot));
     try std.testing.expect(!Optimizer.containsSload(optimized.root.code.statements[2], slot));
+}
+
+test "unroll small for loop" {
+    const allocator = std.testing.allocator;
+    var builder = ast.AstBuilder.init(allocator);
+    defer builder.deinit();
+
+    const init_decl = try builder.varDecl(&.{"i"}, ast.Expression.lit(ast.Literal.number(0)));
+    const pre_block = ast.Block.init(try builder.dupeStatements(&.{init_decl}));
+
+    const cond = try builder.builtinCall("lt", &.{ ast.Expression.id("i"), ast.Expression.lit(ast.Literal.number(3)) });
+
+    const post_expr = try builder.builtinCall("add", &.{ ast.Expression.id("i"), ast.Expression.lit(ast.Literal.number(1)) });
+    const post_stmt = try builder.assign(&.{"i"}, post_expr);
+    const post_block = ast.Block.init(try builder.dupeStatements(&.{post_stmt}));
+
+    const mul_expr = try builder.builtinCall("mul", &.{ ast.Expression.id("i"), ast.Expression.lit(ast.Literal.number(32)) });
+    const add_expr = try builder.builtinCall("add", &.{ ast.Expression.id("ptr"), mul_expr });
+    const store_expr = try builder.builtinCall("mstore", &.{ add_expr, ast.Expression.lit(ast.Literal.number(0)) });
+    const body_block = ast.Block.init(try builder.dupeStatements(&.{ast.Statement.expr(store_expr)}));
+
+    const loop_stmt = builder.forLoop(pre_block, cond, post_block, body_block);
+    const code_block = ast.Block.init(try builder.dupeStatements(&.{loop_stmt}));
+    const obj = ast.Object.init("Opt", code_block, &.{}, &.{});
+    const root = ast.AST.init(obj);
+
+    var opt = Optimizer.init(allocator);
+    defer opt.deinit();
+    const optimized = try opt.optimize(root);
+    try std.testing.expectEqual(@as(usize, 4), optimized.root.code.statements.len);
+    try std.testing.expect(optimized.root.code.statements[1] == .expression_statement);
 }
 
 test "merge packed sstore sequence" {
