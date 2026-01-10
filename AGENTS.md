@@ -159,10 +159,6 @@ cd sdk && zig build test --summary all
 rm -rf .zig-cache zig-out
 ```
 
-**为什么必须使用 solana-zig？**
-- 标准 Zig 没有 `sbf` CPU 架构
-- 标准 Zig 没有 `solana` 操作系统目标
-- 使用系统 zig 会导致编译错误
 
 ---
 
