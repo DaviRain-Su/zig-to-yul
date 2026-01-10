@@ -312,6 +312,13 @@ pub const Transformer = struct {
         return out;
     }
 
+    fn blockWithLocation(self: *Self, block: ast.Block, loc: ast.SourceLocation) ast.Block {
+        _ = self;
+        var out = block;
+        out.location = loc;
+        return out;
+    }
+
     /// Process a top-level declaration
     fn processTopLevelDecl(self: *Self, index: ZigAst.Node.Index) !void {
         const p = &self.zig_parser.?;
@@ -682,10 +689,10 @@ pub const Transformer = struct {
         // Generate function body
         var body_stmts: std.ArrayList(ast.Statement) = .empty;
         defer body_stmts.deinit(self.allocator);
-
         try self.processBlock(body_index, &body_stmts);
 
-        const body = try self.builder.block(body_stmts.items);
+        var body = try self.builder.block(body_stmts.items);
+        body = self.blockWithLocation(body, self.nodeLocation(body_index));
 
         // Only add return variable if function has a return value
         const final_returns: []const ast.TypedName = if (has_return) returns else &.{};
@@ -693,657 +700,6 @@ pub const Transformer = struct {
     }
 
     const TransformProcessError = std.mem.Allocator.Error;
-
-    fn processBlock(self: *Self, index: ZigAst.Node.Index, stmts: *std.ArrayList(ast.Statement)) TransformProcessError!void {
-        const p = &self.zig_parser.?;
-        const tag = p.getNodeTag(index);
-
-        switch (tag) {
-            .block_two, .block_two_semicolon => {
-                // Up to 2 statements stored inline
-                const data = p.ast.nodeData(index);
-                const opt_nodes = data.opt_node_and_opt_node;
-                if (opt_nodes[0].unwrap()) |n| {
-                    try self.processStatement(n, stmts);
-                }
-                if (opt_nodes[1].unwrap()) |n| {
-                    try self.processStatement(n, stmts);
-                }
-            },
-            .block, .block_semicolon => {
-                // Multiple statements stored in extra_data via SubRange
-                const data = p.ast.nodeData(index);
-                const range = data.extra_range;
-                const start: usize = @intFromEnum(range.start);
-                const end: usize = @intFromEnum(range.end);
-                const stmt_indices = p.ast.extra_data[start..end];
-                for (stmt_indices) |stmt_idx_raw| {
-                    const stmt_idx: ZigAst.Node.Index = @enumFromInt(stmt_idx_raw);
-                    try self.processStatement(stmt_idx, stmts);
-                }
-            },
-            else => {
-                // Not a block - might be a single expression as body
-                try self.processStatement(index, stmts);
-            },
-        }
-    }
-
-    fn processStatement(self: *Self, index: ZigAst.Node.Index, stmts: *std.ArrayList(ast.Statement)) TransformProcessError!void {
-        const p = &self.zig_parser.?;
-        const tag = p.getNodeTag(index);
-
-        switch (tag) {
-            .simple_var_decl, .local_var_decl => {
-                try self.processLocalVarDecl(index, stmts);
-            },
-            .assign => {
-                try self.processAssign(index, stmts);
-            },
-            .@"return" => {
-                try self.processReturn(index, stmts);
-            },
-            .@"if", .if_simple => {
-                try self.processIf(index, stmts);
-            },
-            .@"while", .while_simple, .while_cont => {
-                try self.processWhile(index, stmts);
-            },
-            .@"for", .for_simple => {
-                try self.processFor(index, stmts);
-            },
-            .@"switch", .switch_comma => {
-                try self.processSwitch(index, stmts);
-            },
-            .@"break" => {
-                try self.processBreak(index, stmts);
-            },
-            .@"continue" => {
-                try self.processContinue(index, stmts);
-            },
-            else => {
-                if (self.translateExpression(index)) |expr| {
-                    try stmts.append(self.allocator, self.stmtWithLocation(ast.Statement.expr(expr), self.nodeLocation(index)));
-                } else |_| {}
-            },
-        }
-    }
-
-    fn processLocalVarDecl(self: *Self, index: ZigAst.Node.Index, stmts: *std.ArrayList(ast.Statement)) TransformProcessError!void {
-        const p = &self.zig_parser.?;
-
-        if (p.getVarDecl(index)) |var_decl| {
-            const name = p.getIdentifier(var_decl.name_token);
-
-            var value: ?ast.Expression = null;
-            var type_name: ?[]const u8 = null;
-            if (var_decl.type_node.unwrap()) |type_node| {
-                const type_src = p.getNodeSource(type_node);
-                if (self.parseArrayElemType(type_src)) |elem_type| {
-                    try self.setLocalArrayElemType(name, elem_type);
-                }
-                if (self.struct_defs.get(type_src) != null) {
-                    try self.setLocalStructVar(name, type_src);
-                    type_name = type_src;
-                }
-            }
-            if (var_decl.init_node.unwrap()) |init_idx| {
-                const init_tag = p.getNodeTag(init_idx);
-                if (self.isStructInitTag(init_tag) or self.isArrayInitTag(init_tag)) {
-                    if (try self.structInitTypeName(init_idx)) |explicit_type| {
-                        try self.setLocalStructVar(name, explicit_type);
-                        type_name = explicit_type;
-                        value = try self.translateStructInitWithType(init_idx, explicit_type);
-                    } else if (type_name) |override_type| {
-                        value = try self.translateStructInitWithType(init_idx, override_type);
-                    } else {
-                        value = try self.translateStructInit(init_idx);
-                    }
-                } else {
-                    value = try self.translateExpression(init_idx);
-                }
-            }
-
-            const stmt = if (type_name) |resolved| blk: {
-                const typed = [_]ast.TypedName{ast.TypedName.withType(name, self.yulTypeNameForZig(resolved))};
-                break :blk try self.builder.varDeclTyped(&typed, value);
-            } else try self.builder.varDecl(&.{name}, value);
-            try stmts.append(self.allocator, self.stmtWithLocation(stmt, self.nodeLocation(index)));
-        }
-    }
-
-    fn processAssign(self: *Self, index: ZigAst.Node.Index, stmts: *std.ArrayList(ast.Statement)) TransformProcessError!void {
-        const p = &self.zig_parser.?;
-        const data = p.ast.nodeData(index);
-        const nodes = data.node_and_node;
-
-        const target_node = nodes[0];
-        const target_tag = p.getNodeTag(target_node);
-        const value_node = nodes[1];
-        const value_tag = p.getNodeTag(value_node);
-        var value: ast.Expression = undefined;
-        if (self.isStructInitTag(value_tag) or self.isArrayInitTag(value_tag)) {
-            var override_type: ?[]const u8 = null;
-            if (target_tag == .identifier) {
-                const target_name = p.getNodeSource(target_node);
-                override_type = self.local_struct_vars.get(target_name);
-            }
-            if (try self.structInitTypeName(value_node)) |explicit_type| {
-                value = try self.translateStructInitWithType(value_node, explicit_type);
-            } else if (override_type) |type_name| {
-                value = try self.translateStructInitWithType(value_node, type_name);
-            } else {
-                value = try self.translateStructInit(value_node);
-            }
-        } else {
-            value = try self.translateExpression(nodes[1]);
-        }
-
-        if (target_tag == .identifier and (self.isStructInitTag(value_tag) or self.isArrayInitTag(value_tag))) {
-            const target_name = p.getNodeSource(target_node);
-            if (try self.structInitTypeName(value_node)) |type_name| {
-                try self.setLocalStructVar(target_name, type_name);
-            }
-        }
-
-        // Check if this is a storage write (self.field = value)
-        if (target_tag == .field_access) {
-            const target_data = p.ast.nodeData(target_node);
-            const node_and_token = target_data.node_and_token;
-            const obj_src = p.getNodeSource(node_and_token[0]);
-            const field_token = node_and_token[1];
-            const field_name = p.getIdentifier(field_token);
-
-            if (std.mem.eql(u8, obj_src, "self")) {
-                // Find storage slot for this field
-                for (self.storage_vars.items) |sv| {
-                    if (std.mem.eql(u8, sv.name, field_name)) {
-                        // Emit: sstore(slot, value)
-                        const sstore_call = try self.builder.builtinCall("sstore", &.{
-                            ast.Expression.lit(ast.Literal.number(sv.slot)),
-                            value,
-                        });
-                        try stmts.append(self.allocator, self.stmtWithLocation(ast.Statement.expr(sstore_call), self.nodeLocation(index)));
-                        return;
-                    }
-                }
-            }
-
-            if (self.local_struct_vars.get(obj_src)) |struct_name| {
-                if (self.struct_defs.get(struct_name)) |fields| {
-                    if (self.structFieldOffset(fields, field_name)) |offset| {
-                        const addr = try self.builder.builtinCall("add", &.{
-                            ast.Expression.id(obj_src),
-                            ast.Expression.lit(ast.Literal.number(offset)),
-                        });
-                        const mstore_call = try self.builder.builtinCall("mstore", &.{ addr, value });
-                        try stmts.append(self.allocator, self.stmtWithLocation(ast.Statement.expr(mstore_call), self.nodeLocation(index)));
-                        return;
-                    }
-                }
-            }
-        }
-
-        if (target_tag == .array_access) {
-            if (try self.translateArrayAccessStore(target_node, value)) |stmt| {
-                try stmts.append(self.allocator, self.stmtWithLocation(stmt, self.nodeLocation(index)));
-                return;
-            }
-        }
-
-        // Regular assignment
-        const target_name = p.getNodeSource(target_node);
-        const stmt = try self.builder.assign(&.{target_name}, value);
-        try stmts.append(self.allocator, self.stmtWithLocation(stmt, self.nodeLocation(index)));
-    }
-
-    fn processReturn(self: *Self, index: ZigAst.Node.Index, stmts: *std.ArrayList(ast.Statement)) TransformProcessError!void {
-        const p = &self.zig_parser.?;
-        const data = p.ast.nodeData(index);
-        const opt_node = data.opt_node;
-
-        if (opt_node.unwrap()) |ret_node| {
-            const tag = p.getNodeTag(ret_node);
-            var value: ast.Expression = undefined;
-            if ((self.isStructInitTag(tag) or self.isArrayInitTag(tag)) and self.current_return_struct != null) {
-                if (try self.structInitTypeName(ret_node)) |explicit_type| {
-                    value = try self.translateStructInitWithType(ret_node, explicit_type);
-                } else {
-                    value = try self.translateStructInitWithType(ret_node, self.current_return_struct.?);
-                }
-            } else {
-                value = try self.translateExpression(ret_node);
-            }
-            const assign = try self.builder.assign(&.{"result"}, value);
-            try stmts.append(self.allocator, self.stmtWithLocation(assign, self.nodeLocation(index)));
-        }
-        try stmts.append(self.allocator, self.stmtWithLocation(ast.Statement.leaveStmt(), self.nodeLocation(index)));
-    }
-
-    fn processIf(self: *Self, index: ZigAst.Node.Index, stmts: *std.ArrayList(ast.Statement)) TransformProcessError!void {
-        const p = &self.zig_parser.?;
-
-        // Use fullIf to properly extract condition and body
-        const if_info = p.ast.fullIf(index) orelse return;
-
-        const cond_expr = try self.translateExpression(if_info.ast.cond_expr);
-        const has_else = if_info.ast.else_expr.unwrap() != null;
-
-        // If there's an else branch, cache condition in temp to avoid double evaluation
-        // (condition may have side effects like function calls)
-        var cond: ast.Expression = cond_expr;
-
-        if (has_else) {
-            // Generate unique temp name with collision-safe prefix
-            const temp_name = try std.fmt.allocPrint(self.allocator, "$zig2yul$cond${d}", .{self.temp_counter});
-            self.temp_counter += 1;
-            try self.temp_strings.append(self.allocator, temp_name);
-
-            // Emit: let $zig2yul$cond$N := <condition>
-            const var_decl = try self.builder.varDecl(&.{temp_name}, cond_expr);
-            try stmts.append(self.allocator, self.stmtWithLocation(var_decl, self.nodeLocation(index)));
-
-            // Use the temp variable as condition
-            cond = ast.Expression.id(temp_name);
-        }
-
-        // Process then branch
-        var then_body: std.ArrayList(ast.Statement) = .empty;
-        defer then_body.deinit(self.allocator);
-        try self.processBlock(if_info.ast.then_expr, &then_body);
-
-        const then_block = try self.builder.block(then_body.items);
-        const then_stmt = self.builder.ifStmt(cond, then_block);
-        try stmts.append(self.allocator, self.stmtWithLocation(then_stmt, self.nodeLocation(index)));
-
-        // Process else branch if present
-        // Yul has no else, so we emit: if iszero(cond) { else_body }
-        if (if_info.ast.else_expr.unwrap()) |else_expr| {
-            var else_body: std.ArrayList(ast.Statement) = .empty;
-            defer else_body.deinit(self.allocator);
-
-            // Check if it's an else-if chain
-            const else_tag = p.getNodeTag(else_expr);
-            if (else_tag == .@"if" or else_tag == .if_simple) {
-                // Else-if: recurse
-                try self.processIf(else_expr, &else_body);
-            } else {
-                // Regular else block
-                try self.processBlock(else_expr, &else_body);
-            }
-
-            if (else_body.items.len > 0) {
-                const else_block = try self.builder.block(else_body.items);
-                // Use the cached temp variable for iszero
-                const negated_cond = try self.builder.builtinCall("iszero", &.{cond});
-                const else_stmt = self.builder.ifStmt(negated_cond, else_block);
-                try stmts.append(self.allocator, self.stmtWithLocation(else_stmt, self.nodeLocation(index)));
-            }
-        }
-    }
-
-    fn processWhile(self: *Self, index: ZigAst.Node.Index, stmts: *std.ArrayList(ast.Statement)) TransformProcessError!void {
-        const p = &self.zig_parser.?;
-        const while_info = p.ast.fullWhile(index) orelse return;
-
-        if (while_info.ast.else_expr.unwrap() != null) {
-            try self.addError("while-else is not supported", self.nodeLocation(index), .unsupported_feature);
-            return;
-        }
-
-        const cond = try self.translateExpression(while_info.ast.cond_expr);
-
-        var post_stmts: std.ArrayList(ast.Statement) = .empty;
-        defer post_stmts.deinit(self.allocator);
-        if (while_info.ast.cont_expr.unwrap()) |cont_expr| {
-            try self.processStatement(cont_expr, &post_stmts);
-        }
-
-        var body_stmts: std.ArrayList(ast.Statement) = .empty;
-        defer body_stmts.deinit(self.allocator);
-        try self.pushLoopBreakFlag(null);
-        errdefer self.popLoopBreakFlag();
-        try self.processBlock(while_info.ast.then_expr, &body_stmts);
-        self.popLoopBreakFlag();
-
-        const pre_block = try self.builder.block(&.{});
-        const post_block = try self.builder.block(post_stmts.items);
-        const body_block = try self.builder.block(body_stmts.items);
-
-        const loop_stmt = self.builder.forLoop(pre_block, cond, post_block, body_block);
-        try stmts.append(self.allocator, self.stmtWithLocation(loop_stmt, self.nodeLocation(index)));
-    }
-
-    fn processFor(self: *Self, index: ZigAst.Node.Index, stmts: *std.ArrayList(ast.Statement)) TransformProcessError!void {
-        const p = &self.zig_parser.?;
-        const for_info = p.ast.fullFor(index) orelse return;
-
-        const else_node = for_info.ast.else_expr.unwrap();
-        var break_flag: ?[]const u8 = null;
-        if (else_node != null) {
-            const flag_name = try self.makeTemp("for_break");
-            const flag_decl = try self.builder.varDecl(&.{flag_name}, ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0))));
-            try stmts.append(self.allocator, self.stmtWithLocation(flag_decl, self.nodeLocation(index)));
-            break_flag = flag_name;
-        }
-
-        if (for_info.ast.inputs.len == 0 or for_info.ast.inputs.len > 2) {
-            try self.addError("for requires one or two inputs", self.nodeLocation(index), .unsupported_feature);
-            return;
-        }
-
-        var start_expr: ?ast.Expression = null;
-        var end_expr: ?ast.Expression = null;
-        var step_expr: ?ast.Expression = null;
-        const input0 = for_info.ast.inputs[0];
-        var range_step_input = false;
-        var range_step_loc: ?ast.SourceLocation = null;
-        {
-            var call_buf: [1]ZigAst.Node.Index = undefined;
-            if (p.ast.fullCall(&call_buf, input0)) |call_info| {
-                const callee_src = p.getNodeSource(call_info.ast.fn_expr);
-                if (std.mem.eql(u8, callee_src, "range_step") or std.mem.endsWith(u8, callee_src, ".range_step")) {
-                    if (call_info.ast.params.len != 3) {
-                        try self.addError("range_step requires three arguments (start, end, step)", self.nodeLocation(input0), .unsupported_feature);
-                        return;
-                    }
-                    start_expr = try self.translateExpression(call_info.ast.params[0]);
-                    end_expr = try self.translateExpression(call_info.ast.params[1]);
-                    step_expr = try self.translateExpression(call_info.ast.params[2]);
-                    range_step_input = true;
-                    range_step_loc = self.nodeLocation(input0);
-                }
-            }
-        }
-        var input1: ?ZigAst.Node.Index = null;
-        if (for_info.ast.inputs.len == 2) {
-            input1 = for_info.ast.inputs[1];
-            if (p.getNodeTag(input1.?) != .for_range) {
-                try self.addError("for index must use range syntax (start..end)", self.nodeLocation(input1.?), .unsupported_feature);
-                return;
-            }
-        }
-
-        const is_range0 = range_step_input or p.getNodeTag(input0) == .for_range;
-        if (!range_step_input and is_range0) {
-            const range0 = p.ast.nodeData(input0).node_and_opt_node;
-            start_expr = try self.translateExpression(range0[0]);
-            const end_node = range0[1].unwrap();
-            end_expr = if (end_node) |node| try self.translateExpression(node) else null;
-        }
-
-        var index_start_expr: ?ast.Expression = null;
-        var index_end_expr: ?ast.Expression = null;
-        if (input1) |input_node| {
-            const range1 = p.ast.nodeData(input_node).node_and_opt_node;
-            index_start_expr = try self.translateExpression(range1[0]);
-            const idx_end_node = range1[1].unwrap();
-            index_end_expr = if (idx_end_node) |node| try self.translateExpression(node) else null;
-        }
-
-        const payloads = try self.collectForPayloads(for_info.payload_token, for_info.ast.then_expr, index);
-        if (payloads.len == 0) {
-            return;
-        }
-        if (range_step_input) {
-            if (input1 != null) {
-                const loc = range_step_loc orelse self.nodeLocation(index);
-                try self.addError("range_step cannot be combined with a second for input", loc, .unsupported_feature);
-                return;
-            }
-            if (payloads.len != 1) {
-                const loc = range_step_loc orelse self.nodeLocation(index);
-                try self.addError("range_step requires a single payload", loc, .unsupported_feature);
-                return;
-            }
-        }
-        if (payloads.len == 2 and input1 == null) {
-            try self.addError("for with index payload requires a second range input", self.nodeLocation(index), .unsupported_feature);
-            return;
-        }
-        if (payloads.len == 2 and step_expr != null) {
-            try self.addError("range_step does not support index payloads", self.nodeLocation(index), .unsupported_feature);
-            return;
-        }
-
-        if (!is_range0) {
-            if (input1 == null) {
-                try self.processForSlice(index, for_info, payloads, input0, break_flag, stmts);
-                if (break_flag) |flag_name| {
-                    var else_body: std.ArrayList(ast.Statement) = .empty;
-                    defer else_body.deinit(self.allocator);
-                    if (else_node) |else_idx| {
-                        try self.processBlock(else_idx, &else_body);
-                    }
-                    if (else_body.items.len > 0) {
-                        const else_block = try self.builder.block(else_body.items);
-                        const cond = try self.builder.builtinCall("iszero", &.{ast.Expression.id(flag_name)});
-                        const else_stmt = self.builder.ifStmt(cond, else_block);
-                        try stmts.append(self.allocator, self.stmtWithLocation(else_stmt, self.nodeLocation(index)));
-                    }
-                }
-                return;
-            }
-            try self.processForArray(index, for_info, payloads, input0, input1.?, break_flag, stmts);
-            if (break_flag) |flag_name| {
-                var else_body: std.ArrayList(ast.Statement) = .empty;
-                defer else_body.deinit(self.allocator);
-                if (else_node) |else_idx| {
-                    try self.processBlock(else_idx, &else_body);
-                }
-                if (else_body.items.len > 0) {
-                    const else_block = try self.builder.block(else_body.items);
-                    const cond = try self.builder.builtinCall("iszero", &.{ast.Expression.id(flag_name)});
-                    const else_stmt = self.builder.ifStmt(cond, else_block);
-                    try stmts.append(self.allocator, self.stmtWithLocation(else_stmt, self.nodeLocation(index)));
-                }
-            }
-            return;
-        }
-
-        var value_name = payloads.items[0];
-        if (std.mem.eql(u8, value_name, "_")) {
-            value_name = try std.fmt.allocPrint(self.allocator, "$zig2yul$for$val${d}", .{self.temp_counter});
-            self.temp_counter += 1;
-            try self.temp_strings.append(self.allocator, value_name);
-        }
-
-        var index_name: ?[]const u8 = null;
-        if (payloads.len == 2) {
-            var tmp = payloads.items[1];
-            if (std.mem.eql(u8, tmp, "_")) {
-                tmp = try std.fmt.allocPrint(self.allocator, "$zig2yul$for$idx${d}", .{self.temp_counter});
-                self.temp_counter += 1;
-                try self.temp_strings.append(self.allocator, tmp);
-            }
-            index_name = tmp;
-        }
-
-        var init_stmts: std.ArrayList(ast.Statement) = .empty;
-        defer init_stmts.deinit(self.allocator);
-        const init_decl = try self.builder.varDecl(&.{value_name}, start_expr.?);
-        try init_stmts.append(self.allocator, init_decl);
-        if (index_name) |idx_name| {
-            const idx_start = index_start_expr orelse ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0)));
-            const idx_decl = try self.builder.varDecl(&.{idx_name}, idx_start);
-            try init_stmts.append(self.allocator, idx_decl);
-        }
-        var step_name: ?[]const u8 = null;
-        if (step_expr) |step_value| {
-            const tmp = try self.makeTemp("for_step");
-            step_name = tmp;
-            const step_decl = try self.builder.varDecl(&.{tmp}, step_value);
-            try init_stmts.append(self.allocator, step_decl);
-        }
-
-        var cond: ast.Expression = ast.Expression.lit(ast.Literal.number(@as(ast.U256, 1)));
-        if (end_expr) |end_val| {
-            if (step_name) |step_id| {
-                const zero_lit = ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0)));
-                const step_neg = try self.builder.builtinCall("slt", &.{ ast.Expression.id(step_id), zero_lit });
-                const pos_cond = try self.builder.builtinCall("lt", &.{ ast.Expression.id(value_name), end_val });
-                const neg_cond = try self.builder.builtinCall("gt", &.{ ast.Expression.id(value_name), end_val });
-                const pos_guard = try self.builder.builtinCall("and", &.{ try self.builder.builtinCall("iszero", &.{step_neg}), pos_cond });
-                const neg_guard = try self.builder.builtinCall("and", &.{ step_neg, neg_cond });
-                cond = try self.builder.builtinCall("or", &.{ pos_guard, neg_guard });
-            } else {
-                cond = try self.builder.builtinCall("lt", &.{ ast.Expression.id(value_name), end_val });
-            }
-        }
-        if (index_name) |idx_name| {
-            if (index_end_expr) |idx_end| {
-                const idx_cond = try self.builder.builtinCall("lt", &.{ ast.Expression.id(idx_name), idx_end });
-                if (end_expr != null) {
-                    cond = try self.builder.builtinCall("and", &.{ cond, idx_cond });
-                } else {
-                    cond = idx_cond;
-                }
-            }
-        }
-
-        var post_stmts: std.ArrayList(ast.Statement) = .empty;
-        defer post_stmts.deinit(self.allocator);
-        const step_value = if (step_name) |step_id| ast.Expression.id(step_id) else ast.Expression.lit(ast.Literal.number(@as(ast.U256, 1)));
-        const inc_call = try self.builder.builtinCall("add", &.{
-            ast.Expression.id(value_name),
-            step_value,
-        });
-        const inc_stmt = try self.builder.assign(&.{value_name}, inc_call);
-        try post_stmts.append(self.allocator, inc_stmt);
-        if (index_name) |idx_name| {
-            const idx_inc = try self.builder.builtinCall("add", &.{
-                ast.Expression.id(idx_name),
-                ast.Expression.lit(ast.Literal.number(@as(ast.U256, 1))),
-            });
-            const idx_stmt = try self.builder.assign(&.{idx_name}, idx_inc);
-            try post_stmts.append(self.allocator, idx_stmt);
-        }
-
-        var body_stmts: std.ArrayList(ast.Statement) = .empty;
-        defer body_stmts.deinit(self.allocator);
-        try self.pushLoopBreakFlag(break_flag);
-        errdefer self.popLoopBreakFlag();
-        try self.processBlock(for_info.ast.then_expr, &body_stmts);
-        self.popLoopBreakFlag();
-
-        const pre_block = try self.builder.block(init_stmts.items);
-        const post_block = try self.builder.block(post_stmts.items);
-        const body_block = try self.builder.block(body_stmts.items);
-
-        const loop_stmt = self.builder.forLoop(pre_block, cond, post_block, body_block);
-        try stmts.append(self.allocator, self.stmtWithLocation(loop_stmt, self.nodeLocation(index)));
-        if (break_flag) |flag_name| {
-            var else_body: std.ArrayList(ast.Statement) = .empty;
-            defer else_body.deinit(self.allocator);
-            if (else_node) |else_idx| {
-                try self.processBlock(else_idx, &else_body);
-            }
-            if (else_body.items.len > 0) {
-                const else_block = try self.builder.block(else_body.items);
-                const cond_else = try self.builder.builtinCall("iszero", &.{ast.Expression.id(flag_name)});
-                const else_stmt = self.builder.ifStmt(cond_else, else_block);
-                try stmts.append(self.allocator, self.stmtWithLocation(else_stmt, self.nodeLocation(index)));
-            }
-        }
-    }
-
-    fn processForSlice(
-        self: *Self,
-        index: ZigAst.Node.Index,
-        for_info: ZigAst.full.For,
-        payloads: PayloadList,
-        base_node: ZigAst.Node.Index,
-        break_flag: ?[]const u8,
-        stmts: *std.ArrayList(ast.Statement),
-    ) TransformProcessError!void {
-        const elem_type = self.arrayElemTypeForNode(base_node);
-        var struct_elem_type: ?[]const u8 = null;
-        var elem_stride: ast.U256 = 32;
-        if (elem_type) |type_name| {
-            if (self.struct_defs.get(type_name)) |fields| {
-                struct_elem_type = type_name;
-                elem_stride = @intCast(fields.len * 32);
-            }
-        }
-        const base_expr = try self.translateExpression(base_node);
-        const base_name = try self.makeTemp("for_base");
-        const len_name = try self.makeTemp("for_len");
-        const data_name = try self.makeTemp("for_data");
-
-        var value_name = payloads.items[0];
-        if (std.mem.eql(u8, value_name, "_")) {
-            value_name = try std.fmt.allocPrint(self.allocator, "$zig2yul$for$val${d}", .{self.temp_counter});
-            self.temp_counter += 1;
-            try self.temp_strings.append(self.allocator, value_name);
-        }
-        if (struct_elem_type) |type_name| {
-            try self.setLocalStructVar(value_name, type_name);
-        }
-
-        var index_name: []const u8 = undefined;
-        if (payloads.len == 2) {
-            index_name = payloads.items[1];
-            if (std.mem.eql(u8, index_name, "_")) {
-                index_name = try std.fmt.allocPrint(self.allocator, "$zig2yul$for$idx${d}", .{self.temp_counter});
-                self.temp_counter += 1;
-                try self.temp_strings.append(self.allocator, index_name);
-            }
-        } else {
-            index_name = try std.fmt.allocPrint(self.allocator, "$zig2yul$for$idx${d}", .{self.temp_counter});
-            self.temp_counter += 1;
-            try self.temp_strings.append(self.allocator, index_name);
-        }
-
-        var init_stmts: std.ArrayList(ast.Statement) = .empty;
-        defer init_stmts.deinit(self.allocator);
-        try init_stmts.append(self.allocator, try self.builder.varDecl(&.{base_name}, base_expr));
-        try init_stmts.append(self.allocator, try self.builder.varDecl(&.{value_name}, ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0)))));
-        try init_stmts.append(self.allocator, try self.builder.varDecl(&.{index_name}, ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0)))));
-
-        const len_expr = try self.builder.builtinCall("mload", &.{ast.Expression.id(base_name)});
-        try init_stmts.append(self.allocator, try self.builder.varDecl(&.{len_name}, len_expr));
-
-        const data_expr = try self.builder.builtinCall("add", &.{
-            ast.Expression.id(base_name),
-            ast.Expression.lit(ast.Literal.number(@as(ast.U256, 32))),
-        });
-        try init_stmts.append(self.allocator, try self.builder.varDecl(&.{data_name}, data_expr));
-
-        const cond = try self.builder.builtinCall("lt", &.{ ast.Expression.id(index_name), ast.Expression.id(len_name) });
-
-        var post_stmts: std.ArrayList(ast.Statement) = .empty;
-        defer post_stmts.deinit(self.allocator);
-        const inc_call = try self.builder.builtinCall("add", &.{
-            ast.Expression.id(index_name),
-            ast.Expression.lit(ast.Literal.number(@as(ast.U256, 1))),
-        });
-        try post_stmts.append(self.allocator, try self.builder.assign(&.{index_name}, inc_call));
-
-        const addr = if (elem_stride == 32)
-            try self.indexedMemoryAddress(ast.Expression.id(data_name), ast.Expression.id(index_name))
-        else
-            try self.indexedMemoryAddressStride(ast.Expression.id(data_name), ast.Expression.id(index_name), elem_stride);
-        const val_expr = if (struct_elem_type != null)
-            addr
-        else
-            try self.builder.builtinCall("mload", &.{addr});
-        const assign_val = try self.builder.assign(&.{value_name}, val_expr);
-
-        var body_stmts: std.ArrayList(ast.Statement) = .empty;
-        defer body_stmts.deinit(self.allocator);
-        try body_stmts.append(self.allocator, assign_val);
-        try self.pushLoopBreakFlag(break_flag);
-        errdefer self.popLoopBreakFlag();
-        try self.processBlock(for_info.ast.then_expr, &body_stmts);
-        self.popLoopBreakFlag();
-
-        const pre_block = try self.builder.block(init_stmts.items);
-        const post_block = try self.builder.block(post_stmts.items);
-        const body_block = try self.builder.block(body_stmts.items);
-
-        const loop_stmt = self.builder.forLoop(pre_block, cond, post_block, body_block);
-        try stmts.append(self.allocator, self.stmtWithLocation(loop_stmt, self.nodeLocation(index)));
-    }
 
     fn processForArray(
         self: *Self,
@@ -1369,6 +725,7 @@ pub const Transformer = struct {
         const idx_start_expr = try self.translateExpression(range1[0]);
         const idx_end_node = range1[1].unwrap();
         const idx_end_expr = if (idx_end_node) |node| try self.translateExpression(node) else null;
+        const init_loc = self.nodeLocation(index);
 
         var value_name = payloads.items[0];
         if (std.mem.eql(u8, value_name, "_")) {
@@ -1399,9 +756,9 @@ pub const Transformer = struct {
 
         var init_stmts: std.ArrayList(ast.Statement) = .empty;
         defer init_stmts.deinit(self.allocator);
-        try init_stmts.append(self.allocator, try self.builder.varDecl(&.{base_name}, base_expr));
-        try init_stmts.append(self.allocator, try self.builder.varDecl(&.{value_name}, ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0)))));
-        try init_stmts.append(self.allocator, try self.builder.varDecl(&.{index_name}, idx_start_expr));
+        try init_stmts.append(self.allocator, self.stmtWithLocation(try self.builder.varDecl(&.{base_name}, base_expr), init_loc));
+        try init_stmts.append(self.allocator, self.stmtWithLocation(try self.builder.varDecl(&.{value_name}, ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0)))), init_loc));
+        try init_stmts.append(self.allocator, self.stmtWithLocation(try self.builder.varDecl(&.{index_name}, idx_start_expr), init_loc));
 
         var cond: ast.Expression = ast.Expression.lit(ast.Literal.number(@as(ast.U256, 1)));
         if (idx_end_expr) |end_val| {
@@ -1414,7 +771,7 @@ pub const Transformer = struct {
             ast.Expression.id(index_name),
             ast.Expression.lit(ast.Literal.number(@as(ast.U256, 1))),
         });
-        try post_stmts.append(self.allocator, try self.builder.assign(&.{index_name}, inc_call));
+        try post_stmts.append(self.allocator, self.stmtWithLocation(try self.builder.assign(&.{index_name}, inc_call), init_loc));
 
         const addr = if (elem_stride == 32)
             try self.indexedMemoryAddress(ast.Expression.id(base_name), ast.Expression.id(index_name))
@@ -1428,15 +785,18 @@ pub const Transformer = struct {
 
         var body_stmts: std.ArrayList(ast.Statement) = .empty;
         defer body_stmts.deinit(self.allocator);
-        try body_stmts.append(self.allocator, assign_val);
+        try body_stmts.append(self.allocator, self.stmtWithLocation(assign_val, init_loc));
         try self.pushLoopBreakFlag(break_flag);
         errdefer self.popLoopBreakFlag();
         try self.processBlock(for_info.ast.then_expr, &body_stmts);
         self.popLoopBreakFlag();
 
-        const pre_block = try self.builder.block(init_stmts.items);
-        const post_block = try self.builder.block(post_stmts.items);
-        const body_block = try self.builder.block(body_stmts.items);
+        var pre_block = try self.builder.block(init_stmts.items);
+        pre_block = self.blockWithLocation(pre_block, self.nodeLocation(index));
+        var post_block = try self.builder.block(post_stmts.items);
+        post_block = self.blockWithLocation(post_block, self.nodeLocation(index));
+        var body_block = try self.builder.block(body_stmts.items);
+        body_block = self.blockWithLocation(body_block, self.nodeLocation(for_info.ast.then_expr));
 
         const loop_stmt = self.builder.forLoop(pre_block, cond, post_block, body_block);
         try stmts.append(self.allocator, self.stmtWithLocation(loop_stmt, self.nodeLocation(index)));
@@ -1515,16 +875,22 @@ pub const Transformer = struct {
             var body_stmts: std.ArrayList(ast.Statement) = .empty;
             defer body_stmts.deinit(self.allocator);
             try self.processBlock(case_info.ast.target_expr, &body_stmts);
-            const body_block = try self.builder.block(body_stmts.items);
+            var body_block = try self.builder.block(body_stmts.items);
+            const case_loc = self.nodeLocation(case_idx);
+            body_block = self.blockWithLocation(body_block, case_loc);
 
             if (case_info.ast.values.len == 0) {
-                try cases.append(self.allocator, ast.Case.default(body_block));
+                var case_value = ast.Case.default(body_block);
+                case_value.location = case_loc;
+                try cases.append(self.allocator, case_value);
                 continue;
             }
 
             for (case_info.ast.values) |value_node| {
                 if (try self.translateSwitchValue(value_node)) |lit| {
-                    try cases.append(self.allocator, ast.Case.init(lit, body_block));
+                    var case_value = ast.Case.init(lit, body_block);
+                    case_value.location = case_loc;
+                    try cases.append(self.allocator, case_value);
                 }
             }
         }
@@ -1565,9 +931,12 @@ pub const Transformer = struct {
             var body_stmts: std.ArrayList(ast.Statement) = .empty;
             defer body_stmts.deinit(self.allocator);
             try self.processBlock(case_info.ast.target_expr, &body_stmts);
+            const case_loc = self.nodeLocation(case_idx);
 
             if (case_info.ast.values.len == 0) {
-                default_block = try self.builder.block(body_stmts.items);
+                var block = try self.builder.block(body_stmts.items);
+                block = self.blockWithLocation(block, case_loc);
+                default_block = block;
                 continue;
             }
 
@@ -1585,10 +954,11 @@ pub const Transformer = struct {
             var guarded_body: std.ArrayList(ast.Statement) = .empty;
             defer guarded_body.deinit(self.allocator);
             const mark_matched = try self.builder.assign(&.{match_name}, ast.Expression.lit(ast.Literal.number(@as(ast.U256, 1))));
-            try guarded_body.append(self.allocator, mark_matched);
+            try guarded_body.append(self.allocator, self.stmtWithLocation(mark_matched, case_loc));
             try guarded_body.appendSlice(self.allocator, body_stmts.items);
 
-            const guarded_block = try self.builder.block(guarded_body.items);
+            var guarded_block = try self.builder.block(guarded_body.items);
+            guarded_block = self.blockWithLocation(guarded_block, case_loc);
             const if_stmt = self.builder.ifStmt(guard, guarded_block);
             try stmts.append(self.allocator, self.stmtWithLocation(if_stmt, loc));
         }

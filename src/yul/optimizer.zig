@@ -59,7 +59,9 @@ pub const Optimizer = struct {
             }
         }
 
-        return ast.Block.init(try self.builder.dupeStatements(stmts.items));
+        var out = ast.Block.init(try self.builder.dupeStatements(stmts.items));
+        out.location = block.location;
+        return out;
     }
 
     fn optimizeStatement(self: *Optimizer, stmt: ast.Statement) Error!?ast.Statement {

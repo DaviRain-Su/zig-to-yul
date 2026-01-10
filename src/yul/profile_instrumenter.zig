@@ -147,14 +147,15 @@ pub const Instrumenter = struct {
         if (with_prelude and self.next_index > 0) {
             const base_name = "__prof_base";
             const load_free = try self.builder.builtinCall("mload", &.{ast.Expression.lit(ast.Literal.number(0x40))});
-            try stmts.append(self.allocator, try self.builder.varDecl(&.{base_name}, load_free));
+            const base_decl = try self.builder.varDecl(&.{base_name}, load_free);
+            try stmts.append(self.allocator, self.stmtWithLocation(base_decl, block.location));
 
             const size_bytes = @as(ast.U256, self.next_index) * 32;
             const size_expr = ast.Expression.lit(ast.Literal.number(size_bytes));
             const base_expr = ast.Expression.id(base_name);
             const new_free = try self.builder.builtinCall("add", &.{ base_expr, size_expr });
             const store_free = try self.builder.builtinCall("mstore", &.{ ast.Expression.lit(ast.Literal.number(0x40)), new_free });
-            try stmts.append(self.allocator, ast.Statement.expr(store_free));
+            try stmts.append(self.allocator, self.stmtWithLocation(ast.Statement.expr(store_free), block.location));
         }
 
         for (block.statements) |stmt| {
@@ -162,7 +163,9 @@ pub const Instrumenter = struct {
             if (expanded.len > 0) try stmts.appendSlice(self.allocator, expanded);
         }
 
-        return ast.Block.init(try self.builder.dupeStatements(stmts.items));
+        var out_block = ast.Block.init(try self.builder.dupeStatements(stmts.items));
+        out_block.location = block.location;
+        return out_block;
     }
 
     fn instrumentStatement(self: *Self, stmt: ast.Statement) Error![]const ast.Statement {
@@ -173,39 +176,43 @@ pub const Instrumenter = struct {
             .expression_statement => |s| {
                 var expr_stmt = s;
                 expr_stmt.expression = try self.cloneExpression(s.expression);
-                try out.append(self.allocator, ast.Statement{ .expression_statement = expr_stmt });
+                try out.append(self.allocator, self.stmtWithLocation(ast.Statement{ .expression_statement = expr_stmt }, s.location));
             },
             .variable_declaration => |s| {
                 var decl = s;
                 if (s.value) |val| decl.value = try self.cloneExpression(val);
                 decl.variables = try self.builder.dupeTypedNames(s.variables);
-                try out.append(self.allocator, ast.Statement{ .variable_declaration = decl });
+                try out.append(self.allocator, self.stmtWithLocation(ast.Statement{ .variable_declaration = decl }, s.location));
             },
             .assignment => |s| {
                 var assign = s;
                 assign.value = try self.cloneExpression(s.value);
                 assign.variable_names = try self.builder.dupeIdentifiers(s.variable_names);
-                try out.append(self.allocator, ast.Statement{ .assignment = assign });
+                try out.append(self.allocator, self.stmtWithLocation(ast.Statement{ .assignment = assign }, s.location));
             },
             .block => |s| {
-                const blk = try self.instrumentBlock(s, false);
-                try out.append(self.allocator, ast.Statement{ .block = blk });
+                var blk = try self.instrumentBlock(s, false);
+                blk.location = s.location;
+                try out.append(self.allocator, self.stmtWithLocation(ast.Statement{ .block = blk }, s.location));
             },
             .if_statement => |s| {
                 const site = self.nextBranchSite();
                 const cond_name = try self.allocTemp("__prof_cond");
                 const cond_expr = try self.cloneExpression(s.condition);
-                try out.append(self.allocator, try self.builder.varDecl(&.{cond_name}, cond_expr));
+                const cond_decl = try self.builder.varDecl(&.{cond_name}, cond_expr);
+                try out.append(self.allocator, self.stmtWithLocation(cond_decl, s.location));
 
                 var true_block = try self.instrumentBlock(s.body, false);
-                true_block = try self.prependCounter(true_block, site.true_index);
+                true_block = try self.prependCounter(true_block, site.true_index, s.location);
                 const if_stmt = ast.Statement{ .if_statement = ast.If.init(ast.Expression.id(cond_name), true_block) };
-                try out.append(self.allocator, if_stmt);
+                try out.append(self.allocator, self.stmtWithLocation(if_stmt, s.location));
 
                 const false_cond = try self.builder.builtinCall("iszero", &.{ast.Expression.id(cond_name)});
-                const false_block = try self.builder.block(&.{try self.counterStatement(site.false_index)});
+                var false_block = try self.builder.block(&.{try self.counterStatement(site.false_index, s.location)});
+                false_block.location = s.location;
                 const false_if = ast.Statement{ .if_statement = ast.If.init(false_cond, false_block) };
-                try out.append(self.allocator, false_if);
+
+                try out.append(self.allocator, self.stmtWithLocation(false_if, s.location));
             },
             .switch_statement => |s| {
                 const site = self.nextSwitchSite();
@@ -216,12 +223,12 @@ pub const Instrumenter = struct {
                 for (s.cases, 0..) |case_, idx| {
                     var c = case_;
                     var case_block = try self.instrumentBlock(case_.body, false);
-                    case_block = try self.prependCounter(case_block, site.base_index + @as(u32, @intCast(idx)));
+                    case_block = try self.prependCounter(case_block, site.base_index + @as(u32, @intCast(idx)), s.location);
                     c.body = case_block;
                     try cases.append(self.allocator, c);
                 }
                 out_switch.cases = try self.builder.dupeCases(cases.items);
-                try out.append(self.allocator, ast.Statement{ .switch_statement = out_switch });
+                try out.append(self.allocator, self.stmtWithLocation(ast.Statement{ .switch_statement = out_switch }, s.location));
             },
             .for_loop => |s| {
                 const site = self.nextLoopSite();
@@ -230,23 +237,42 @@ pub const Instrumenter = struct {
                 loop.condition = try self.cloneExpression(s.condition);
                 loop.post = try self.instrumentBlock(s.post, false);
                 var body = try self.instrumentBlock(s.body, false);
-                body = try self.prependCounter(body, site.index);
+                body = try self.prependCounter(body, site.index, s.location);
                 loop.body = body;
-                try out.append(self.allocator, ast.Statement{ .for_loop = loop });
+                try out.append(self.allocator, self.stmtWithLocation(ast.Statement{ .for_loop = loop }, s.location));
             },
             .function_definition => |s| {
                 var func = s;
                 func.parameters = try self.builder.dupeTypedNames(s.parameters);
                 func.return_variables = try self.builder.dupeTypedNames(s.return_variables);
                 func.body = try self.instrumentBlock(s.body, false);
-                try out.append(self.allocator, ast.Statement{ .function_definition = func });
+                try out.append(self.allocator, self.stmtWithLocation(ast.Statement{ .function_definition = func }, s.location));
             },
-            .break_statement => try out.append(self.allocator, ast.Statement.breakStmt()),
-            .continue_statement => try out.append(self.allocator, ast.Statement.continueStmt()),
-            .leave_statement => try out.append(self.allocator, ast.Statement.leaveStmt()),
+            .break_statement => |s| try out.append(self.allocator, self.stmtWithLocation(ast.Statement.breakStmt(), s.location)),
+            .continue_statement => |s| try out.append(self.allocator, self.stmtWithLocation(ast.Statement.continueStmt(), s.location)),
+            .leave_statement => |s| try out.append(self.allocator, self.stmtWithLocation(ast.Statement.leaveStmt(), s.location)),
         }
 
         return try self.builder.dupeStatements(out.items);
+    }
+
+    fn stmtWithLocation(self: *Self, stmt: ast.Statement, loc: ast.SourceLocation) ast.Statement {
+        _ = self;
+        var out = stmt;
+        switch (out) {
+            .expression_statement => |*s| s.location = loc,
+            .variable_declaration => |*s| s.location = loc,
+            .assignment => |*s| s.location = loc,
+            .block => |*s| s.location = loc,
+            .if_statement => |*s| s.location = loc,
+            .switch_statement => |*s| s.location = loc,
+            .for_loop => |*s| s.location = loc,
+            .function_definition => |*s| s.location = loc,
+            .break_statement => |*s| s.location = loc,
+            .continue_statement => |*s| s.location = loc,
+            .leave_statement => |*s| s.location = loc,
+        }
+        return out;
     }
 
     fn cloneExpression(self: *Self, expr: ast.Expression) Error!ast.Expression {
@@ -266,24 +292,26 @@ pub const Instrumenter = struct {
         };
     }
 
-    fn counterStatement(self: *Self, index: u32) Error!ast.Statement {
+    fn counterStatement(self: *Self, index: u32, loc: ast.SourceLocation) Error!ast.Statement {
         const base_expr = ast.Expression.id("__prof_base");
         const offset = ast.Expression.lit(ast.Literal.number(@as(ast.U256, index) * 32));
         const addr = try self.builder.builtinCall("add", &.{ base_expr, offset });
         const load_val = try self.builder.builtinCall("mload", &.{addr});
         const inc_val = try self.builder.builtinCall("add", &.{ load_val, ast.Expression.lit(ast.Literal.number(1)) });
         const store = try self.builder.builtinCall("mstore", &.{ addr, inc_val });
-        return ast.Statement.expr(store);
+        return self.stmtWithLocation(ast.Statement.expr(store), loc);
     }
 
-    fn prependCounter(self: *Self, block: ast.Block, index: u32) Error!ast.Block {
+    fn prependCounter(self: *Self, block: ast.Block, index: u32, loc: ast.SourceLocation) Error!ast.Block {
         var stmts = std.ArrayList(ast.Statement).empty;
         defer stmts.deinit(self.allocator);
-        try stmts.append(self.allocator, try self.counterStatement(index));
+        try stmts.append(self.allocator, try self.counterStatement(index, loc));
         for (block.statements) |stmt| {
             try stmts.append(self.allocator, stmt);
         }
-        return ast.Block.init(try self.builder.dupeStatements(stmts.items));
+        var out_block = ast.Block.init(try self.builder.dupeStatements(stmts.items));
+        out_block.location = block.location;
+        return out_block;
     }
 
     fn allocTemp(self: *Self, prefix: []const u8) Error![]const u8 {

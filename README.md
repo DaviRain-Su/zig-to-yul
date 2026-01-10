@@ -46,6 +46,9 @@ zig-to-yul compile contract.zig
 
 # Output to file
 zig-to-yul compile contract.zig -o contract.yul
+
+# Emit source map (Solidity-compatible entries: start:length:source)
+zig-to-yul compile contract.zig -o contract.yul --sourcemap
 ```
 
 ### Build to EVM Bytecode
