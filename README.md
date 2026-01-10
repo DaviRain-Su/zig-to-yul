@@ -97,6 +97,8 @@ Available namespaces:
 - `evm.event` (alias for `evm.event_encode`/`evm.event_decode`)
 - `evm.abi`
 - `evm.precompile`
+- `evm.rpc`
+- `evm.contract`
 
 ### Scaffold Project (z2y)
 
@@ -151,6 +153,20 @@ Example `profiles.json`:
     "private_key_env": "PRIVATE_KEY"
   }
 }
+```
+
+SDK example (call a Solidity function):
+
+```zig
+const evm = @import("zig_to_yul").evm;
+
+const result_hex = try evm.contract.call(
+    allocator,
+    "http://127.0.0.1:8545",
+    "0x1234...",
+    "balanceOf(address)",
+    &.{ .{ .address = some_address } },
+);
 ```
 
 ### Gas Estimation

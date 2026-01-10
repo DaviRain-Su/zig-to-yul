@@ -9,6 +9,8 @@ pub const evm = struct {
     pub const builtins = @import("evm/builtins.zig");
     pub const abi = @import("evm/abi.zig");
     pub const precompile = @import("evm/precompile.zig");
+    pub const rpc = @import("evm/rpc.zig");
+    pub const contract = @import("evm/contract.zig");
 
     pub const event = struct {
         pub const encode = event_encode;
@@ -55,5 +57,19 @@ const internal = struct {
 };
 
 test {
-    @import("std").testing.refAllDecls(internal);
+    const std = @import("std");
+    const builtin = @import("builtin");
+
+    if (builtin.os.tag == .freestanding or builtin.cpu.arch == .wasm32) {
+        std.testing.refAllDecls(internal);
+        std.testing.refAllDecls(@This());
+        return;
+    }
+
+    std.testing.refAllDecls(evm.types);
+    std.testing.refAllDecls(evm.storage);
+    std.testing.refAllDecls(evm.builtins);
+    std.testing.refAllDecls(evm.abi);
+    std.testing.refAllDecls(evm.precompile);
+    std.testing.refAllDecls(evm.rpc);
 }

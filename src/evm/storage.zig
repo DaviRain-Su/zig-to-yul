@@ -40,7 +40,7 @@ pub const StorageLayout = struct {
     ) !ast.Expression {
         // mstore(0x00, key)
         const mstore_key = ast.Expression{ .function_call = .{
-            .identifier = ast.Identifier.init("mstore"),
+            .function_name = "mstore",
             .arguments = try self.allocator.dupe(ast.Expression, &.{
                 ast.Expression.lit(ast.Literal.number(0x00)),
                 key_expr,
@@ -50,7 +50,7 @@ pub const StorageLayout = struct {
 
         // mstore(0x20, baseSlot)
         const mstore_base = ast.Expression{ .function_call = .{
-            .identifier = ast.Identifier.init("mstore"),
+            .function_name = "mstore",
             .arguments = try self.allocator.dupe(ast.Expression, &.{
                 ast.Expression.lit(ast.Literal.number(0x20)),
                 ast.Expression.lit(ast.Literal.number(base_slot)),
@@ -60,7 +60,7 @@ pub const StorageLayout = struct {
 
         // keccak256(0x00, 0x40)
         return ast.Expression{ .function_call = .{
-            .identifier = ast.Identifier.init("keccak256"),
+            .function_name = "keccak256",
             .arguments = try self.allocator.dupe(ast.Expression, &.{
                 ast.Expression.lit(ast.Literal.number(0x00)),
                 ast.Expression.lit(ast.Literal.number(0x40)),
@@ -82,7 +82,7 @@ pub const StorageLayout = struct {
             // 对于每一层，计算 keccak256(key, current_slot)
             // mstore(0x00, key)
             const mstore_key = ast.Expression{ .function_call = .{
-                .identifier = ast.Identifier.init("mstore"),
+                .function_name = "mstore",
                 .arguments = try self.allocator.dupe(ast.Expression, &.{
                     ast.Expression.lit(ast.Literal.number(0x00)),
                     key,
@@ -92,7 +92,7 @@ pub const StorageLayout = struct {
 
             // mstore(0x20, current_slot)
             const mstore_slot = ast.Expression{ .function_call = .{
-                .identifier = ast.Identifier.init("mstore"),
+                .function_name = "mstore",
                 .arguments = try self.allocator.dupe(ast.Expression, &.{
                     ast.Expression.lit(ast.Literal.number(0x20)),
                     current_slot,
@@ -102,7 +102,7 @@ pub const StorageLayout = struct {
 
             // current_slot = keccak256(0x00, 0x40)
             current_slot = ast.Expression{ .function_call = .{
-                .identifier = ast.Identifier.init("keccak256"),
+                .function_name = "keccak256",
                 .arguments = try self.allocator.dupe(ast.Expression, &.{
                     ast.Expression.lit(ast.Literal.number(0x00)),
                     ast.Expression.lit(ast.Literal.number(0x40)),
@@ -197,7 +197,7 @@ pub const StoragePacker = struct {
 
         // sload(slot)
         const sload_expr = ast.Expression{ .function_call = .{
-            .identifier = ast.Identifier.init("sload"),
+            .function_name = "sload",
             .arguments = try self.allocator.dupe(ast.Expression, &.{
                 ast.Expression.lit(ast.Literal.number(slot)),
             }),
@@ -206,7 +206,7 @@ pub const StoragePacker = struct {
         if (field.offset_bits == 0) {
             // 无需移位，只需 mask
             return ast.Expression{ .function_call = .{
-                .identifier = ast.Identifier.init("and"),
+                .function_name = "and",
                 .arguments = try self.allocator.dupe(ast.Expression, &.{
                     sload_expr,
                     ast.Expression.lit(ast.Literal.number(mask)),
@@ -216,7 +216,7 @@ pub const StoragePacker = struct {
 
         // shr(offset, sload(slot))
         const shifted = ast.Expression{ .function_call = .{
-            .identifier = ast.Identifier.init("shr"),
+            .function_name = "shr",
             .arguments = try self.allocator.dupe(ast.Expression, &.{
                 ast.Expression.lit(ast.Literal.number(field.offset_bits)),
                 sload_expr,
@@ -225,7 +225,7 @@ pub const StoragePacker = struct {
 
         // and(shifted, mask)
         return ast.Expression{ .function_call = .{
-            .identifier = ast.Identifier.init("and"),
+            .function_name = "and",
             .arguments = try self.allocator.dupe(ast.Expression, &.{
                 shifted,
                 ast.Expression.lit(ast.Literal.number(mask)),
@@ -247,7 +247,7 @@ pub const StoragePacker = struct {
 
         // 1. 读取当前值: let _old := sload(slot)
         const sload_expr = ast.Expression{ .function_call = .{
-            .identifier = ast.Identifier.init("sload"),
+            .function_name = "sload",
             .arguments = try self.allocator.dupe(ast.Expression, &.{
                 ast.Expression.lit(ast.Literal.number(slot)),
             }),
@@ -255,7 +255,7 @@ pub const StoragePacker = struct {
 
         // 2. 清除旧值: and(_old, clearMask)
         const cleared = ast.Expression{ .function_call = .{
-            .identifier = ast.Identifier.init("and"),
+            .function_name = "and",
             .arguments = try self.allocator.dupe(ast.Expression, &.{
                 sload_expr,
                 ast.Expression.lit(ast.Literal.number(clear_mask)),
@@ -264,7 +264,7 @@ pub const StoragePacker = struct {
 
         // 3. 移位新值: shl(offset, and(value, mask))
         const masked_value = ast.Expression{ .function_call = .{
-            .identifier = ast.Identifier.init("and"),
+            .function_name = "and",
             .arguments = try self.allocator.dupe(ast.Expression, &.{
                 value,
                 ast.Expression.lit(ast.Literal.number(mask)),
@@ -275,7 +275,7 @@ pub const StoragePacker = struct {
             masked_value
         else
             ast.Expression{ .function_call = .{
-                .identifier = ast.Identifier.init("shl"),
+                .function_name = "shl",
                 .arguments = try self.allocator.dupe(ast.Expression, &.{
                     ast.Expression.lit(ast.Literal.number(field.offset_bits)),
                     masked_value,
@@ -284,7 +284,7 @@ pub const StoragePacker = struct {
 
         // 4. 合并: or(cleared, shifted)
         const merged = ast.Expression{ .function_call = .{
-            .identifier = ast.Identifier.init("or"),
+            .function_name = "or",
             .arguments = try self.allocator.dupe(ast.Expression, &.{
                 cleared,
                 shifted_value,
@@ -293,7 +293,7 @@ pub const StoragePacker = struct {
 
         // 5. 写入: sstore(slot, merged)
         const sstore_expr = ast.Expression{ .function_call = .{
-            .identifier = ast.Identifier.init("sstore"),
+            .function_name = "sstore",
             .arguments = try self.allocator.dupe(ast.Expression, &.{
                 ast.Expression.lit(ast.Literal.number(slot)),
                 merged,
@@ -345,7 +345,7 @@ pub const MemoryOptimizer = struct {
     ) !ast.Expression {
         // mstore(0x00, data1)
         const mstore1 = ast.Expression{ .function_call = .{
-            .identifier = ast.Identifier.init("mstore"),
+            .function_name = "mstore",
             .arguments = try allocator.dupe(ast.Expression, &.{
                 ast.Expression.lit(ast.Literal.number(0x00)),
                 data1,
@@ -355,7 +355,7 @@ pub const MemoryOptimizer = struct {
 
         // mstore(0x20, data2)
         const mstore2 = ast.Expression{ .function_call = .{
-            .identifier = ast.Identifier.init("mstore"),
+            .function_name = "mstore",
             .arguments = try allocator.dupe(ast.Expression, &.{
                 ast.Expression.lit(ast.Literal.number(0x20)),
                 data2,
@@ -365,7 +365,7 @@ pub const MemoryOptimizer = struct {
 
         // keccak256(0x00, 0x40)
         return ast.Expression{ .function_call = .{
-            .identifier = ast.Identifier.init("keccak256"),
+            .function_name = "keccak256",
             .arguments = try allocator.dupe(ast.Expression, &.{
                 ast.Expression.lit(ast.Literal.number(0x00)),
                 ast.Expression.lit(ast.Literal.number(0x40)),
@@ -374,6 +374,21 @@ pub const MemoryOptimizer = struct {
     }
 };
 
+fn freeExpression(allocator: Allocator, expr: ast.Expression) void {
+    switch (expr) {
+        .function_call => |call| allocator.free(call.arguments),
+        .builtin_call => |call| allocator.free(call.arguments),
+        else => {},
+    }
+}
+
+fn freeStatement(allocator: Allocator, stmt: ast.Statement) void {
+    switch (stmt) {
+        .expression_statement => |s| freeExpression(allocator, s.expression),
+        else => {},
+    }
+}
+
 test "mapping slot calculation" {
     const allocator = std.testing.allocator;
 
@@ -381,15 +396,20 @@ test "mapping slot calculation" {
     const base_slot = layout.allocSlot();
 
     var stmts: std.ArrayList(ast.Statement) = .empty;
-    defer stmts.deinit(allocator);
+    defer {
+        for (stmts.items) |stmt| {
+            freeStatement(allocator, stmt);
+        }
+        stmts.deinit(allocator);
+    }
 
     const key = ast.Expression{ .function_call = .{
-        .identifier = ast.Identifier.init("caller"),
+        .function_name = "caller",
         .arguments = &.{},
     } };
 
     const slot_expr = try layout.genMappingSlot(key, base_slot, &stmts);
-    _ = slot_expr;
+    defer freeExpression(allocator, slot_expr);
 
     // 应该生成 2 个 mstore 语句
     try std.testing.expectEqual(@as(usize, 2), stmts.items.len);
@@ -408,7 +428,12 @@ test "storage packing analysis" {
     };
 
     const slots = try packer.analyzeStruct(fields);
-    defer allocator.free(slots);
+    defer {
+        for (slots) |slot| {
+            allocator.free(slot.fields);
+        }
+        allocator.free(slots);
+    }
 
     // 应该只需要 1 个 slot
     try std.testing.expectEqual(@as(usize, 1), slots.len);

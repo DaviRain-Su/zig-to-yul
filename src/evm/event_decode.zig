@@ -1097,7 +1097,7 @@ test "decode indexed string with preimage" {
     };
 
     var topics: [2][32]u8 = undefined;
-    @memset(&topics, 0);
+    @memset(std.mem.asBytes(&topics), 0);
     const decoded = try decodeEvent(allocator, event, topics[0..], &.{});
     defer decoded.deinit(allocator);
 
@@ -1145,7 +1145,7 @@ test "event signature validation" {
     };
 
     var topics: [3][32]u8 = undefined;
-    @memset(&topics, 0);
+    @memset(std.mem.asBytes(&topics), 0);
     topics[0] = try eventSignatureHash(allocator, event);
 
     var data: [32]u8 = undefined;
@@ -1171,13 +1171,13 @@ test "anonymous event topic count" {
     };
 
     var topics: [1][32]u8 = undefined;
-    @memset(&topics, 0);
+    @memset(std.mem.asBytes(&topics), 0);
     var data: [0]u8 = .{};
 
     const decoded = try decodeEvent(allocator, event, topics[0..], data[0..]);
     defer decoded.deinit(allocator);
 
     var extra_topics: [2][32]u8 = undefined;
-    @memset(&extra_topics, 0);
+    @memset(std.mem.asBytes(&extra_topics), 0);
     try std.testing.expectError(error.ExtraTopics, decodeEvent(allocator, event, extra_topics[0..], data[0..]));
 }
