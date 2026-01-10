@@ -201,6 +201,22 @@ pub fn main() !void {
         return;
     }
 
+    if (std.mem.eql(u8, command, "build")) {
+        if (args.len > 2) {
+            try printUsage();
+            return;
+        }
+        const output = try buildBytecode(allocator);
+        defer allocator.free(output);
+
+        var stdout_buffer: [1024]u8 = undefined;
+        var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
+        const stdout: *std.Io.Writer = &stdout_writer.interface;
+        try stdout.print("Bytecode written: out/Contract.bin\n", .{});
+        try stdout.flush();
+        return;
+    }
+
     try printUsage();
 }
 
@@ -213,6 +229,7 @@ fn printUsage() !void {
             "  z2y init [dir]\n" ++
             "  z2y install\n" ++
             "  z2y info\n" ++
+            "  z2y build\n" ++
             "  z2y build-abi\n" ++
             "  z2y test\n" ++
             "  z2y deploy [--rpc-url <url>]\n",

@@ -95,6 +95,9 @@ cd tools/z2y && zig build
 # Check tool availability (zig, zig-to-yul, solc, anvil, forge, cast)
 ./tools/z2y/zig-out/bin/z2y info
 
+# Build bytecode into out/Contract.bin
+./tools/z2y/zig-out/bin/z2y build
+
 # Generate ABI + Yul into out/
 ./tools/z2y/zig-out/bin/z2y build-abi
 

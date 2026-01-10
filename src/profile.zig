@@ -227,7 +227,19 @@ pub fn profileMapToJson(allocator: std.mem.Allocator, map: ProfileMap) ![]const 
         .counter_count = map.counter_count,
     };
 
-    return std.json.stringifyAlloc(allocator, map_json, .{});
+    return jsonStringifyAlloc(allocator, map_json);
+}
+
+fn jsonStringifyAlloc(allocator: std.mem.Allocator, value: anytype) ![]u8 {
+    var out: std.io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+
+    var write_stream: std.json.Stringify = .{
+        .writer = &out.writer,
+        .options = .{},
+    };
+    try write_stream.write(value);
+    return try allocator.dupe(u8, out.written());
 }
 
 pub fn parseProfileCounts(allocator: std.mem.Allocator, json_bytes: []const u8) !ProfileCounts {

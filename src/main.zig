@@ -226,7 +226,7 @@ fn runEstimate(allocator: std.mem.Allocator, args: []const []const u8) !void {
 
     const result = gas_estimator.estimateWithOptions(yul_ast_root, estimate_opts);
 
-    const json_out = try std.json.stringifyAlloc(allocator, result, .{});
+    const json_out = try jsonStringifyAlloc(allocator, result);
     defer allocator.free(json_out);
 
     if (opts.output_file) |path| {
@@ -279,7 +279,7 @@ fn runProfile(allocator: std.mem.Allocator, args: []const []const u8) !void {
     var instrumenter = profile_instrumenter.Instrumenter.initWithOptions(allocator, should_return_counts);
     defer instrumenter.deinit();
 
-    const instrumented = try instrumenter.instrument(yul_ast_root);
+    var instrumented = try instrumenter.instrument(yul_ast_root);
     defer instrumented.map.deinit(allocator);
 
     const yul_code = printer.format(allocator, instrumented.ast) catch |err| {
@@ -327,72 +327,9 @@ fn runProfile(allocator: std.mem.Allocator, args: []const []const u8) !void {
         }
 
         if (aggregate) |agg| {
-            const profile_json = try std.json.stringifyAlloc(allocator, agg, .{});
+            const profile_json = try jsonStringifyAlloc(allocator, agg);
             defer allocator.free(profile_json);
-            if (opts.profile_out) |path| {
-                try writeOutput(profile_json, path);
-            } else {
-                const stdout = std.fs.File.stdout();
-                stdout.writeAll(profile_json) catch {};
-                stdout.writeAll("\n") catch {};
-            }
-        }
-    }
 
-    if (opts.rpc_url) |rpc_url| {
-        const from_addr = try rpcPickFromAccount(allocator, rpc_url);
-        defer allocator.free(from_addr);
-
-        var contract_addr: ?[]u8 = null;
-        defer if (contract_addr) |addr| allocator.free(addr);
-
-        if (opts.deploy) {
-            const bytecode = try compileSolc(allocator, yul_code, opts.optimize);
-            defer allocator.free(bytecode);
-            const deploy_tx = try rpcSendTransaction(allocator, rpc_url, from_addr, bytecode);
-            defer allocator.free(deploy_tx);
-            contract_addr = try rpcWaitForContract(allocator, rpc_url, deploy_tx);
-        } else if (opts.contract_addr) |addr| {
-            contract_addr = try allocator.dupe(u8, addr);
-        }
-
-        if (contract_addr == null) {
-            std.debug.print("Error: contract address required (deploy failed or --no-deploy without --contract)\n", .{});
-            std.process.exit(1);
-        }
-
-        var call_data_buf: ?[]u8 = null;
-        defer if (call_data_buf) |buf| allocator.free(buf);
-        const call_data = if (opts.call_data) |raw| blk: {
-            call_data_buf = try resolveCallData(allocator, raw);
-            break :blk call_data_buf.?;
-        } else "0x";
-
-        var aggregate: ?profile.ProfileData = null;
-        defer if (aggregate) |*agg| agg.deinit(allocator);
-
-        var run_index: u64 = 0;
-        while (run_index < opts.runs) : (run_index += 1) {
-            const return_hex = try rpcCall(allocator, rpc_url, from_addr, contract_addr.?, call_data);
-            defer allocator.free(return_hex);
-
-            const raw_bytes = try parseHexAlloc(allocator, return_hex);
-            defer allocator.free(raw_bytes);
-            const counts = try countsFromReturn(allocator, raw_bytes, instrumented.map.counter_count);
-            defer allocator.free(counts);
-
-            var run = try profile.profileFromCounts(allocator, instrumented.map, counts);
-            if (aggregate) |*agg| {
-                try profile.mergeProfileData(agg, run);
-                run.deinit(allocator);
-            } else {
-                aggregate = run;
-            }
-        }
-
-        if (aggregate) |agg| {
-            const profile_json = try std.json.stringifyAlloc(allocator, agg, .{});
-            defer allocator.free(profile_json);
             if (opts.profile_out) |path| {
                 try writeOutput(profile_json, path);
             } else {
@@ -652,12 +589,24 @@ fn buildAbiJson(allocator: std.mem.Allocator, trans: *Transformer, source_path: 
         });
     }
 
-    const json_out = try std.json.stringifyAlloc(allocator, items.items, .{});
+    const json_out = try jsonStringifyAlloc(allocator, items.items);
     for (items.items) |item| {
         allocator.free(item.inputs);
         allocator.free(item.outputs);
     }
     return json_out;
+}
+
+fn jsonStringifyAlloc(allocator: std.mem.Allocator, value: anytype) ![]u8 {
+    var out: std.io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+
+    var write_stream: std.json.Stringify = .{
+        .writer = &out.writer,
+        .options = .{},
+    };
+    try write_stream.write(value);
+    return try allocator.dupe(u8, out.written());
 }
 
 fn rpcPickFromAccount(allocator: std.mem.Allocator, url: []const u8) ![]u8 {
