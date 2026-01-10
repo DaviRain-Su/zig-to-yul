@@ -104,7 +104,11 @@ pub const Optimizer = struct {
             j += 1;
         }
 
-        var out = ast.Block.init(try self.builder.dupeStatements(merged.items));
+        var propagated = std.ArrayList(ast.Statement).empty;
+        defer propagated.deinit(self.allocator);
+        try self.propagateConstants(merged.items, &propagated);
+
+        var out = ast.Block.init(try self.builder.dupeStatements(propagated.items));
         out.location = block.location;
         return out;
     }
@@ -184,6 +188,97 @@ pub const Optimizer = struct {
         };
     }
 
+    fn propagateConstants(self: *Optimizer, stmts: []const ast.Statement, out: *std.ArrayList(ast.Statement)) Error!void {
+        var consts = std.StringHashMap(ast.Expression).init(self.allocator);
+        defer consts.deinit();
+
+        for (stmts) |stmt| {
+            switch (stmt) {
+                .variable_declaration => |s| {
+                    var out_stmt = s;
+                    if (s.value) |val| {
+                        const replaced = try self.replaceConstExpr(val, &consts);
+                        const simplified = try self.optimizeExpression(replaced);
+                        out_stmt.value = simplified;
+                        if (s.variables.len == 1 and simplified == .literal) {
+                            try consts.put(s.variables[0].name, simplified);
+                        } else {
+                            if (s.variables.len == 1) _ = consts.remove(s.variables[0].name);
+                        }
+                    } else if (s.variables.len == 1) {
+                        _ = consts.remove(s.variables[0].name);
+                    }
+                    out_stmt.variables = try self.builder.dupeTypedNames(s.variables);
+                    try out.append(self.allocator, ast.Statement{ .variable_declaration = out_stmt });
+                },
+                .assignment => |s| {
+                    if (consts.count() == 0) {
+                        try out.append(self.allocator, stmt);
+                    } else {
+                        var out_stmt = s;
+                        const replaced = try self.replaceConstExpr(s.value, &consts);
+                        const simplified = try self.optimizeExpression(replaced);
+                        out_stmt.value = simplified;
+                        out_stmt.variable_names = try self.builder.dupeIdentifiers(s.variable_names);
+                        if (s.variable_names.len == 1 and simplified == .literal) {
+                            try consts.put(s.variable_names[0].name, simplified);
+                        } else if (s.variable_names.len == 1) {
+                            _ = consts.remove(s.variable_names[0].name);
+                        }
+                        try out.append(self.allocator, ast.Statement{ .assignment = out_stmt });
+                    }
+                },
+                .expression_statement => |s| {
+                    if (consts.count() == 0) {
+                        try out.append(self.allocator, stmt);
+                    } else {
+                        var out_stmt = s;
+                        const replaced = try self.replaceConstExpr(s.expression, &consts);
+                        out_stmt.expression = try self.optimizeExpression(replaced);
+                        try out.append(self.allocator, ast.Statement{ .expression_statement = out_stmt });
+                    }
+                },
+                else => {
+                    try out.append(self.allocator, stmt);
+                },
+            }
+        }
+    }
+
+    fn replaceConstExpr(
+        self: *Optimizer,
+        expr: ast.Expression,
+        consts: *std.StringHashMap(ast.Expression),
+    ) Error!ast.Expression {
+        switch (expr) {
+            .identifier => |id| {
+                if (consts.get(id.name)) |value| return value;
+                return expr;
+            },
+            .builtin_call => |call| {
+                var args = std.ArrayList(ast.Expression).empty;
+                defer args.deinit(self.allocator);
+                for (call.arguments) |arg| {
+                    try args.append(self.allocator, try self.replaceConstExpr(arg, consts));
+                }
+                var out = call;
+                out.arguments = try self.builder.dupeExpressions(args.items);
+                return ast.Expression{ .builtin_call = out };
+            },
+            .function_call => |call| {
+                var args = std.ArrayList(ast.Expression).empty;
+                defer args.deinit(self.allocator);
+                for (call.arguments) |arg| {
+                    try args.append(self.allocator, try self.replaceConstExpr(arg, consts));
+                }
+                var out = call;
+                out.arguments = try self.builder.dupeExpressions(args.items);
+                return ast.Expression{ .function_call = out };
+            },
+            else => return expr,
+        }
+    }
+
     fn optimizeExpression(self: *Optimizer, expr: ast.Expression) Error!ast.Expression {
         switch (expr) {
             .literal, .identifier => return expr,
@@ -206,7 +301,8 @@ pub const Optimizer = struct {
 
                 const loc = expr.getLocation();
                 if (simplifyBuiltin(call.builtin_name.name, args.items)) |replacement| {
-                    return withLocation(replacement, loc);
+                    const cloned = try self.cloneExpression(replacement);
+                    return withLocation(cloned, loc);
                 }
 
                 var out = call;
@@ -214,6 +310,22 @@ pub const Optimizer = struct {
                 return ast.Expression{ .builtin_call = out };
             },
         }
+    }
+
+    fn cloneExpression(self: *Optimizer, expr: ast.Expression) Error!ast.Expression {
+        return switch (expr) {
+            .builtin_call => |call| blk: {
+                var out = call;
+                out.arguments = try self.builder.dupeExpressions(call.arguments);
+                break :blk ast.Expression{ .builtin_call = out };
+            },
+            .function_call => |call| blk: {
+                var out = call;
+                out.arguments = try self.builder.dupeExpressions(call.arguments);
+                break :blk ast.Expression{ .function_call = out };
+            },
+            else => expr,
+        };
     }
 
     const IfAssignment = struct {
@@ -474,32 +586,37 @@ pub const Optimizer = struct {
         if (input_offset != 0 or input_size != expected_size) return false;
 
         const selector_expr = ast.Expression.lit(ast.Literal.number(selector));
-        try out.append(self.allocator, ast.Statement.expr(ast.Expression.builtinCall("mstore", &.{
+        const store_selector = try self.builder.builtinCall("mstore", &.{
             ast.Expression.lit(ast.Literal.number(0x0c)),
             selector_expr,
-        })));
+        });
+        try out.append(self.allocator, ast.Statement.expr(store_selector));
 
         const arg0_expr = try self.ensureAddressWord(arg0);
-        try out.append(self.allocator, ast.Statement.expr(ast.Expression.builtinCall("mstore", &.{
+        const store_arg0 = try self.builder.builtinCall("mstore", &.{
             ast.Expression.lit(ast.Literal.number(0x2c)),
             arg0_expr,
-        })));
+        });
+        try out.append(self.allocator, ast.Statement.expr(store_arg0));
 
         if (is_transfer) {
-            try out.append(self.allocator, ast.Statement.expr(ast.Expression.builtinCall("mstore", &.{
+            const store_amount = try self.builder.builtinCall("mstore", &.{
                 ast.Expression.lit(ast.Literal.number(0x40)),
                 arg1,
-            })));
+            });
+            try out.append(self.allocator, ast.Statement.expr(store_amount));
         } else if (arg2) |amount| {
             const arg1_expr = try self.ensureAddressWord(arg1);
-            try out.append(self.allocator, ast.Statement.expr(ast.Expression.builtinCall("mstore", &.{
+            const store_to = try self.builder.builtinCall("mstore", &.{
                 ast.Expression.lit(ast.Literal.number(0x40)),
                 arg1_expr,
-            })));
-            try out.append(self.allocator, ast.Statement.expr(ast.Expression.builtinCall("mstore", &.{
+            });
+            try out.append(self.allocator, ast.Statement.expr(store_to));
+            const store_amt = try self.builder.builtinCall("mstore", &.{
                 ast.Expression.lit(ast.Literal.number(0x60)),
                 amount,
-            })));
+            });
+            try out.append(self.allocator, ast.Statement.expr(store_amt));
         }
 
         const new_call = try self.rewriteCallInput(call_stmt, 0x1c, expected_size);
@@ -1393,6 +1510,31 @@ test "rewrite mod add to addmod" {
     const out_expr = out_stmt.expression_statement.expression;
     try std.testing.expect(out_expr == .builtin_call);
     try std.testing.expectEqualStrings("addmod", out_expr.builtin_call.builtin_name.name);
+}
+
+test "constant propagation simple" {
+    const allocator = std.testing.allocator;
+    var builder = ast.AstBuilder.init(allocator);
+    defer builder.deinit();
+
+    const decl_x = try builder.varDecl(&.{"x"}, ast.Expression.lit(ast.Literal.number(32)));
+    const mul_expr = ast.Expression.builtinCall("mul", &.{ ast.Expression.id("x"), ast.Expression.lit(ast.Literal.number(2)) });
+    const decl_y = try builder.varDecl(&.{"y"}, mul_expr);
+
+    const code_block = ast.Block.init(try builder.dupeStatements(&.{ decl_x, decl_y }));
+    const obj = ast.Object.init("Opt", code_block, &.{}, &.{});
+    const root = ast.AST.init(obj);
+
+    var opt = Optimizer.init(allocator);
+    defer opt.deinit();
+    const optimized = try opt.optimize(root);
+    try std.testing.expectEqual(@as(usize, 2), optimized.root.code.statements.len);
+
+    const stmt = optimized.root.code.statements[1];
+    try std.testing.expect(stmt == .variable_declaration);
+    const value = stmt.variable_declaration.value orelse return error.TestUnexpectedResult;
+    try std.testing.expect(value == .literal);
+    try std.testing.expectEqual(@as(ast.U256, 64), value.literal.value.number);
 }
 
 test "optimize erc20 transferfrom layout" {
