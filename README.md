@@ -34,7 +34,15 @@ The binary will be at `./zig-out/bin/zig_to_yul`.
 
 ### From Releases
 
-Download pre-built binaries from the [Releases](https://github.com/example/zig-to-yul/releases) page.
+Download pre-built binaries from the [Releases](https://github.com/DaviRain-Su/zig-to-yul/releases) page.
+
+One-line installer (Linux/macOS, installs `z2y` + `zig_to_yul` to `~/.local/bin`):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/DaviRain-Su/zig-to-yul/v0.1.0/scripts/install.sh | bash
+```
+
+Ensure Zig 0.15.2 is installed separately (required by `z2y`).
 
 ## Usage
 
