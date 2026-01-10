@@ -409,7 +409,7 @@ pub fn hasBuiltin(self: Dialect, name: []const u8) bool { ... }
 | 多返回值 | ✅ | 结构体返回会连续 `mstore` |
 | 事件编码 | ✅ | 新增 `evm.event_encode` 辅助：编码 data + 生成 topic，再调用 log0-log4 |
 
-### 6.5 SourceLocation 部分填充
+### 6.5 SourceLocation 完整填充
 
 ```zig
 // ast.zig - 结构存在
@@ -419,8 +419,8 @@ pub const SourceLocation = struct {
     source_index: ?u32 = null,
 };
 
-// transformer.zig - 主要语句/表达式已填充
-// 结果：AST 路径错误定位更准确，IR 路径仍无位置
+// transformer.zig - 语句/表达式均填充，source_index 固定为 0
+// 结果：AST 路径错误定位与 sourcemap 完整可用
 ```
 
 ---

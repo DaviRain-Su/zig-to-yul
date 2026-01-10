@@ -256,6 +256,7 @@ pub const Transformer = struct {
             const location = ast.SourceLocation{
                 .start = token.start,
                 .end = token.start + 1,
+                .source_index = 0,
             };
             try self.addError(@tagName(err.tag), location, .parse_error);
         }
@@ -277,7 +278,7 @@ pub const Transformer = struct {
         const first_loc = p.ast.tokens.get(first_token);
         const last_loc = p.ast.tokens.get(last_token);
         const last_len: u32 = @intCast(p.getTokenSlice(last_token).len);
-        return .{ .start = first_loc.start, .end = last_loc.start + last_len };
+        return .{ .start = first_loc.start, .end = last_loc.start + last_len, .source_index = 0 };
     }
 
     fn exprWithLocation(self: *Self, expr: ast.Expression, loc: ast.SourceLocation) ast.Expression {
