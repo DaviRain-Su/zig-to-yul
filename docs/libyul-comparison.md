@@ -394,7 +394,7 @@ pub fn hasBuiltin(self: Dialect, name: []const u8) bool { ... }
 | continue | ✅ | 不支持 label/value |
 | if-else | ✅ | 通过 `iszero` 翻转 |
 | 复杂表达式 | ✅ | 递归翻译算术/调用/访问 |
-| 数组索引 | ⚠️ 部分 | 内存 `mload/mstore`，存储 slot+index，本地结构体字段索引走内存地址 |
+| 数组索引 | ✅ | 支持内存数组/切片、结构体数组索引（字段访问通过结构体指针 + stride 计算）；存储数组仍按 slot+index |
 | 结构体字面量 | ⚠️ 部分 | 生成内存初始化 helper 并返回指针，需显式类型 |
 
 ### 6.4 ABI 编解码限制

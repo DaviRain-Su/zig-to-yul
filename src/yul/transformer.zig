@@ -1850,6 +1850,20 @@ pub const Transformer = struct {
                             ast.Expression.lit(ast.Literal.number(offset)),
                         });
                         const idx_expr = try self.translateExpression(index_node);
+                        const field_type = self.structFieldType(fields, field_name);
+                        if (field_type) |type_name| {
+                            if (self.parseArrayElemType(type_name)) |elem_type| {
+                                const stride = self.elementStrideBytes(elem_type);
+                                const addr = if (stride == 32)
+                                    try self.indexedMemoryAddress(base_addr, idx_expr)
+                                else
+                                    try self.indexedMemoryAddressStride(base_addr, idx_expr, stride);
+                                if (self.struct_defs.get(elem_type) != null) {
+                                    return addr;
+                                }
+                                return try self.builder.builtinCall("mload", &.{addr});
+                            }
+                        }
                         const addr = try self.indexedMemoryAddress(base_addr, idx_expr);
                         return try self.builder.builtinCall("mload", &.{addr});
                     }
@@ -1859,6 +1873,17 @@ pub const Transformer = struct {
 
         const base_expr = try self.translateExpression(base_node);
         const idx_expr = try self.translateExpression(index_node);
+        if (self.arrayElemTypeForNode(base_node)) |elem_type| {
+            const stride = self.elementStrideBytes(elem_type);
+            const addr = if (stride == 32)
+                try self.indexedMemoryAddress(base_expr, idx_expr)
+            else
+                try self.indexedMemoryAddressStride(base_expr, idx_expr, stride);
+            if (self.struct_defs.get(elem_type) != null) {
+                return addr;
+            }
+            return try self.builder.builtinCall("mload", &.{addr});
+        }
         const addr = try self.indexedMemoryAddress(base_expr, idx_expr);
         return try self.builder.builtinCall("mload", &.{addr});
     }
@@ -1890,6 +1915,22 @@ pub const Transformer = struct {
                             ast.Expression.lit(ast.Literal.number(offset)),
                         });
                         const idx_expr = try self.translateExpression(index_node);
+                        const field_type = self.structFieldType(fields, field_name);
+                        if (field_type) |type_name| {
+                            if (self.parseArrayElemType(type_name)) |elem_type| {
+                                if (self.struct_defs.get(elem_type) != null) {
+                                    try self.addError("array store for struct elements is not supported", self.nodeLocation(target), .unsupported_feature);
+                                    return null;
+                                }
+                                const stride = self.elementStrideBytes(elem_type);
+                                const addr = if (stride == 32)
+                                    try self.indexedMemoryAddress(base_addr, idx_expr)
+                                else
+                                    try self.indexedMemoryAddressStride(base_addr, idx_expr, stride);
+                                const store = try self.builder.builtinCall("mstore", &.{ addr, value });
+                                return ast.Statement.expr(store);
+                            }
+                        }
                         const addr = try self.indexedMemoryAddress(base_addr, idx_expr);
                         const store = try self.builder.builtinCall("mstore", &.{ addr, value });
                         return ast.Statement.expr(store);
@@ -1900,6 +1941,19 @@ pub const Transformer = struct {
 
         const base_expr = try self.translateExpression(base_node);
         const idx_expr = try self.translateExpression(index_node);
+        if (self.arrayElemTypeForNode(base_node)) |elem_type| {
+            if (self.struct_defs.get(elem_type) != null) {
+                try self.addError("array store for struct elements is not supported", self.nodeLocation(target), .unsupported_feature);
+                return null;
+            }
+            const stride = self.elementStrideBytes(elem_type);
+            const addr = if (stride == 32)
+                try self.indexedMemoryAddress(base_expr, idx_expr)
+            else
+                try self.indexedMemoryAddressStride(base_expr, idx_expr, stride);
+            const store = try self.builder.builtinCall("mstore", &.{ addr, value });
+            return ast.Statement.expr(store);
+        }
         const addr = try self.indexedMemoryAddress(base_expr, idx_expr);
         const store = try self.builder.builtinCall("mstore", &.{ addr, value });
         return ast.Statement.expr(store);
@@ -2058,6 +2112,16 @@ pub const Transformer = struct {
         for (fields, 0..) |field, i| {
             if (std.mem.eql(u8, field.name, field_name)) {
                 return @intCast(i * 32);
+            }
+        }
+        return null;
+    }
+
+    fn structFieldType(self: *Self, fields: []const StructFieldDef, field_name: []const u8) ?[]const u8 {
+        _ = self;
+        for (fields) |field| {
+            if (std.mem.eql(u8, field.name, field_name)) {
+                return field.type_name;
             }
         }
         return null;
@@ -3213,10 +3277,11 @@ test "transform expression coverage" {
         \\        return (x + y) * 2;
         \\    }
         \\
-        \\    pub fn compute(self: *Counter, offset: u256) u256 {
+        \\    pub fn compute(self: *Counter, offset: u256, pairs: []Pair) u256 {
         \\        const p = Pair{ .a = 7 + offset, .b = (1 + 2) * 3 };
         \\        var x = (p.a + self.value) * (offset - 1);
         \\        var y = p.b[1];
+        \\        var z = pairs[1].a;
         \\        self.value = x + self.helper(p.a, y);
         \\        return x + y;
         \\    }
@@ -3247,4 +3312,5 @@ test "transform expression coverage" {
     try std.testing.expect(std.mem.indexOf(u8, output, "function helper") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "__zig2yul$init$Pair") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "mload") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "pairs") != null);
 }
