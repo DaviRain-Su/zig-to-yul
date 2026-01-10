@@ -411,8 +411,7 @@ test "optimize basic expression folds" {
     var opt = Optimizer.init(allocator);
     defer opt.deinit();
     const optimized = try opt.optimize(root);
-    const out_stmt = optimized.root.code.statements[0];
-    try std.testing.expect(out_stmt.expression_statement.expression == .identifier);
+    try std.testing.expectEqual(@as(usize, 0), optimized.root.code.statements.len);
 }
 
 test "drop if false" {

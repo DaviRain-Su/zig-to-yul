@@ -135,27 +135,14 @@ pub fn build(b: *std.Build) void {
     // A run step that will run the second test executable.
     const run_exe_tests = b.addRunArtifact(exe_tests);
 
-    const extra_test_files = [_][]const u8{
-        "src/profile.zig",
-        "src/compiler.zig",
-        "src/zig2yul.zig",
-        "src/ast/parser.zig",
-        "src/sema/symbols.zig",
-        "src/yul/ast.zig",
-        "src/yul/codegen.zig",
-        "src/yul/ir.zig",
-        "src/yul/gas_estimator.zig",
-        "src/yul/optimizer.zig",
-        "src/yul/printer.zig",
-        "src/yul/profile_instrumenter.zig",
-        "src/yul/source_map.zig",
-        "src/yul/transformer.zig",
-        "src/evm/builtins.zig",
-        "src/evm/event_decode.zig",
-        "src/evm/event_encode.zig",
-        "src/evm/storage.zig",
-        "src/evm/types.zig",
-    };
+    const all_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/test_all.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_all_tests = b.addRunArtifact(all_tests);
 
     // A top level step for running all tests. dependOn can be called multiple
     // times and since the two run steps do not depend on one another, this will
@@ -163,18 +150,7 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
-
-    inline for (extra_test_files) |path| {
-        const file_tests = b.addTest(.{
-            .root_module = b.createModule(.{
-                .root_source_file = b.path(path),
-                .target = target,
-                .optimize = optimize,
-            }),
-        });
-        const run_file_tests = b.addRunArtifact(file_tests);
-        test_step.dependOn(&run_file_tests.step);
-    }
+    test_step.dependOn(&run_all_tests.step);
 
     // Just like flags, top level steps are also listed in the `--help` menu.
     //
