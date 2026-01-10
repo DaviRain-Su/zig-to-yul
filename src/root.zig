@@ -38,6 +38,7 @@ pub const yul = struct {
 pub const evm = struct {
     pub const types = @import("evm/types.zig");
     pub const event_decode = @import("evm/event_decode.zig");
+    pub const event_encode = @import("evm/event_encode.zig");
     pub const builtins = @import("evm/builtins.zig");
     pub const U256 = types.U256;
     pub const Address = types.Address;

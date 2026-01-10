@@ -2,7 +2,6 @@
 
 - Gas 估算仅静态估算（5.3）
 - Yul 优化器仅 peephole 基础实现（5.3）
-- 事件编码仅部分支持（6.4）
 - SourceLocation 仅 AST 路径填充（6.5）
 - EOF Prague 指令未实现（5.1）
 

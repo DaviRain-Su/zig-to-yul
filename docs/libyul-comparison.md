@@ -407,7 +407,7 @@ pub fn hasBuiltin(self: Dialect, name: []const u8) bool { ... }
 | 动态数组 | ✅ | 偏移量解码 + `len*32` |
 | 结构体参数 | ✅ | 支持静态与动态嵌套字段 |
 | 多返回值 | ✅ | 结构体返回会连续 `mstore` |
-| 事件编码 | ⚠️ 部分 | log0-log4 存在，无高级封装 |
+| 事件编码 | ✅ | 新增 `evm.event_encode` 辅助：编码 data + 生成 topic，再调用 log0-log4 |
 
 ### 6.5 SourceLocation 部分填充
 
