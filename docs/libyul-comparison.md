@@ -22,7 +22,6 @@ Zig 源代码 → [zig-to-yul] → Yul 代码 → [solc] → EVM 字节码
 
 | 路径 | 入口函数 | 说明 |
 |------|----------|------|
-| IR-based (旧) | `Compiler.compile()` | 基于中间表示 |
 | AST-based (新) | `Compiler.compileWithAst()` | 直接 AST 转换，推荐使用 |
 
 ### 1.2 对比范围

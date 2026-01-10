@@ -2,7 +2,6 @@
 //! Compiles Zig smart contracts to Yul and EVM bytecode.
 
 const std = @import("std");
-const Compiler = @import("compiler.zig").Compiler;
 const Transformer = @import("yul/transformer.zig").Transformer;
 const printer = @import("yul/printer.zig");
 const event_decode = @import("evm/event_decode.zig");
@@ -38,8 +37,8 @@ pub fn main() !void {
     } else if (std.mem.eql(u8, command, "help") or std.mem.eql(u8, command, "--help") or std.mem.eql(u8, command, "-h")) {
         printUsageStdout();
     } else {
-        // Legacy mode: treat first arg as input file
-        try runCompileLegacy(allocator, args[1..]);
+        printUsageStderr();
+        std.process.exit(1);
     }
 }
 
@@ -136,12 +135,18 @@ fn runBuild(allocator: std.mem.Allocator, args: []const []const u8) !void {
     const source = try readFile(allocator, opts.input_file.?);
     defer allocator.free(source);
 
-    // Step 1: Compile Zig to Yul
-    var compiler = Compiler.init(allocator);
-    defer compiler.deinit();
+    // Step 1: Compile Zig to Yul (AST-based)
+    var trans = Transformer.init(allocator);
+    defer trans.deinit();
 
-    const yul_code = compiler.compile(source) catch {
-        printCompileErrorsStderr(&compiler);
+    const ast = trans.transform(source) catch |err| {
+        printTransformErrorsStderr(&trans, opts.input_file.?);
+        std.debug.print("Compilation failed: {}\n", .{err});
+        std.process.exit(1);
+    };
+
+    const yul_code = printer.format(allocator, ast) catch |err| {
+        std.debug.print("Code generation error: {}\n", .{err});
         std.process.exit(1);
     };
     defer allocator.free(yul_code);
@@ -166,57 +171,6 @@ fn runBuild(allocator: std.mem.Allocator, args: []const []const u8) !void {
     }
 }
 
-/// Legacy compile mode for backwards compatibility
-fn runCompileLegacy(allocator: std.mem.Allocator, args: []const []const u8) !void {
-    var input_file: ?[]const u8 = null;
-    var output_file: ?[]const u8 = null;
-    var i: usize = 0;
-
-    while (i < args.len) : (i += 1) {
-        const arg = args[i];
-
-        if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
-            printUsageStdout();
-            return;
-        } else if (std.mem.eql(u8, arg, "-o") or std.mem.eql(u8, arg, "--output")) {
-            i += 1;
-            if (i < args.len) {
-                output_file = args[i];
-            } else {
-                std.debug.print("Error: -o requires an argument\n", .{});
-                std.process.exit(1);
-            }
-        } else if (std.mem.eql(u8, arg, "-v") or std.mem.eql(u8, arg, "--version")) {
-            printVersionStdout();
-            return;
-        } else if (arg.len > 0 and arg[0] != '-') {
-            input_file = arg;
-        } else {
-            std.debug.print("Unknown option: {s}\n", .{arg});
-            std.process.exit(1);
-        }
-    }
-
-    if (input_file == null) {
-        std.debug.print("Error: No input file specified\n", .{});
-        printUsageStderr();
-        std.process.exit(1);
-    }
-
-    const source = try readFile(allocator, input_file.?);
-    defer allocator.free(source);
-
-    var compiler = Compiler.init(allocator);
-    defer compiler.deinit();
-
-    const yul_code = compiler.compile(source) catch {
-        printCompileErrorsStderr(&compiler);
-        std.process.exit(1);
-    };
-    defer allocator.free(yul_code);
-
-    try writeOutput(yul_code, output_file);
-}
 
 const DecodeEventOptions = struct {
     event_name: ?[]const u8 = null,
@@ -507,13 +461,6 @@ fn writeOutput(content: []const u8, output_file: ?[]const u8) !void {
     }
 }
 
-fn printCompileErrorsStderr(compiler: *Compiler) void {
-    std.debug.print("Compilation failed:\n", .{});
-    for (compiler.getErrors()) |e| {
-        std.debug.print("  {}:{}: {s}\n", .{ e.line, e.column, e.message });
-    }
-}
-
 fn printTransformErrorsStderr(trans: *Transformer, filename: []const u8) void {
     for (trans.getErrors()) |e| {
         const loc = e.location;
@@ -769,9 +716,6 @@ fn printUsageTo(writer: anytype) !void {
         \\
         \\    # Build with optimization
         \\    zig-to-yul build -O token.zig
-        \\
-        \\    # Legacy mode (compile to Yul)
-        \\    zig-to-yul token.zig -o token.yul
         \\
         \\    # Decode an event log
         \\    zig-to-yul decode-event --event Transfer --param from:address:indexed \\
