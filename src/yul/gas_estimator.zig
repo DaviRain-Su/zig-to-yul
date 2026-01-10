@@ -15,70 +15,99 @@ pub const GasEstimate = struct {
     unknown_ops: u32 = 0,
     memory_words: u64 = 0,
     memory_gas: u64 = 0,
+    cold_storage_accesses: u32 = 0,
+    warm_storage_accesses: u32 = 0,
+    cold_account_accesses: u32 = 0,
+    warm_account_accesses: u32 = 0,
+    refund_estimate: u64 = 0,
 };
 
 pub fn estimate(root: ast.AST) GasEstimate {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    var ctx = EstimatorContext.init(arena.allocator());
+    defer ctx.deinit();
+
     var out = GasEstimate{};
-    visitObject(root.root, &out);
+    visitObject(root.root, &out, &ctx);
     return out;
 }
 
-fn visitObject(obj: ast.Object, out: *GasEstimate) void {
-    visitBlock(obj.code, out);
+const EstimatorContext = struct {
+    allocator: std.mem.Allocator,
+    storage_slots: std.ArrayList(ast.U256),
+    account_addrs: std.ArrayList(ast.U256),
+
+    fn init(allocator: std.mem.Allocator) EstimatorContext {
+        return .{
+            .allocator = allocator,
+            .storage_slots = std.ArrayList(ast.U256).init(allocator),
+            .account_addrs = std.ArrayList(ast.U256).init(allocator),
+        };
+    }
+
+    fn deinit(self: *EstimatorContext) void {
+        self.storage_slots.deinit();
+        self.account_addrs.deinit();
+    }
+};
+
+fn visitObject(obj: ast.Object, out: *GasEstimate, ctx: *EstimatorContext) void {
+    visitBlock(obj.code, out, ctx);
     for (obj.sub_objects) |sub| {
-        visitObject(sub, out);
+        visitObject(sub, out, ctx);
     }
 }
 
-fn visitBlock(block: ast.Block, out: *GasEstimate) void {
+fn visitBlock(block: ast.Block, out: *GasEstimate, ctx: *EstimatorContext) void {
     for (block.statements) |stmt| {
-        visitStatement(stmt, out);
+        visitStatement(stmt, out, ctx);
     }
 }
 
-fn visitStatement(stmt: ast.Statement, out: *GasEstimate) void {
+fn visitStatement(stmt: ast.Statement, out: *GasEstimate, ctx: *EstimatorContext) void {
     switch (stmt) {
-        .expression_statement => |s| visitExpression(s.expression, out),
-        .variable_declaration => |s| if (s.value) |val| visitExpression(val, out),
-        .assignment => |s| visitExpression(s.value, out),
-        .block => |s| visitBlock(s, out),
+        .expression_statement => |s| visitExpression(s.expression, out, ctx),
+        .variable_declaration => |s| if (s.value) |val| visitExpression(val, out, ctx),
+        .assignment => |s| visitExpression(s.value, out, ctx),
+        .block => |s| visitBlock(s, out, ctx),
         .if_statement => |s| {
-            visitExpression(s.condition, out);
-            visitBlock(s.body, out);
+            visitExpression(s.condition, out, ctx);
+            visitBlock(s.body, out, ctx);
         },
         .switch_statement => |s| {
-            visitExpression(s.expression, out);
+            visitExpression(s.expression, out, ctx);
             for (s.cases) |case_| {
-                visitBlock(case_.body, out);
+                visitBlock(case_.body, out, ctx);
             }
         },
         .for_loop => |s| {
-            visitBlock(s.pre, out);
-            visitExpression(s.condition, out);
-            visitBlock(s.post, out);
-            visitBlock(s.body, out);
+            visitBlock(s.pre, out, ctx);
+            visitExpression(s.condition, out, ctx);
+            visitBlock(s.post, out, ctx);
+            visitBlock(s.body, out, ctx);
         },
         .function_definition => {},
         .break_statement, .continue_statement, .leave_statement => {},
     }
 }
 
-fn visitExpression(expr: ast.Expression, out: *GasEstimate) void {
+fn visitExpression(expr: ast.Expression, out: *GasEstimate, ctx: *EstimatorContext) void {
     switch (expr) {
         .literal => {},
         .identifier => {},
         .function_call => |call| {
             for (call.arguments) |arg| {
-                visitExpression(arg, out);
+                visitExpression(arg, out, ctx);
             }
         },
         .builtin_call => |call| {
             for (call.arguments) |arg| {
-                visitExpression(arg, out);
+                visitExpression(arg, out, ctx);
             }
             if (gasForBuiltin(call.builtin_name.name)) |cost| {
                 out.total += cost.base;
-                const handled_dynamic = applyDynamicCosts(call.builtin_name.name, call.arguments, out);
+                const handled_dynamic = applyDynamicCosts(call.builtin_name.name, call.arguments, out, ctx);
                 if (cost.dynamic and !handled_dynamic) out.dynamic_ops += 1;
             } else {
                 out.unknown_ops += 1;
@@ -154,7 +183,7 @@ fn gasForBuiltin(name: []const u8) ?GasCost {
     return null;
 }
 
-fn applyDynamicCosts(name: []const u8, args: []const ast.Expression, out: *GasEstimate) bool {
+fn applyDynamicCosts(name: []const u8, args: []const ast.Expression, out: *GasEstimate, ctx: *EstimatorContext) bool {
     if (std.mem.eql(u8, name, "keccak256") and args.len == 2) {
         const maybe_size = literalU256(args[1]);
         if (maybe_size) |size| {
@@ -185,6 +214,23 @@ fn applyDynamicCosts(name: []const u8, args: []const ast.Expression, out: *GasEs
                 const words = wordsForSize(size_bytes);
                 out.total += 3 * words;
                 if (literalU256(args[0])) |offset| {
+                    _ = applyMemoryExpansion(out, offset, size_bytes);
+                }
+                return true;
+            }
+        }
+        return false;
+    }
+
+    if (std.mem.eql(u8, name, "extcodecopy") and args.len == 4) {
+        if (literalU256(args[0])) |addr| {
+            applyAccountAccess(addr, out, ctx);
+        }
+        if (literalU256(args[3])) |len| {
+            if (bytesToU64(len)) |size_bytes| {
+                const words = wordsForSize(size_bytes);
+                out.total += 3 * words;
+                if (literalU256(args[1])) |offset| {
                     _ = applyMemoryExpansion(out, offset, size_bytes);
                 }
                 return true;
@@ -236,9 +282,41 @@ fn applyDynamicCosts(name: []const u8, args: []const ast.Expression, out: *GasEs
         return false;
     }
 
-    if ((std.mem.eql(u8, name, "call") or std.mem.eql(u8, name, "callcode") or
-        std.mem.eql(u8, name, "delegatecall") or std.mem.eql(u8, name, "staticcall")) and args.len >= 7)
-    {
+    if (std.mem.eql(u8, name, "sload") and args.len >= 1) {
+        if (literalU256(args[0])) |slot| {
+            applyStorageAccess(slot, out, ctx);
+            return true;
+        }
+        return false;
+    }
+
+    if (std.mem.eql(u8, name, "sstore") and args.len >= 2) {
+        if (literalU256(args[0])) |slot| {
+            applyStorageAccess(slot, out, ctx);
+        }
+        if (literalU256(args[1])) |value| {
+            if (value == 0) {
+                out.refund_estimate += 4800;
+            }
+        }
+        return false;
+    }
+
+    if (isOneOf(name, &.{ "balance", "extcodesize", "extcodehash" }) and args.len >= 1) {
+        if (literalU256(args[0])) |addr| {
+            applyAccountAccess(addr, out, ctx);
+            return true;
+        }
+        return false;
+    }
+
+    if ((std.mem.eql(u8, name, "call") or std.mem.eql(u8, name, "callcode")) and args.len >= 7) {
+        if (literalU256(args[1])) |addr| {
+            applyAccountAccess(addr, out, ctx);
+        }
+        if (literalU256(args[2])) |value| {
+            if (value != 0) out.total += 9000;
+        }
         if (literalU256(args[3])) |in_offset| {
             if (literalU256(args[4])) |in_len| {
                 if (bytesToU64(in_len)) |size_bytes| {
@@ -256,9 +334,30 @@ fn applyDynamicCosts(name: []const u8, args: []const ast.Expression, out: *GasEs
         return false;
     }
 
+    if ((std.mem.eql(u8, name, "delegatecall") or std.mem.eql(u8, name, "staticcall")) and args.len >= 6) {
+        if (literalU256(args[1])) |addr| {
+            applyAccountAccess(addr, out, ctx);
+        }
+        if (literalU256(args[2])) |in_offset| {
+            if (literalU256(args[3])) |in_len| {
+                if (bytesToU64(in_len)) |size_bytes| {
+                    _ = applyMemoryExpansion(out, in_offset, size_bytes);
+                }
+            }
+        }
+        if (literalU256(args[4])) |out_offset| {
+            if (literalU256(args[5])) |out_len| {
+                if (bytesToU64(out_len)) |size_bytes| {
+                    _ = applyMemoryExpansion(out, out_offset, size_bytes);
+                }
+            }
+        }
+        return false;
+    }
+
     if ((std.mem.eql(u8, name, "create") and args.len == 3) or (std.mem.eql(u8, name, "create2") and args.len == 4)) {
-        const offset_arg = if (args.len == 3) args[1] else args[1];
-        const size_arg = if (args.len == 3) args[2] else args[2];
+        const offset_arg = args[1];
+        const size_arg = args[2];
         if (literalU256(offset_arg)) |offset| {
             if (literalU256(size_arg)) |len| {
                 if (bytesToU64(len)) |size_bytes| {
@@ -331,6 +430,32 @@ fn byteLen(value: ast.U256) u64 {
     return count;
 }
 
+fn applyStorageAccess(slot: ast.U256, out: *GasEstimate, ctx: *EstimatorContext) void {
+    if (isFirstAccess(slot, &ctx.storage_slots)) {
+        out.total += 2000;
+        out.cold_storage_accesses += 1;
+    } else {
+        out.warm_storage_accesses += 1;
+    }
+}
+
+fn applyAccountAccess(addr: ast.U256, out: *GasEstimate, ctx: *EstimatorContext) void {
+    if (isFirstAccess(addr, &ctx.account_addrs)) {
+        out.total += 2600;
+        out.cold_account_accesses += 1;
+    } else {
+        out.warm_account_accesses += 1;
+    }
+}
+
+fn isFirstAccess(value: ast.U256, list: *std.ArrayList(ast.U256)) bool {
+    for (list.items) |item| {
+        if (item == value) return false;
+    }
+    list.append(value) catch return true;
+    return true;
+}
+
 test "estimate basic gas" {
     const code_block = ast.Block.init(&.{
         ast.Statement.expr(ast.Expression.builtinCall("add", &.{
@@ -356,4 +481,31 @@ test "estimate basic gas" {
     try std.testing.expectEqual(@as(u32, 0), result.unknown_ops);
     try std.testing.expectEqual(@as(u64, 1), result.memory_words);
     try std.testing.expectEqual(@as(u64, 3), result.memory_gas);
+    try std.testing.expectEqual(@as(u32, 0), result.cold_storage_accesses);
+}
+
+test "estimate cold storage and account access" {
+    const code_block = ast.Block.init(&.{
+        ast.Statement.expr(ast.Expression.builtinCall("sload", &.{
+            ast.Expression.lit(ast.Literal.number(5)),
+        })),
+        ast.Statement.expr(ast.Expression.builtinCall("sload", &.{
+            ast.Expression.lit(ast.Literal.number(5)),
+        })),
+        ast.Statement.expr(ast.Expression.builtinCall("balance", &.{
+            ast.Expression.lit(ast.Literal.number(1)),
+        })),
+        ast.Statement.expr(ast.Expression.builtinCall("balance", &.{
+            ast.Expression.lit(ast.Literal.number(1)),
+        })),
+    });
+
+    const obj = ast.Object.init("Gas", code_block, &.{}, &.{});
+    const root = ast.AST.init(obj);
+
+    const result = estimate(root);
+    try std.testing.expectEqual(@as(u32, 1), result.cold_storage_accesses);
+    try std.testing.expectEqual(@as(u32, 1), result.warm_storage_accesses);
+    try std.testing.expectEqual(@as(u32, 1), result.cold_account_accesses);
+    try std.testing.expectEqual(@as(u32, 1), result.warm_account_accesses);
 }

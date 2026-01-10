@@ -332,7 +332,7 @@ Zig 源代码 → [zig-to-yul] → Yul 代码 → [solc] → EVM 字节码
 | 源码映射 (Source Maps) | 调试时定位源码位置 | ✅ 基础实现 |
 | 事件解码 (Event Decoding) | 解析合约事件日志 | ✅ 完整（静态类型/bytes/string/数组/动态数组元素/tuple/数组 tuple/CLI/indexed 预镜像/签名校验/匿名事件） |
 | ABI 解码 | 解码 calldata/returndata | ✅ 完整（静态类型/动态类型/数组/tuple/CLI） |
-| Gas 估算 | 预估交易 gas 消耗 | ⚠️ 增强实现（内存扩展/部分动态成本） |
+| Gas 估算 | 预估交易 gas 消耗 | ⚠️ 增强实现（内存扩展/冷热访问/部分动态成本） |
 | Yul 优化器 | 内置 Yul 级别优化 | ✅ 扩展实现（常量折叠/控制流化简/无效语句移除/恒等式简化） |
 
 ### 5.4 调试/辅助功能
