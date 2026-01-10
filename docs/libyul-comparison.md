@@ -76,8 +76,8 @@ Zig 源代码 → [zig-to-yul] → Yul 代码 → [solc] → EVM 字节码
 | `AST` | `AST` | src/yul/ast.zig:585 | ✅ 完整 |
 | `Object` | `Object` | src/yul/ast.zig:562 | ✅ 完整 |
 | `Data` (ObjectNode) | `DataSection` | src/yul/ast.zig:542 | ✅ 完整 |
-| `ObjectDebugData` | - | - | ⚠️ 未实现 |
-| `Object::Structure` | - | - | ⚠️ 未实现 |
+| `ObjectDebugData` | `ObjectDebugData` | src/yul/ast.zig:562 | ✅ |
+| `Object::Structure` | `ObjectStructure` | src/yul/ast.zig:568 | ✅ |
 
 ### 2.4 辅助类型
 
@@ -340,8 +340,8 @@ Zig 源代码 → [zig-to-yul] → Yul 代码 → [solc] → EVM 字节码
 
 | 功能 | 描述 | 优先级 |
 |------|------|--------|
-| `ObjectDebugData` | 源码名称映射 | 可选 |
-| `Object::Structure` | 对象层级查询 | 可选 |
+| `ObjectDebugData` | 源码名称映射 | ✅ |
+| `Object::Structure` | 对象层级查询 | ✅ |
 
 ---
 

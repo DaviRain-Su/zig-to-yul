@@ -4,8 +4,6 @@
 - Yul 优化器仅 peephole 基础实现（5.3）
 - 事件编码仅部分支持（6.4）
 - SourceLocation 仅 AST 路径填充（6.5）
-- ObjectDebugData 未实现（2.3/5.4）
-- Object::Structure 未实现（2.3/5.4）
 - EOF Prague 指令未实现（5.1）
 
-如果你想继续：建议按 5.2（预编译合约封装）→ 5.4（调试辅助）→ 5.1（EOF Prague 指令）的优先级推进。
+如果你想继续：建议按 5.3（工具特性）→ 6.5（SourceLocation）→ 5.1（EOF Prague 指令）的优先级推进。

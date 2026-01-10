@@ -2613,11 +2613,17 @@ pub const Transformer = struct {
         try self.temp_strings.append(self.allocator, deployed_name); // Track for cleanup
 
         const deployed_code = try self.builder.block(deployed_stmts.items);
-        const deployed_obj = ast.Object.init(
+        const source_name = try self.dupTempString(name);
+        const deployed_debug = ast.ObjectDebugData{
+            .source_name = source_name,
+            .object_name = try self.dupTempString(deployed_name),
+        };
+        const deployed_obj = ast.Object.initWithDebug(
             deployed_name,
             deployed_code,
             &.{},
             &.{},
+            deployed_debug,
         );
 
         // Generate constructor code
@@ -2644,7 +2650,11 @@ pub const Transformer = struct {
         // Need to allocate the deployed object slice
         const sub_objects = try self.builder.dupeObjects(&.{deployed_obj});
 
-        const root_obj = ast.Object.init(name, init_code, sub_objects, &.{});
+        const root_debug = ast.ObjectDebugData{
+            .source_name = source_name,
+            .object_name = source_name,
+        };
+        const root_obj = ast.Object.initWithDebug(name, init_code, sub_objects, &.{}, root_debug);
 
         return ast.AST.init(root_obj);
     }
@@ -2953,6 +2963,12 @@ pub const Transformer = struct {
         self.temp_counter += 1;
         try self.temp_strings.append(self.allocator, name);
         return name;
+    }
+
+    fn dupTempString(self: *Self, value: []const u8) ![]const u8 {
+        const copy = try self.allocator.dupe(u8, value);
+        try self.temp_strings.append(self.allocator, copy);
+        return copy;
     }
 
     fn pushLoopBreakFlag(self: *Self, flag: ?[]const u8) TransformProcessError!void {

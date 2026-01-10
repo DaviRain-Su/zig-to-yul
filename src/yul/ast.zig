@@ -575,6 +575,27 @@ pub const DataSection = struct {
     }
 };
 
+/// Optional debug metadata for objects.
+pub const ObjectDebugData = struct {
+    source_name: []const u8,
+    object_name: []const u8,
+};
+
+/// Structural view of object hierarchy.
+pub const ObjectStructure = struct {
+    name: YulName,
+    sub_objects: []const ObjectStructure,
+    data_sections: []const YulName,
+
+    pub fn deinit(self: ObjectStructure, allocator: Allocator) void {
+        for (self.sub_objects) |sub| {
+            sub.deinit(allocator);
+        }
+        allocator.free(self.sub_objects);
+        allocator.free(self.data_sections);
+    }
+};
+
 /// Yul Object - top-level container
 pub const Object = struct {
     location: SourceLocation = .none,
@@ -582,6 +603,7 @@ pub const Object = struct {
     code: Block,
     sub_objects: []const Object,
     data_sections: []const DataSection,
+    debug_data: ?ObjectDebugData = null,
 
     pub fn init(
         name: YulName,
@@ -594,6 +616,39 @@ pub const Object = struct {
             .code = code,
             .sub_objects = sub_objects,
             .data_sections = data_sections,
+            .debug_data = null,
+        };
+    }
+
+    pub fn initWithDebug(
+        name: YulName,
+        code: Block,
+        sub_objects: []const Object,
+        data_sections: []const DataSection,
+        debug_data: ObjectDebugData,
+    ) Object {
+        return .{
+            .name = name,
+            .code = code,
+            .sub_objects = sub_objects,
+            .data_sections = data_sections,
+            .debug_data = debug_data,
+        };
+    }
+
+    pub fn structure(self: Object, allocator: Allocator) Allocator.Error!ObjectStructure {
+        const sub = try allocator.alloc(ObjectStructure, self.sub_objects.len);
+        for (self.sub_objects, 0..) |child, i| {
+            sub[i] = try child.structure(allocator);
+        }
+        const data = try allocator.alloc(YulName, self.data_sections.len);
+        for (self.data_sections, 0..) |section, i| {
+            data[i] = section.name;
+        }
+        return .{
+            .name = self.name,
+            .sub_objects = sub,
+            .data_sections = data,
         };
     }
 };
@@ -604,6 +659,10 @@ pub const AST = struct {
 
     pub fn init(root: Object) AST {
         return .{ .root = root };
+    }
+
+    pub fn structure(self: AST, allocator: Allocator) Allocator.Error!ObjectStructure {
+        return self.root.structure(allocator);
     }
 };
 
@@ -840,4 +899,21 @@ test "AstBuilder creates function" {
     try std.testing.expectEqualStrings("myFunc", func.function_definition.name);
     try std.testing.expectEqual(@as(usize, 1), func.function_definition.parameters.len);
     try std.testing.expectEqual(@as(usize, 1), func.function_definition.return_variables.len);
+}
+
+test "object structure" {
+    const allocator = std.testing.allocator;
+
+    const child = Object.init("Child", Block.empty(), &.{}, &.{});
+    const data = [_]DataSection{DataSection.string("Data", "x")};
+    const root = Object.init("Root", Block.empty(), &.{child}, data[0..]);
+
+    var structure = try root.structure(allocator);
+    defer structure.deinit(allocator);
+
+    try std.testing.expectEqualStrings("Root", structure.name);
+    try std.testing.expectEqual(@as(usize, 1), structure.sub_objects.len);
+    try std.testing.expectEqualStrings("Child", structure.sub_objects[0].name);
+    try std.testing.expectEqual(@as(usize, 1), structure.data_sections.len);
+    try std.testing.expectEqualStrings("Data", structure.data_sections[0]);
 }

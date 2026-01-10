@@ -113,12 +113,50 @@ pub const DataSection = struct {
     };
 };
 
+/// Optional debug metadata for objects.
+pub const ObjectDebugData = struct {
+    source_name: []const u8,
+    object_name: []const u8,
+};
+
+/// Structural view of object hierarchy.
+pub const ObjectStructure = struct {
+    name: []const u8,
+    sub_objects: []const ObjectStructure,
+    data_sections: []const []const u8,
+
+    pub fn deinit(self: ObjectStructure, allocator: Allocator) void {
+        for (self.sub_objects) |sub| {
+            sub.deinit(allocator);
+        }
+        allocator.free(self.sub_objects);
+        allocator.free(self.data_sections);
+    }
+};
+
 /// Yul object - top-level construct
 pub const Object = struct {
     name: []const u8,
     code: []const Statement,
     sub_objects: []const Object,
     data_sections: []const DataSection,
+    debug_data: ?ObjectDebugData = null,
+
+    pub fn structure(self: Object, allocator: Allocator) Allocator.Error!ObjectStructure {
+        const sub = try allocator.alloc(ObjectStructure, self.sub_objects.len);
+        for (self.sub_objects, 0..) |child, i| {
+            sub[i] = try child.structure(allocator);
+        }
+        const data = try allocator.alloc([]const u8, self.data_sections.len);
+        for (self.data_sections, 0..) |section, i| {
+            data[i] = section.name;
+        }
+        return .{
+            .name = self.name,
+            .sub_objects = sub,
+            .data_sections = data,
+        };
+    }
 };
 
 /// Builder for constructing Yul IR
@@ -319,6 +357,7 @@ pub const Builder = struct {
             .code = code_copy,
             .sub_objects = sub_copy,
             .data_sections = data_copy,
+            .debug_data = null,
         };
     }
 };
