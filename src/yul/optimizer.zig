@@ -808,6 +808,15 @@ pub const Optimizer = struct {
         if (std.mem.eql(u8, name, "mod") and args.len == 2) {
             if (isZero(args[0])) return makeLiteralNumber(0);
             if (isOne(args[1]) or isZero(args[1])) return makeLiteralNumber(0);
+            if (args[0] == .builtin_call) {
+                const call = args[0].builtin_call;
+                if (std.mem.eql(u8, call.builtin_name.name, "mul") and call.arguments.len == 2) {
+                    return ast.Expression.builtinCall("mulmod", &.{ call.arguments[0], call.arguments[1], args[1] });
+                }
+                if (std.mem.eql(u8, call.builtin_name.name, "add") and call.arguments.len == 2) {
+                    return ast.Expression.builtinCall("addmod", &.{ call.arguments[0], call.arguments[1], args[1] });
+                }
+            }
             if (literalU256(args[0])) |a| {
                 if (literalU256(args[1])) |b| {
                     return makeLiteralNumber(a % b);
@@ -1136,6 +1145,56 @@ test "optimize calldata hash copy" {
     const expr = stmt.expression_statement.expression;
     try std.testing.expect(expr == .builtin_call);
     try std.testing.expectEqualStrings("calldatacopy", expr.builtin_call.builtin_name.name);
+}
+
+test "rewrite mod mul to mulmod" {
+    const allocator = std.testing.allocator;
+    var builder = ast.AstBuilder.init(allocator);
+    defer builder.deinit();
+
+    const mul_expr = ast.Expression.builtinCall("mul", &.{ ast.Expression.id("a"), ast.Expression.id("b") });
+    const mod_expr = ast.Expression.builtinCall("mod", &.{ mul_expr, ast.Expression.id("m") });
+    const stmt = ast.Statement.expr(mod_expr);
+
+    const code_block = ast.Block.init(try builder.dupeStatements(&.{stmt}));
+    const obj = ast.Object.init("Opt", code_block, &.{}, &.{});
+    const root = ast.AST.init(obj);
+
+    var opt = Optimizer.init(allocator);
+    defer opt.deinit();
+    const optimized = try opt.optimize(root);
+    try std.testing.expectEqual(@as(usize, 1), optimized.root.code.statements.len);
+
+    const out_stmt = optimized.root.code.statements[0];
+    try std.testing.expect(out_stmt == .expression_statement);
+    const out_expr = out_stmt.expression_statement.expression;
+    try std.testing.expect(out_expr == .builtin_call);
+    try std.testing.expectEqualStrings("mulmod", out_expr.builtin_call.builtin_name.name);
+}
+
+test "rewrite mod add to addmod" {
+    const allocator = std.testing.allocator;
+    var builder = ast.AstBuilder.init(allocator);
+    defer builder.deinit();
+
+    const add_expr = ast.Expression.builtinCall("add", &.{ ast.Expression.id("a"), ast.Expression.id("b") });
+    const mod_expr = ast.Expression.builtinCall("mod", &.{ add_expr, ast.Expression.id("m") });
+    const stmt = ast.Statement.expr(mod_expr);
+
+    const code_block = ast.Block.init(try builder.dupeStatements(&.{stmt}));
+    const obj = ast.Object.init("Opt", code_block, &.{}, &.{});
+    const root = ast.AST.init(obj);
+
+    var opt = Optimizer.init(allocator);
+    defer opt.deinit();
+    const optimized = try opt.optimize(root);
+    try std.testing.expectEqual(@as(usize, 1), optimized.root.code.statements.len);
+
+    const out_stmt = optimized.root.code.statements[0];
+    try std.testing.expect(out_stmt == .expression_statement);
+    const out_expr = out_stmt.expression_statement.expression;
+    try std.testing.expect(out_expr == .builtin_call);
+    try std.testing.expectEqualStrings("addmod", out_expr.builtin_call.builtin_name.name);
 }
 
 test "optimize erc20 transferfrom layout" {
