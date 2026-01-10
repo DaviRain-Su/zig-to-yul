@@ -1,0 +1,66 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build-${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Build zig_to_yul
+        run: zig build -Doptimize=ReleaseFast
+
+      - name: Build z2y
+        run: zig build -Doptimize=ReleaseFast
+        working-directory: tools/z2y
+
+      - name: Package artifacts
+        run: |
+          rm -rf dist
+          mkdir -p dist
+          cp zig-out/bin/zig_to_yul dist/
+          cp tools/z2y/zig-out/bin/z2y dist/
+          if [ -d sdk ]; then
+            cp -r sdk dist/sdk
+          fi
+          tar -czf zig-to-yul-${{ matrix.os }}.tar.gz -C dist .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.os }}
+          path: zig-to-yul-${{ matrix.os }}.tar.gz
+
+  release:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/**/*.tar.gz
