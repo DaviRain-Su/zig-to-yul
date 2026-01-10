@@ -94,6 +94,9 @@ pub const Optimizer = struct {
             if (try self.mergeCalldataKeccakSequence(combined.items, &j, &merged)) {
                 continue;
             }
+            if (try self.mergeErc20CallLayout(combined.items, &j, &merged)) {
+                continue;
+            }
             try merged.append(self.allocator, combined.items[j]);
             j += 1;
         }
@@ -408,6 +411,194 @@ pub const Optimizer = struct {
             .dest_offset = dest_info.offset,
             .src_offset = src_info.offset,
         };
+    }
+
+    const MstoreEntry = struct {
+        offset: ast.U256,
+        value: ast.Expression,
+    };
+
+    fn parseLiteralMstore(stmt: ast.Statement) ?MstoreEntry {
+        if (stmt != .expression_statement) return null;
+        const expr = stmt.expression_statement.expression;
+        if (expr != .builtin_call) return null;
+        const call = expr.builtin_call;
+        if (!std.mem.eql(u8, call.builtin_name.name, "mstore")) return null;
+        if (call.arguments.len != 2) return null;
+        const offset = literalU256(call.arguments[0]) orelse return null;
+        return .{ .offset = offset, .value = call.arguments[1] };
+    }
+
+    fn mergeErc20CallLayout(
+        self: *Optimizer,
+        stmts: []const ast.Statement,
+        index: *usize,
+        out: *std.ArrayList(ast.Statement),
+    ) Error!bool {
+        const mstore0 = parseLiteralMstore(stmts[index.*]) orelse return false;
+        if (mstore0.offset != 0) return false;
+        const selector = parseSelectorWord(mstore0.value) orelse return false;
+
+        const is_transfer = selector == 0xa9059cbb;
+        const is_transfer_from = selector == 0x23b872dd;
+        if (!is_transfer and !is_transfer_from) return false;
+
+        const mstore1 = if (index.* + 1 < stmts.len) parseLiteralMstore(stmts[index.* + 1]) orelse return false else return false;
+        if (mstore1.offset != 0x04) return false;
+
+        const mstore2 = if (index.* + 2 < stmts.len) parseLiteralMstore(stmts[index.* + 2]) orelse return false else return false;
+        if (mstore2.offset != 0x24) return false;
+
+        const arg0 = mstore1.value;
+        const arg1 = mstore2.value;
+        var arg2: ?ast.Expression = null;
+
+        var call_index: usize = index.* + 3;
+        if (is_transfer_from) {
+            const mstore3 = if (index.* + 3 < stmts.len) parseLiteralMstore(stmts[index.* + 3]) orelse return false else return false;
+            if (mstore3.offset != 0x44) return false;
+            arg2 = mstore3.value;
+            call_index = index.* + 4;
+        }
+
+        if (call_index >= stmts.len) return false;
+        const call_stmt = parseCallStatement(stmts[call_index]) orelse return false;
+        const call_args = call_stmt.call.arguments;
+        if (call_args.len != 7) return false;
+        const input_offset = literalU256(call_args[3]) orelse return false;
+        const input_size = literalU256(call_args[4]) orelse return false;
+        const expected_size: ast.U256 = if (is_transfer_from) 0x64 else 0x44;
+        if (input_offset != 0 or input_size != expected_size) return false;
+
+        const selector_expr = ast.Expression.lit(ast.Literal.number(selector));
+        try out.append(self.allocator, ast.Statement.expr(ast.Expression.builtinCall("mstore", &.{
+            ast.Expression.lit(ast.Literal.number(0x0c)),
+            selector_expr,
+        })));
+
+        const arg0_expr = try self.ensureAddressWord(arg0);
+        try out.append(self.allocator, ast.Statement.expr(ast.Expression.builtinCall("mstore", &.{
+            ast.Expression.lit(ast.Literal.number(0x2c)),
+            arg0_expr,
+        })));
+
+        if (is_transfer) {
+            try out.append(self.allocator, ast.Statement.expr(ast.Expression.builtinCall("mstore", &.{
+                ast.Expression.lit(ast.Literal.number(0x40)),
+                arg1,
+            })));
+        } else if (arg2) |amount| {
+            const arg1_expr = try self.ensureAddressWord(arg1);
+            try out.append(self.allocator, ast.Statement.expr(ast.Expression.builtinCall("mstore", &.{
+                ast.Expression.lit(ast.Literal.number(0x40)),
+                arg1_expr,
+            })));
+            try out.append(self.allocator, ast.Statement.expr(ast.Expression.builtinCall("mstore", &.{
+                ast.Expression.lit(ast.Literal.number(0x60)),
+                amount,
+            })));
+        }
+
+        const new_call = try self.rewriteCallInput(call_stmt, 0x1c, expected_size);
+        try out.append(self.allocator, new_call);
+
+        index.* = call_index + 1;
+        return true;
+    }
+
+    const CallStmt = struct {
+        stmt: ast.Statement,
+        call: ast.BuiltinCall,
+        kind: CallStmtKind,
+    };
+
+    const CallStmtKind = enum { expr, assign, var_decl };
+
+    fn parseCallStatement(stmt: ast.Statement) ?CallStmt {
+        switch (stmt) {
+            .expression_statement => |s| {
+                const expr = s.expression;
+                if (expr != .builtin_call) return null;
+                if (!std.mem.eql(u8, expr.builtin_call.builtin_name.name, "call")) return null;
+                return .{ .stmt = stmt, .call = expr.builtin_call, .kind = .expr };
+            },
+            .assignment => |s| {
+                if (s.value != .builtin_call) return null;
+                if (!std.mem.eql(u8, s.value.builtin_call.builtin_name.name, "call")) return null;
+                return .{ .stmt = stmt, .call = s.value.builtin_call, .kind = .assign };
+            },
+            .variable_declaration => |s| {
+                const value = s.value orelse return null;
+                if (value != .builtin_call) return null;
+                if (!std.mem.eql(u8, value.builtin_call.builtin_name.name, "call")) return null;
+                return .{ .stmt = stmt, .call = value.builtin_call, .kind = .var_decl };
+            },
+            else => return null,
+        }
+    }
+
+    fn rewriteCallInput(self: *Optimizer, call_stmt: CallStmt, new_offset: ast.U256, new_len: ast.U256) Error!ast.Statement {
+        var args = std.ArrayList(ast.Expression).empty;
+        defer args.deinit(self.allocator);
+        for (call_stmt.call.arguments, 0..) |arg, idx| {
+            if (idx == 3) {
+                try args.append(self.allocator, ast.Expression.lit(ast.Literal.number(new_offset)));
+                continue;
+            }
+            if (idx == 4) {
+                try args.append(self.allocator, ast.Expression.lit(ast.Literal.number(new_len)));
+                continue;
+            }
+            try args.append(self.allocator, arg);
+        }
+        const new_call_expr = try self.builder.builtinCall("call", args.items);
+
+        return switch (call_stmt.kind) {
+            .expr => ast.Statement.expr(new_call_expr),
+            .assign => blk: {
+                var out = call_stmt.stmt.assignment;
+                out.value = new_call_expr;
+                break :blk ast.Statement{ .assignment = out };
+            },
+            .var_decl => blk: {
+                var out = call_stmt.stmt.variable_declaration;
+                out.value = new_call_expr;
+                break :blk ast.Statement{ .variable_declaration = out };
+            },
+        };
+    }
+
+    fn parseSelectorWord(expr: ast.Expression) ?ast.U256 {
+        if (literalU256(expr)) |value| {
+            const low_mask: ast.U256 = (@as(ast.U256, 1) << 224) - 1;
+            if ((value & low_mask) == 0) {
+                return value >> 224;
+            }
+            return null;
+        }
+        if (expr != .builtin_call) return null;
+        const call = expr.builtin_call;
+        if (!std.mem.eql(u8, call.builtin_name.name, "shl")) return null;
+        if (call.arguments.len != 2) return null;
+        const shift = literalU256(call.arguments[0]) orelse return null;
+        if (shift != 224) return null;
+        const selector = literalU256(call.arguments[1]) orelse return null;
+        return selector;
+    }
+
+    fn ensureAddressWord(self: *Optimizer, expr: ast.Expression) Error!ast.Expression {
+        if (expr == .builtin_call) {
+            const call = expr.builtin_call;
+            if (std.mem.eql(u8, call.builtin_name.name, "shl") and call.arguments.len == 2) {
+                if (literalU256(call.arguments[0])) |shift| {
+                    if (shift == 96) return expr;
+                }
+            }
+        }
+        return try self.builder.builtinCall("shl", &.{
+            ast.Expression.lit(ast.Literal.number(96)),
+            expr,
+        });
     }
 
     fn parseKeccakStatement(stmt: ast.Statement) ?KeccakStmt {
@@ -945,6 +1136,59 @@ test "optimize calldata hash copy" {
     const expr = stmt.expression_statement.expression;
     try std.testing.expect(expr == .builtin_call);
     try std.testing.expectEqualStrings("calldatacopy", expr.builtin_call.builtin_name.name);
+}
+
+test "optimize erc20 transferfrom layout" {
+    const allocator = std.testing.allocator;
+    var builder = ast.AstBuilder.init(allocator);
+    defer builder.deinit();
+
+    const selector = ast.Expression.builtinCall("shl", &.{
+        ast.Expression.lit(ast.Literal.number(224)),
+        ast.Expression.lit(ast.Literal.number(0x23b872dd)),
+    });
+    const mstore0 = ast.Statement.expr(ast.Expression.builtinCall("mstore", &.{
+        ast.Expression.lit(ast.Literal.number(0)),
+        selector,
+    }));
+    const mstore1 = ast.Statement.expr(ast.Expression.builtinCall("mstore", &.{
+        ast.Expression.lit(ast.Literal.number(4)),
+        ast.Expression.id("from"),
+    }));
+    const mstore2 = ast.Statement.expr(ast.Expression.builtinCall("mstore", &.{
+        ast.Expression.lit(ast.Literal.number(0x24)),
+        ast.Expression.id("to"),
+    }));
+    const mstore3 = ast.Statement.expr(ast.Expression.builtinCall("mstore", &.{
+        ast.Expression.lit(ast.Literal.number(0x44)),
+        ast.Expression.id("amount"),
+    }));
+    const call_expr = ast.Expression.builtinCall("call", &.{
+        ast.Expression.builtinCall("gas", &.{}),
+        ast.Expression.id("token"),
+        ast.Expression.lit(ast.Literal.number(0)),
+        ast.Expression.lit(ast.Literal.number(0)),
+        ast.Expression.lit(ast.Literal.number(0x64)),
+        ast.Expression.lit(ast.Literal.number(0)),
+        ast.Expression.lit(ast.Literal.number(0x20)),
+    });
+    const call_stmt = ast.Statement.expr(call_expr);
+
+    const code_block = ast.Block.init(try builder.dupeStatements(&.{ mstore0, mstore1, mstore2, mstore3, call_stmt }));
+    const obj = ast.Object.init("Opt", code_block, &.{}, &.{});
+    const root = ast.AST.init(obj);
+
+    var opt = Optimizer.init(allocator);
+    defer opt.deinit();
+    const optimized = try opt.optimize(root);
+    try std.testing.expectEqual(@as(usize, 5), optimized.root.code.statements.len);
+
+    const call_out = optimized.root.code.statements[4];
+    try std.testing.expect(call_out == .expression_statement);
+    const call_expr_out = call_out.expression_statement.expression;
+    try std.testing.expect(call_expr_out == .builtin_call);
+    try std.testing.expectEqualStrings("call", call_expr_out.builtin_call.builtin_name.name);
+    try std.testing.expectEqual(@as(ast.U256, 0x1c), call_expr_out.builtin_call.arguments[3].literal.value.number);
 }
 
 test "merge packed sstore sequence" {
