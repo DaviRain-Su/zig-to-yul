@@ -27,6 +27,7 @@ pub const Transformer = struct {
     local_array_elem_types: std.StringHashMap([]const u8),
     function_param_structs: std.StringHashMap([]const []const u8),
     precompile_helpers: std.StringHashMap([]const u8),
+    math_helpers: std.StringHashMap([]const u8),
     extra_functions: std.ArrayList(ast.Statement),
 
     // State tracking
@@ -136,6 +137,7 @@ pub const Transformer = struct {
             .local_array_elem_types = std.StringHashMap([]const u8).init(allocator),
             .function_param_structs = std.StringHashMap([]const []const u8).init(allocator),
             .precompile_helpers = std.StringHashMap([]const u8).init(allocator),
+            .math_helpers = std.StringHashMap([]const u8).init(allocator),
             .extra_functions = .empty,
             .current_contract = null,
             .functions = .empty,
@@ -200,6 +202,13 @@ pub const Transformer = struct {
             self.allocator.free(entry.value_ptr.*);
         }
         self.precompile_helpers.deinit();
+
+        var math_it = self.math_helpers.iterator();
+        while (math_it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            self.allocator.free(entry.value_ptr.*);
+        }
+        self.math_helpers.deinit();
 
         // Free function info param arrays
         for (self.function_infos.items) |fi| {
@@ -1855,6 +1864,13 @@ pub const Transformer = struct {
                 const helper = try self.ensurePrecompileHelper(builtin_name, addr);
                 return try self.builder.call(helper, args.items);
             }
+            if (std.mem.eql(u8, builtin_name, "saturating_mul") or std.mem.eql(u8, builtin_name, "saturatingMul")) {
+                if (args.items.len != 2) {
+                    try self.addError("saturating_mul expects 2 arguments", self.nodeLocation(call_info.ast.fn_expr), .unsupported_feature);
+                }
+                const helper = try self.ensureSaturatingMulHelper();
+                return try self.builder.call(helper, args.items);
+            }
         }
 
         // Regular function call
@@ -1913,6 +1929,41 @@ pub const Transformer = struct {
         try stmts.append(self.allocator, assign);
         const body = try self.builder.block(stmts.items);
         const func = try self.builder.funcDef(helper_name, &.{ "in_ptr", "in_len", "out_ptr", "out_len" }, &.{"success"}, body);
+        try self.extra_functions.append(self.allocator, func);
+
+        return helper_name;
+    }
+
+    fn ensureSaturatingMulHelper(self: *Self) ![]const u8 {
+        const key_name = "saturating_mul";
+        if (self.math_helpers.get(key_name)) |helper| return helper;
+
+        const helper_name = try std.fmt.allocPrint(self.allocator, "__zig2yul$saturating_mul", .{});
+        const key = try self.allocator.dupe(u8, key_name);
+        try self.math_helpers.put(key, helper_name);
+
+        var stmts: std.ArrayList(ast.Statement) = .empty;
+        defer stmts.deinit(self.allocator);
+
+        const mul_expr = try self.builder.builtinCall("mul", &.{ ast.Expression.id("x"), ast.Expression.id("y") });
+        try stmts.append(self.allocator, try self.builder.assign(&.{"result"}, mul_expr));
+
+        const div_expr = try self.builder.builtinCall("div", &.{ ast.Expression.id("result"), ast.Expression.id("x") });
+        const eq_expr = try self.builder.builtinCall("eq", &.{ div_expr, ast.Expression.id("y") });
+        const overflow_cond = try self.builder.builtinCall("iszero", &.{eq_expr});
+        const max_expr = try self.builder.builtinCall("not", &.{ast.Expression.lit(ast.Literal.number(0))});
+        const set_max = try self.builder.assign(&.{"result"}, max_expr);
+        const overflow_block = try self.builder.block(&.{set_max});
+        const overflow_if = self.builder.ifStmt(overflow_cond, overflow_block);
+
+        const zero_inner = try self.builder.builtinCall("iszero", &.{ast.Expression.id("x")});
+        const nonzero_cond = try self.builder.builtinCall("iszero", &.{zero_inner});
+        const nonzero_block = try self.builder.block(&.{overflow_if});
+        const nonzero_if = self.builder.ifStmt(nonzero_cond, nonzero_block);
+        try stmts.append(self.allocator, nonzero_if);
+
+        const body = try self.builder.block(stmts.items);
+        const func = try self.builder.funcDef(helper_name, &.{ "x", "y" }, &.{"result"}, body);
         try self.extra_functions.append(self.allocator, func);
 
         return helper_name;
@@ -3496,6 +3547,36 @@ test "transient storage requires cancun" {
     transformer.dialect = ast.Dialect.forVersion(.shanghai);
 
     try std.testing.expectError(error.TransformError, transformer.transform(source_z));
+}
+
+test "saturating mul helper" {
+    const allocator = std.testing.allocator;
+    const printer = @import("printer.zig");
+
+    const source =
+        \\pub const Counter = struct {
+        \\    value: u256,
+        \\
+        \\    pub fn mul(self: *Counter, x: u256, y: u256) u256 {
+        \\        _ = self;
+        \\        return evm.saturating_mul(x, y);
+        \\    }
+        \\};
+    ;
+
+    const source_z = try allocator.dupeZ(u8, source);
+    defer allocator.free(source_z);
+
+    var transformer = Transformer.init(allocator);
+    defer transformer.deinit();
+
+    const yul_ast = try transformer.transform(source_z);
+    const output = try printer.format(allocator, yul_ast);
+    defer allocator.free(output);
+
+    try std.testing.expect(std.mem.indexOf(u8, output, "__zig2yul$saturating_mul") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "function __zig2yul$saturating_mul") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "not(0)") != null);
 }
 
 test "dispatcher with parameterized function" {
