@@ -20,12 +20,35 @@ pub const GasEstimate = struct {
     cold_account_accesses: u32 = 0,
     warm_account_accesses: u32 = 0,
     refund_estimate: u64 = 0,
+    assumed_dynamic_ops: u32 = 0,
 };
 
 pub fn estimate(root: ast.AST) GasEstimate {
+    return estimateWithOptions(root, .{});
+}
+
+    pub const AccessList = struct {
+        addresses: []const ast.U256 = &.{},
+        storage_slots: []const ast.U256 = &.{},
+        storage_values: []const StorageValue = &.{},
+
+        pub const StorageValue = struct {
+            slot: ast.U256,
+            value: ast.U256,
+        };
+    };
+
+pub const EstimateOptions = struct {
+    access_list: AccessList = .{},
+    assume_words: u64 = 1,
+    assume_exp_bytes: u64 = 1,
+    assume_unknown_storage_zero: bool = true,
+};
+
+pub fn estimateWithOptions(root: ast.AST, opts: EstimateOptions) GasEstimate {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
-    var ctx = EstimatorContext.init(arena.allocator());
+    var ctx = EstimatorContext.init(arena.allocator(), opts);
     defer ctx.deinit();
 
     var out = GasEstimate{};
@@ -37,18 +60,38 @@ const EstimatorContext = struct {
     allocator: std.mem.Allocator,
     storage_slots: std.ArrayList(ast.U256),
     account_addrs: std.ArrayList(ast.U256),
+    storage_values: std.ArrayList(StorageValue),
+    created_accounts: std.ArrayList(ast.U256),
+    opts: EstimateOptions,
 
-    fn init(allocator: std.mem.Allocator) EstimatorContext {
-        return .{
+    const StorageValue = struct {
+        slot: ast.U256,
+        original: ast.U256,
+        value: ast.U256,
+    };
+
+    fn init(allocator: std.mem.Allocator, opts: EstimateOptions) EstimatorContext {
+        var ctx = EstimatorContext{
             .allocator = allocator,
             .storage_slots = std.ArrayList(ast.U256).init(allocator),
             .account_addrs = std.ArrayList(ast.U256).init(allocator),
+            .storage_values = std.ArrayList(StorageValue).init(allocator),
+            .created_accounts = std.ArrayList(ast.U256).init(allocator),
+            .opts = opts,
         };
+        ctx.storage_slots.appendSlice(opts.access_list.storage_slots) catch {};
+        ctx.account_addrs.appendSlice(opts.access_list.addresses) catch {};
+        for (opts.access_list.storage_values) |entry| {
+            ctx.storage_values.append(.{ .slot = entry.slot, .original = entry.value, .value = entry.value }) catch {};
+        }
+        return ctx;
     }
 
     fn deinit(self: *EstimatorContext) void {
         self.storage_slots.deinit();
         self.account_addrs.deinit();
+        self.storage_values.deinit();
+        self.created_accounts.deinit();
     }
 };
 
@@ -196,6 +239,11 @@ fn applyDynamicCosts(name: []const u8, args: []const ast.Expression, out: *GasEs
                 return true;
             }
         }
+        const assumed_bytes = ctx.opts.assume_words * 32;
+        out.total += 6 * ctx.opts.assume_words;
+        out.assumed_dynamic_ops += 1;
+        applyAssumedMemoryGrowth(out, ctx.opts.assume_words);
+        _ = assumed_bytes;
         return false;
     }
 
@@ -205,6 +253,8 @@ fn applyDynamicCosts(name: []const u8, args: []const ast.Expression, out: *GasEs
             out.total += 50 * bytes;
             return true;
         }
+        out.total += 50 * ctx.opts.assume_exp_bytes;
+        out.assumed_dynamic_ops += 1;
         return false;
     }
 
@@ -219,6 +269,9 @@ fn applyDynamicCosts(name: []const u8, args: []const ast.Expression, out: *GasEs
                 return true;
             }
         }
+        out.total += 3 * ctx.opts.assume_words;
+        out.assumed_dynamic_ops += 1;
+        applyAssumedMemoryGrowth(out, ctx.opts.assume_words);
         return false;
     }
 
@@ -236,6 +289,9 @@ fn applyDynamicCosts(name: []const u8, args: []const ast.Expression, out: *GasEs
                 return true;
             }
         }
+        out.total += 3 * ctx.opts.assume_words;
+        out.assumed_dynamic_ops += 1;
+        applyAssumedMemoryGrowth(out, ctx.opts.assume_words);
         return false;
     }
 
@@ -244,6 +300,8 @@ fn applyDynamicCosts(name: []const u8, args: []const ast.Expression, out: *GasEs
             _ = applyMemoryExpansion(out, offset, 32);
             return true;
         }
+        applyAssumedMemoryGrowth(out, ctx.opts.assume_words);
+        out.assumed_dynamic_ops += 1;
         return false;
     }
 
@@ -252,6 +310,8 @@ fn applyDynamicCosts(name: []const u8, args: []const ast.Expression, out: *GasEs
             _ = applyMemoryExpansion(out, offset, 1);
             return true;
         }
+        applyAssumedMemoryGrowth(out, ctx.opts.assume_words);
+        out.assumed_dynamic_ops += 1;
         return false;
     }
 
@@ -266,6 +326,8 @@ fn applyDynamicCosts(name: []const u8, args: []const ast.Expression, out: *GasEs
                 }
             }
         }
+        applyAssumedMemoryGrowth(out, ctx.opts.assume_words);
+        out.assumed_dynamic_ops += 1;
         return false;
     }
 
@@ -279,6 +341,10 @@ fn applyDynamicCosts(name: []const u8, args: []const ast.Expression, out: *GasEs
                 }
             }
         }
+        const bytes = ctx.opts.assume_words * 32;
+        out.total += 8 * bytes;
+        out.assumed_dynamic_ops += 1;
+        applyAssumedMemoryGrowth(out, ctx.opts.assume_words);
         return false;
     }
 
@@ -293,11 +359,12 @@ fn applyDynamicCosts(name: []const u8, args: []const ast.Expression, out: *GasEs
     if (std.mem.eql(u8, name, "sstore") and args.len >= 2) {
         if (literalU256(args[0])) |slot| {
             applyStorageAccess(slot, out, ctx);
-        }
-        if (literalU256(args[1])) |value| {
-            if (value == 0) {
-                out.refund_estimate += 4800;
+            if (literalU256(args[1])) |value| {
+                applySstoreCost(slot, value, out, ctx);
+                return true;
             }
+            out.total += 20000;
+            out.assumed_dynamic_ops += 1;
         }
         return false;
     }
@@ -316,6 +383,12 @@ fn applyDynamicCosts(name: []const u8, args: []const ast.Expression, out: *GasEs
         }
         if (literalU256(args[2])) |value| {
             if (value != 0) out.total += 9000;
+            if (value != 0 and literalU256(args[1]) != null) {
+                const addr = literalU256(args[1]).?;
+                if (isNewAccount(addr, ctx)) {
+                    out.total += 25000;
+                }
+            }
         }
         if (literalU256(args[3])) |in_offset| {
             if (literalU256(args[4])) |in_len| {
@@ -420,6 +493,15 @@ fn applyMemoryExpansion(out: *GasEstimate, offset: ast.U256, size_bytes: u64) bo
     return true;
 }
 
+fn applyAssumedMemoryGrowth(out: *GasEstimate, assume_words: u64) void {
+    if (assume_words <= out.memory_words) return;
+    const prev_cost = memoryCost(out.memory_words);
+    const next_cost = memoryCost(assume_words);
+    out.total += next_cost - prev_cost;
+    out.memory_words = assume_words;
+    out.memory_gas = next_cost;
+}
+
 fn byteLen(value: ast.U256) u64 {
     if (value == 0) return 0;
     var tmp = value;
@@ -446,6 +528,76 @@ fn applyAccountAccess(addr: ast.U256, out: *GasEstimate, ctx: *EstimatorContext)
     } else {
         out.warm_account_accesses += 1;
     }
+}
+
+fn applySstoreCost(slot: ast.U256, new_value: ast.U256, out: *GasEstimate, ctx: *EstimatorContext) void {
+    const entry = getStorageEntry(slot, ctx);
+    if (entry == null) {
+        if (ctx.opts.assume_unknown_storage_zero) {
+            applySstoreCostKnown(slot, 0, 0, new_value, out, ctx);
+            return;
+        }
+        // Unknown previous value: assume change is expensive
+        out.total += 20000;
+        if (new_value == 0) out.refund_estimate += 4800;
+        setStorageEntry(slot, new_value, new_value, ctx);
+        return;
+    }
+
+    applySstoreCostKnown(slot, entry.?.original, entry.?.current, new_value, out, ctx);
+}
+
+fn applySstoreCostKnown(slot: ast.U256, original: ast.U256, prev: ast.U256, new_value: ast.U256, out: *GasEstimate, ctx: *EstimatorContext) void {
+    if (prev == new_value) {
+        out.total += 100;
+        return;
+    }
+
+    if (original == prev) {
+        if (original == 0 and new_value != 0) {
+            out.total += 20000;
+        } else if (original != 0 and new_value == 0) {
+            out.total += 5000;
+            out.refund_estimate += 4800;
+        } else {
+            out.total += 5000;
+        }
+    } else {
+        out.total += 5000;
+        if (original != 0 and prev == 0 and new_value != 0) {
+            if (out.refund_estimate >= 4800) out.refund_estimate -= 4800;
+        } else if (original != 0 and new_value == 0) {
+            out.refund_estimate += 4800;
+        }
+    }
+
+    setStorageEntry(slot, original, new_value, ctx);
+}
+
+fn getStorageEntry(slot: ast.U256, ctx: *EstimatorContext) ?EstimatorContext.StorageValue {
+    for (ctx.storage_values.items) |entry| {
+        if (entry.slot == slot) return entry;
+    }
+    return null;
+}
+
+fn setStorageEntry(slot: ast.U256, original: ast.U256, current: ast.U256, ctx: *EstimatorContext) void {
+    for (ctx.storage_values.items) |*entry| {
+        if (entry.slot == slot) {
+            entry.value = current;
+            entry.original = original;
+            return;
+        }
+    }
+    ctx.storage_values.append(.{ .slot = slot, .original = original, .value = current }) catch {};
+}
+
+fn isNewAccount(addr: ast.U256, ctx: *EstimatorContext) bool {
+    for (ctx.created_accounts.items) |item| {
+        if (item == addr) return false;
+    }
+    ctx.created_accounts.append(addr) catch return false;
+    return true;
 }
 
 fn isFirstAccess(value: ast.U256, list: *std.ArrayList(ast.U256)) bool {
@@ -508,4 +660,61 @@ test "estimate cold storage and account access" {
     try std.testing.expectEqual(@as(u32, 1), result.warm_storage_accesses);
     try std.testing.expectEqual(@as(u32, 1), result.cold_account_accesses);
     try std.testing.expectEqual(@as(u32, 1), result.warm_account_accesses);
+}
+
+test "estimate sstore refunds" {
+    const code_block = ast.Block.init(&.{
+        ast.Statement.expr(ast.Expression.builtinCall("sstore", &.{
+            ast.Expression.lit(ast.Literal.number(1)),
+            ast.Expression.lit(ast.Literal.number(0)),
+        })),
+    });
+
+    const obj = ast.Object.init("Gas", code_block, &.{}, &.{});
+    const root = ast.AST.init(obj);
+
+    const result = estimate(root);
+    try std.testing.expect(result.refund_estimate >= 4800);
+}
+
+test "estimate warm access list" {
+    const code_block = ast.Block.init(&.{
+        ast.Statement.expr(ast.Expression.builtinCall("sload", &.{
+            ast.Expression.lit(ast.Literal.number(7)),
+        })),
+        ast.Statement.expr(ast.Expression.builtinCall("balance", &.{
+            ast.Expression.lit(ast.Literal.number(2)),
+        })),
+    });
+
+    const obj = ast.Object.init("Gas", code_block, &.{}, &.{});
+    const root = ast.AST.init(obj);
+
+    const opts: EstimateOptions = .{
+        .access_list = .{
+            .storage_slots = &.{7},
+            .addresses = &.{2},
+        },
+    };
+
+    const result = estimateWithOptions(root, opts);
+    try std.testing.expectEqual(@as(u32, 0), result.cold_storage_accesses);
+    try std.testing.expectEqual(@as(u32, 1), result.warm_storage_accesses);
+    try std.testing.expectEqual(@as(u32, 0), result.cold_account_accesses);
+    try std.testing.expectEqual(@as(u32, 1), result.warm_account_accesses);
+}
+
+test "estimate assumed dynamic sizing" {
+    const code_block = ast.Block.init(&.{
+        ast.Statement.expr(ast.Expression.builtinCall("keccak256", &.{
+            ast.Expression.id("ptr"),
+            ast.Expression.id("len"),
+        })),
+    });
+
+    const obj = ast.Object.init("Gas", code_block, &.{}, &.{});
+    const root = ast.AST.init(obj);
+
+    const result = estimate(root);
+    try std.testing.expectEqual(@as(u32, 1), result.assumed_dynamic_ops);
 }
