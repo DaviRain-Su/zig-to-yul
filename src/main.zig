@@ -6,6 +6,9 @@ const Transformer = @import("yul/transformer.zig").Transformer;
 const printer = @import("yul/printer.zig");
 const event_decode = @import("evm/event_decode.zig");
 const optimizer = @import("yul/optimizer.zig");
+const gas_estimator = @import("yul/gas_estimator.zig");
+const profile = @import("profile.zig");
+const yul_ast = @import("yul/ast.zig");
 
 const version = "0.1.0";
 
@@ -32,6 +35,8 @@ pub fn main() !void {
         try runDecodeEvent(allocator, args[2..]);
     } else if (std.mem.eql(u8, command, "decode-abi")) {
         try runDecodeAbi(allocator, args[2..]);
+    } else if (std.mem.eql(u8, command, "estimate")) {
+        try runEstimate(allocator, args[2..]);
     } else if (std.mem.eql(u8, command, "version") or std.mem.eql(u8, command, "--version") or std.mem.eql(u8, command, "-v")) {
         printVersionStdout();
     } else if (std.mem.eql(u8, command, "help") or std.mem.eql(u8, command, "--help") or std.mem.eql(u8, command, "-h")) {
@@ -171,6 +176,53 @@ fn runBuild(allocator: std.mem.Allocator, args: []const []const u8) !void {
     }
 }
 
+fn runEstimate(allocator: std.mem.Allocator, args: []const []const u8) !void {
+    const opts = try parseEstimateOptions(args);
+
+    if (opts.input_file == null) {
+        std.debug.print("Error: No input file specified\n", .{});
+        printEstimateUsageStderr();
+        std.process.exit(1);
+    }
+
+    const source = try readFile(allocator, opts.input_file.?);
+    defer allocator.free(source);
+
+    var trans = Transformer.init(allocator);
+    defer trans.deinit();
+
+    const yul_ast_root = trans.transform(source) catch |err| {
+        printTransformErrorsStderr(&trans, opts.input_file.?);
+        std.debug.print("Compilation failed: {}\n", .{err});
+        std.process.exit(1);
+    };
+
+    var estimate_opts = gas_estimator.optionsForVersion(opts.evm_version);
+
+    var profile_overrides: ?profile.ProfileOverrides = null;
+    defer if (profile_overrides) |*p| p.deinit(allocator);
+
+    if (opts.profile_path) |path| {
+        const profile_json = try readFile(allocator, path);
+        defer allocator.free(profile_json);
+        const parsed = try profile.parseProfileOverrides(allocator, profile_json);
+        profile_overrides = parsed;
+        estimate_opts = profile.applyProfileToOptions(estimate_opts, parsed);
+    }
+
+    const result = gas_estimator.estimateWithOptions(yul_ast_root, estimate_opts);
+
+    const json_out = try std.json.stringifyAlloc(allocator, result, .{});
+    defer allocator.free(json_out);
+
+    if (opts.output_file) |path| {
+        try writeOutput(json_out, path);
+    } else {
+        const stdout = std.fs.File.stdout();
+        stdout.writeAll(json_out) catch {};
+        stdout.writeAll("\n") catch {};
+    }
+}
 
 const DecodeEventOptions = struct {
     event_name: ?[]const u8 = null,
@@ -395,6 +447,84 @@ const Options = struct {
     optimize_yul: bool = false,
 };
 
+const EstimateCliOptions = struct {
+    input_file: ?[]const u8 = null,
+    output_file: ?[]const u8 = null,
+    profile_path: ?[]const u8 = null,
+    evm_version: yul_ast.EvmVersion = .cancun,
+};
+
+fn parseEstimateOptions(args: []const []const u8) !EstimateCliOptions {
+    var opts = EstimateCliOptions{};
+    var i: usize = 0;
+
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "-o") or std.mem.eql(u8, arg, "--output")) {
+            i += 1;
+            if (i < args.len) {
+                opts.output_file = args[i];
+            } else {
+                std.debug.print("Error: -o requires an argument\n", .{});
+                std.process.exit(1);
+            }
+        } else if (std.mem.eql(u8, arg, "--profile")) {
+            i += 1;
+            if (i < args.len) {
+                opts.profile_path = args[i];
+            } else {
+                std.debug.print("Error: --profile requires a file\n", .{});
+                std.process.exit(1);
+            }
+        } else if (std.mem.eql(u8, arg, "--evm-version")) {
+            i += 1;
+            if (i < args.len) {
+                opts.evm_version = parseEvmVersion(args[i]) orelse {
+                    std.debug.print("Error: unknown EVM version: {s}\n", .{args[i]});
+                    std.process.exit(1);
+                };
+            } else {
+                std.debug.print("Error: --evm-version requires a value\n", .{});
+                std.process.exit(1);
+            }
+        } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
+            printEstimateUsageStderr();
+            std.process.exit(0);
+        } else if (arg.len > 0 and arg[0] != '-') {
+            opts.input_file = arg;
+        } else {
+            std.debug.print("Unknown option: {s}\n", .{arg});
+            std.process.exit(1);
+        }
+    }
+
+    return opts;
+}
+
+fn parseEvmVersion(value: []const u8) ?yul_ast.EvmVersion {
+    const table = [_]struct { name: []const u8, version: yul_ast.EvmVersion }{
+        .{ .name = "homestead", .version = .homestead },
+        .{ .name = "tangerine", .version = .tangerine_whistle },
+        .{ .name = "tangerine_whistle", .version = .tangerine_whistle },
+        .{ .name = "spurious_dragon", .version = .spurious_dragon },
+        .{ .name = "byzantium", .version = .byzantium },
+        .{ .name = "constantinople", .version = .constantinople },
+        .{ .name = "petersburg", .version = .petersburg },
+        .{ .name = "istanbul", .version = .istanbul },
+        .{ .name = "berlin", .version = .berlin },
+        .{ .name = "london", .version = .london },
+        .{ .name = "paris", .version = .paris },
+        .{ .name = "shanghai", .version = .shanghai },
+        .{ .name = "cancun", .version = .cancun },
+        .{ .name = "prague", .version = .prague },
+    };
+
+    for (table) |entry| {
+        if (std.mem.eql(u8, value, entry.name)) return entry.version;
+    }
+    return null;
+}
+
 fn parseOptions(args: []const []const u8) !Options {
     var opts = Options{};
     var i: usize = 0;
@@ -598,6 +728,7 @@ fn printUsageStderr() void {
         \\COMMANDS:
         \\    compile     Compile Zig to Yul intermediate language
         \\    build       Compile Zig to EVM bytecode (requires solc)
+        \\    estimate    Estimate gas; supports profile overrides
         \\    decode-event Decode EVM event logs
         \\    decode-abi  Decode ABI-encoded data
         \\    version     Print version information
@@ -608,6 +739,8 @@ fn printUsageStderr() void {
         \\    -O, --optimize         Enable solc optimizer (build only)
         \\    --sourcemap           Write a .map file next to output (compile only)
         \\    --optimize-yul        Run basic Yul optimizer (compile only)
+        \\    --profile <file>       Profile counts JSON (estimate only)
+        \\    --evm-version <name>   EVM version (estimate only)
         \\    -h, --help             Print help message
         \\
     , .{version});
@@ -681,6 +814,19 @@ fn printBuildUsageStderr() void {
     , .{});
 }
 
+fn printEstimateUsageStderr() void {
+    std.debug.print(
+        \\USAGE: zig-to-yul estimate [options] <input.zig>
+        \\
+        \\OPTIONS:
+        \\    -o, --output <file>    Write JSON output to <file> (default stdout)
+        \\    --profile <file>       Profile JSON with branch/switch/loop counts
+        \\    --evm-version <name>   EVM version (homestead..prague)
+        \\    -h, --help             Print help
+        \\
+    , .{});
+}
+
 fn printVersionStdout() void {
     std.debug.print("zig-to-yul {s}\n", .{version});
 }
@@ -695,6 +841,7 @@ fn printUsageTo(writer: anytype) !void {
         \\COMMANDS:
         \\    compile     Compile Zig to Yul intermediate language
         \\    build       Compile Zig to EVM bytecode (requires solc)
+        \\    estimate    Estimate gas; supports profile overrides
         \\    decode-event Decode EVM event logs
         \\    decode-abi  Decode ABI-encoded data
         \\    version     Print version information
@@ -705,6 +852,8 @@ fn printUsageTo(writer: anytype) !void {
         \\    -O, --optimize         Enable solc optimizer (build only)
         \\    --sourcemap           Write a .map file next to output (compile only)
         \\    --optimize-yul        Run basic Yul optimizer (compile only)
+        \\    --profile <file>       Profile counts JSON (estimate only)
+        \\    --evm-version <name>   EVM version (estimate only)
         \\    -h, --help             Print help message
         \\
         \\EXAMPLES:

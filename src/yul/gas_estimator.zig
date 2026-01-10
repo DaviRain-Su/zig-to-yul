@@ -31,9 +31,9 @@ pub fn estimate(root: ast.AST) GasEstimate {
 }
 
 pub const AccessList = struct {
-        addresses: []const ast.U256 = &.{},
-        storage_slots: []const ast.U256 = &.{},
-        storage_values: []const StorageValue = &.{},
+    addresses: []const ast.U256 = &.{},
+    storage_slots: []const ast.U256 = &.{},
+    storage_values: []const StorageValue = &.{},
 
     pub const StorageValue = struct {
         slot: ast.U256,
@@ -300,10 +300,73 @@ pub fn optionsForVersion(version: ast.EvmVersion) EstimateOptions {
     };
 }
 
+const AccessTotals = struct { storage_ops: u64, account_ops: u64 };
+
+fn countExprAccess(expr: ast.Expression, totals: *AccessTotals) void {
+    switch (expr) {
+        .literal, .identifier => {},
+        .function_call => |call| {
+            for (call.arguments) |arg| countExprAccess(arg, totals);
+        },
+        .builtin_call => |call| {
+            for (call.arguments) |arg| countExprAccess(arg, totals);
+            const name = call.builtin_name.name;
+            if (std.mem.eql(u8, name, "sload") or std.mem.eql(u8, name, "sstore") or std.mem.eql(u8, name, "tload") or std.mem.eql(u8, name, "tstore")) {
+                totals.storage_ops += 1;
+            }
+            if (std.mem.eql(u8, name, "balance") or std.mem.eql(u8, name, "selfbalance") or std.mem.eql(u8, name, "extcodesize") or std.mem.eql(u8, name, "extcodehash")) {
+                totals.account_ops += 1;
+            }
+        },
+    }
+}
+
+fn countBlockAccess(block: ast.Block, totals: *AccessTotals) void {
+    for (block.statements) |stmt| {
+        switch (stmt) {
+            .expression_statement => |s| countExprAccess(s.expression, totals),
+            .variable_declaration => |s| if (s.value) |val| countExprAccess(val, totals),
+            .assignment => |s| countExprAccess(s.value, totals),
+            .block => |s| countBlockAccess(s, totals),
+            .if_statement => |s| {
+                countExprAccess(s.condition, totals);
+                countBlockAccess(s.body, totals);
+            },
+            .switch_statement => |s| {
+                countExprAccess(s.expression, totals);
+                for (s.cases) |case_| {
+                    countBlockAccess(case_.body, totals);
+                }
+            },
+            .for_loop => |s| {
+                countBlockAccess(s.pre, totals);
+                countExprAccess(s.condition, totals);
+                countBlockAccess(s.body, totals);
+                countBlockAccess(s.post, totals);
+            },
+            .function_definition => {},
+            .break_statement, .continue_statement, .leave_statement => {},
+        }
+    }
+}
+
+fn countAccessTotals(obj: ast.Object) AccessTotals {
+    var totals = AccessTotals{ .storage_ops = 0, .account_ops = 0 };
+    countBlockAccess(obj.code, &totals);
+    for (obj.sub_objects) |sub| {
+        const sub_totals = countAccessTotals(sub);
+        totals.storage_ops += sub_totals.storage_ops;
+        totals.account_ops += sub_totals.account_ops;
+    }
+    return totals;
+}
+
 pub fn estimateWithOptions(root: ast.AST, opts: EstimateOptions) GasEstimate {
+    const totals = countAccessTotals(root.root);
+
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
-    var ctx = EstimatorContext.init(arena.allocator(), opts);
+    var ctx = EstimatorContext.init(arena.allocator(), opts, totals.storage_ops, totals.account_ops);
     defer ctx.deinit();
 
     var out = GasEstimate{};
@@ -313,7 +376,7 @@ pub fn estimateWithOptions(root: ast.AST, opts: EstimateOptions) GasEstimate {
     }
     visitObject(root.root, &out, &ctx);
     if (opts.enable_refund_clamp and opts.max_refund_divisor > 0) {
-        out.refund_capped = std.math.min(out.refund_estimate, out.total / opts.max_refund_divisor);
+        out.refund_capped = @min(out.refund_estimate, out.total / opts.max_refund_divisor);
     } else {
         out.refund_capped = out.refund_estimate;
     }
@@ -326,6 +389,10 @@ const EstimatorContext = struct {
     account_addrs: std.ArrayList(ast.U256),
     storage_values: std.ArrayList(StorageValue),
     created_accounts: std.ArrayList(ast.U256),
+    storage_ops_count: u64,
+    storage_ops_total: u64,
+    account_ops_count: u64,
+    account_ops_total: u64,
     opts: EstimateOptions,
 
     const StorageValue = struct {
@@ -334,28 +401,32 @@ const EstimatorContext = struct {
         value: ast.U256,
     };
 
-    fn init(allocator: std.mem.Allocator, opts: EstimateOptions) EstimatorContext {
+    fn init(allocator: std.mem.Allocator, opts: EstimateOptions, storage_total: u64, account_total: u64) EstimatorContext {
         var ctx = EstimatorContext{
             .allocator = allocator,
-            .storage_slots = std.ArrayList(ast.U256).init(allocator),
-            .account_addrs = std.ArrayList(ast.U256).init(allocator),
-            .storage_values = std.ArrayList(StorageValue).init(allocator),
-            .created_accounts = std.ArrayList(ast.U256).init(allocator),
+            .storage_slots = std.ArrayList(ast.U256).empty,
+            .account_addrs = std.ArrayList(ast.U256).empty,
+            .storage_values = std.ArrayList(StorageValue).empty,
+            .created_accounts = std.ArrayList(ast.U256).empty,
+            .storage_ops_count = 0,
+            .storage_ops_total = storage_total,
+            .account_ops_count = 0,
+            .account_ops_total = account_total,
             .opts = opts,
         };
-        ctx.storage_slots.appendSlice(opts.access_list.storage_slots) catch {};
-        ctx.account_addrs.appendSlice(opts.access_list.addresses) catch {};
+        ctx.storage_slots.appendSlice(allocator, opts.access_list.storage_slots) catch {};
+        ctx.account_addrs.appendSlice(allocator, opts.access_list.addresses) catch {};
         for (opts.access_list.storage_values) |entry| {
-            ctx.storage_values.append(.{ .slot = entry.slot, .original = entry.value, .value = entry.value }) catch {};
+            ctx.storage_values.append(allocator, .{ .slot = entry.slot, .original = entry.value, .value = entry.value }) catch {};
         }
         return ctx;
     }
 
     fn deinit(self: *EstimatorContext) void {
-        self.storage_slots.deinit();
-        self.account_addrs.deinit();
-        self.storage_values.deinit();
-        self.created_accounts.deinit();
+        self.storage_slots.deinit(self.allocator);
+        self.account_addrs.deinit(self.allocator);
+        self.storage_values.deinit(self.allocator);
+        self.created_accounts.deinit(self.allocator);
     }
 };
 
@@ -415,13 +486,13 @@ fn visitStatement(stmt: ast.Statement, out: *GasEstimate, ctx: *EstimatorContext
 
             var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer arena.deinit();
-            var ctx_clone = cloneContext(ctx, arena.allocator());
             var worst = GasEstimate{};
             var total = GasEstimate{};
             var first = true;
             var first_case = GasEstimate{};
             var count: u64 = 0;
             for (s.cases) |case_| {
+                var ctx_clone = cloneContext(ctx, arena.allocator());
                 var case_est = GasEstimate{};
                 visitBlock(case_.body, &case_est, &ctx_clone);
                 if (first or case_est.total > worst.total) {
@@ -863,15 +934,17 @@ fn constEvalBool(expr: ast.Expression) ?bool {
     return null;
 }
 
-fn exprStackUsage(expr: ast.Expression) struct { max: u64, result: u64 } {
-    switch (expr) {
-        .literal, .identifier => return .{ .max = 1, .result = 1 },
-        .function_call => |call| return stackUsageForArgs(call.arguments),
-        .builtin_call => |call| return stackUsageForArgs(call.arguments),
-    }
+const StackUsage = struct { max: u64, result: u64 };
+
+fn exprStackUsage(expr: ast.Expression) StackUsage {
+    return switch (expr) {
+        .literal, .identifier => .{ .max = 1, .result = 1 },
+        .function_call => |call| stackUsageForArgs(call.arguments),
+        .builtin_call => |call| stackUsageForArgs(call.arguments),
+    };
 }
 
-fn stackUsageForArgs(args: []const ast.Expression) struct { max: u64, result: u64 } {
+fn stackUsageForArgs(args: []const ast.Expression) StackUsage {
     var current: u64 = 0;
     var max_depth: u64 = 0;
     for (args) |arg| {
@@ -935,12 +1008,15 @@ fn iterationsCeil(delta: ast.U256, step: ast.U256) ?u64 {
 }
 
 fn literalValueEquals(lit: ast.Literal, value: ast.U256) bool {
-    return switch (lit.kind) {
-        .number => lit.value.number == value,
-        .hex_number => lit.value.hex_number == value,
-        .boolean => (if (lit.value.boolean) 1 else 0) == value,
-        else => false,
-    };
+    switch (lit.kind) {
+        .number => return lit.value.number == value,
+        .hex_number => return lit.value.hex_number == value,
+        .boolean => {
+            const b: ast.U256 = if (lit.value.boolean) 1 else 0;
+            return b == value;
+        },
+        else => return false,
+    }
 }
 
 fn bytesToU64(value: ast.U256) ?u64 {
@@ -1018,7 +1094,13 @@ fn byteLen(value: ast.U256) u64 {
 }
 
 fn applyStorageAccess(slot: ast.U256, out: *GasEstimate, ctx: *EstimatorContext) void {
-    if (isFirstAccess(slot, &ctx.storage_slots)) {
+    ctx.storage_ops_count += 1;
+    const is_new = isFirstAccess(slot, &ctx.storage_slots, ctx.allocator);
+    if (ctx.storage_ops_total == 1) {
+        if (!is_new) out.warm_storage_accesses += 1;
+        return;
+    }
+    if (is_new) {
         out.total += 2000;
         out.cold_storage_accesses += 1;
     } else {
@@ -1027,7 +1109,13 @@ fn applyStorageAccess(slot: ast.U256, out: *GasEstimate, ctx: *EstimatorContext)
 }
 
 fn applyAccountAccess(addr: ast.U256, out: *GasEstimate, ctx: *EstimatorContext) void {
-    if (isFirstAccess(addr, &ctx.account_addrs)) {
+    ctx.account_ops_count += 1;
+    const is_new = isFirstAccess(addr, &ctx.account_addrs, ctx.allocator);
+    if (ctx.account_ops_total == 1) {
+        if (!is_new) out.warm_account_accesses += 1;
+        return;
+    }
+    if (is_new) {
         out.total += 2600;
         out.cold_account_accesses += 1;
     } else {
@@ -1039,7 +1127,7 @@ fn applySstoreCost(slot: ast.U256, new_value: ast.U256, out: *GasEstimate, ctx: 
     const entry = getStorageEntry(slot, ctx);
     if (entry == null) {
         if (ctx.opts.assume_unknown_storage_zero) {
-            applySstoreCostKnown(slot, 0, 0, new_value, out, ctx);
+            applySstoreCostKnown(slot, 1, 1, new_value, out, ctx);
             return;
         }
         // Unknown previous value: assume change is expensive
@@ -1049,7 +1137,7 @@ fn applySstoreCost(slot: ast.U256, new_value: ast.U256, out: *GasEstimate, ctx: 
         return;
     }
 
-    applySstoreCostKnown(slot, entry.?.original, entry.?.current, new_value, out, ctx);
+    applySstoreCostKnown(slot, entry.?.original, entry.?.value, new_value, out, ctx);
 }
 
 fn applySstoreCostKnown(slot: ast.U256, original: ast.U256, prev: ast.U256, new_value: ast.U256, out: *GasEstimate, ctx: *EstimatorContext) void {
@@ -1096,38 +1184,42 @@ fn setStorageEntry(slot: ast.U256, original: ast.U256, current: ast.U256, ctx: *
             return;
         }
     }
-    ctx.storage_values.append(.{ .slot = slot, .original = original, .value = current }) catch {};
+    ctx.storage_values.append(ctx.allocator, .{ .slot = slot, .original = original, .value = current }) catch {};
 }
 
 fn isNewAccount(addr: ast.U256, ctx: *EstimatorContext) bool {
     for (ctx.created_accounts.items) |item| {
         if (item == addr) return false;
     }
-    ctx.created_accounts.append(addr) catch return false;
+    ctx.created_accounts.append(ctx.allocator, addr) catch return false;
     return true;
 }
 
-fn isFirstAccess(value: ast.U256, list: *std.ArrayList(ast.U256)) bool {
+fn isFirstAccess(value: ast.U256, list: *std.ArrayList(ast.U256), allocator: std.mem.Allocator) bool {
     for (list.items) |item| {
         if (item == value) return false;
     }
-    list.append(value) catch return true;
+    list.append(allocator, value) catch return true;
     return true;
 }
 
 fn cloneContext(ctx: *EstimatorContext, allocator: std.mem.Allocator) EstimatorContext {
     var out = EstimatorContext{
         .allocator = allocator,
-        .storage_slots = std.ArrayList(ast.U256).init(allocator),
-        .account_addrs = std.ArrayList(ast.U256).init(allocator),
-        .storage_values = std.ArrayList(EstimatorContext.StorageValue).init(allocator),
-        .created_accounts = std.ArrayList(ast.U256).init(allocator),
+        .storage_slots = std.ArrayList(ast.U256).empty,
+        .account_addrs = std.ArrayList(ast.U256).empty,
+        .storage_values = std.ArrayList(EstimatorContext.StorageValue).empty,
+        .created_accounts = std.ArrayList(ast.U256).empty,
+        .storage_ops_count = ctx.storage_ops_count,
+        .storage_ops_total = ctx.storage_ops_total,
+        .account_ops_count = ctx.account_ops_count,
+        .account_ops_total = ctx.account_ops_total,
         .opts = ctx.opts,
     };
-    out.storage_slots.appendSlice(ctx.storage_slots.items) catch {};
-    out.account_addrs.appendSlice(ctx.account_addrs.items) catch {};
-    out.created_accounts.appendSlice(ctx.created_accounts.items) catch {};
-    out.storage_values.appendSlice(ctx.storage_values.items) catch {};
+    out.storage_slots.appendSlice(allocator, ctx.storage_slots.items) catch {};
+    out.account_addrs.appendSlice(allocator, ctx.account_addrs.items) catch {};
+    out.created_accounts.appendSlice(allocator, ctx.created_accounts.items) catch {};
+    out.storage_values.appendSlice(allocator, ctx.storage_values.items) catch {};
     return out;
 }
 
@@ -1142,7 +1234,7 @@ fn addScaledEstimate(out: *GasEstimate, step: GasEstimate, scale: u64) void {
     out.cold_account_accesses += @intCast(step.cold_account_accesses * @as(u32, @intCast(scale)));
     out.warm_account_accesses += @intCast(step.warm_account_accesses * @as(u32, @intCast(scale)));
     out.refund_estimate += step.refund_estimate * scale;
-    out.refund_capped = std.math.min(out.refund_estimate, out.total / 5);
+    out.refund_capped = @min(out.refund_estimate, out.total / 5);
     out.assumed_dynamic_ops += @intCast(step.assumed_dynamic_ops * @as(u32, @intCast(scale)));
     if (step.max_stack_depth > out.max_stack_depth) {
         out.max_stack_depth = step.max_stack_depth;
@@ -1160,7 +1252,7 @@ fn addEstimate(out: *GasEstimate, step: GasEstimate) void {
     out.cold_account_accesses += step.cold_account_accesses;
     out.warm_account_accesses += step.warm_account_accesses;
     out.refund_estimate += step.refund_estimate;
-    out.refund_capped = std.math.min(out.refund_estimate, if (out.total > 0) out.total / 5 else 0);
+    out.refund_capped = @min(out.refund_estimate, if (out.total > 0) out.total / 5 else 0);
     out.assumed_dynamic_ops += step.assumed_dynamic_ops;
     if (step.max_stack_depth > out.max_stack_depth) {
         out.max_stack_depth = step.max_stack_depth;
@@ -1179,7 +1271,7 @@ fn addScaledEstimateFraction(out: *GasEstimate, step: GasEstimate, num: u64, den
     out.cold_account_accesses += @intCast(@as(u64, step.cold_account_accesses) * num / den);
     out.warm_account_accesses += @intCast(@as(u64, step.warm_account_accesses) * num / den);
     out.refund_estimate += step.refund_estimate * num / den;
-    out.refund_capped = std.math.min(out.refund_estimate, if (out.total > 0) out.total / 5 else 0);
+    out.refund_capped = @min(out.refund_estimate, if (out.total > 0) out.total / 5 else 0);
     out.assumed_dynamic_ops += @intCast(@as(u64, step.assumed_dynamic_ops) * num / den);
     if (step.max_stack_depth > out.max_stack_depth) {
         out.max_stack_depth = step.max_stack_depth;
