@@ -2924,11 +2924,57 @@ pub const Transformer = struct {
         }
 
         var head_offset: ast.U256 = 4;
-        for (fi.params, 0..) |param_name, i| {
+        var i: usize = 0;
+        while (i < fi.params.len) {
             const offset: evm_types.U256 = head_offset;
             const abi_type = fi.param_types[i];
             const struct_len = fi.param_struct_lens[i];
             const struct_dynamic = fi.param_struct_dynamic[i];
+
+            if (struct_len == 0 and !isDynamicAbiType(abi_type)) {
+                var run_len: usize = 1;
+                while (i + run_len < fi.params.len) : (run_len += 1) {
+                    const next_abi = fi.param_types[i + run_len];
+                    if (fi.param_struct_lens[i + run_len] != 0) break;
+                    if (fi.param_struct_dynamic[i + run_len]) break;
+                    if (isDynamicAbiType(next_abi)) break;
+                }
+
+                if (run_len >= 3) {
+                    const copy_size: ast.U256 = @intCast(run_len * 32);
+                    const copy_call = try self.builder.builtinCall("calldatacopy", &.{
+                        ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0))),
+                        ast.Expression.lit(ast.Literal.number(offset)),
+                        ast.Expression.lit(ast.Literal.number(copy_size)),
+                    });
+                    try case_stmts.append(self.allocator, ast.Statement.expr(copy_call));
+
+                    var k: usize = 0;
+                    while (k < run_len) : (k += 1) {
+                        const param_name = fi.params[i + k];
+                        const param_abi = fi.param_types[i + k];
+                        const load_expr = try self.builder.builtinCall("mload", &.{
+                            ast.Expression.lit(ast.Literal.number(@as(ast.U256, @intCast(k * 32)))),
+                        });
+                        const value_expr = if (std.mem.eql(u8, param_abi, "address"))
+                            try self.builder.builtinCall("shr", &.{
+                                ast.Expression.lit(ast.Literal.number(@as(ast.U256, 96))),
+                                load_expr,
+                            })
+                        else
+                            load_expr;
+                        const var_decl = try self.builder.varDecl(&.{param_name}, value_expr);
+                        try case_stmts.append(self.allocator, var_decl);
+                        try call_args.append(self.allocator, ast.Expression.id(param_name));
+                    }
+
+                    head_offset += copy_size;
+                    i += run_len;
+                    continue;
+                }
+            }
+
+            const param_name = fi.params[i];
             if (struct_len > 0 and !struct_dynamic) {
                 const struct_name = fi.param_struct_names[i];
                 if (self.struct_defs.get(struct_name)) |fields| {
@@ -3070,6 +3116,7 @@ pub const Transformer = struct {
                 try call_args.append(self.allocator, ast.Expression.id(param_name));
                 head_offset += @as(ast.U256, 32);
             }
+            i += 1;
         }
 
         const func_call = try self.builder.call(fi.name, call_args.items);
@@ -3820,6 +3867,35 @@ test "dispatcher with dynamic params and return" {
     try std.testing.expect(std.mem.indexOf(u8, output, "mstore(0, 32)") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "mstore(32,") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "return(0, add(64") != null);
+}
+
+test "dispatcher batches static params" {
+    const allocator = std.testing.allocator;
+    const printer = @import("printer.zig");
+
+    const source =
+        \\pub const Batch = struct {
+        \\    pub fn sum(self: *Batch, a: u256, b: u256, c: u256) u256 {
+        \\        _ = self;
+        \\        return a + b + c;
+        \\    }
+        \\};
+    ;
+
+    const source_z = try allocator.dupeZ(u8, source);
+    defer allocator.free(source_z);
+
+    var transformer = Transformer.init(allocator);
+    defer transformer.deinit();
+
+    const yul_ast = try transformer.transform(source_z);
+    const output = try printer.format(allocator, yul_ast);
+    defer allocator.free(output);
+
+    try std.testing.expect(std.mem.indexOf(u8, output, "calldatacopy(0, 4, 96)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "mload(0)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "mload(32)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "mload(64)") != null);
 }
 
 test "dispatcher dynamic abi size rounding" {
