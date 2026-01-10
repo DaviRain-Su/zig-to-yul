@@ -22,28 +22,98 @@ pub const GasEstimate = struct {
     refund_estimate: u64 = 0,
     refund_capped: u64 = 0,
     assumed_dynamic_ops: u32 = 0,
+    assumed_loop_iterations: u64 = 0,
 };
 
 pub fn estimate(root: ast.AST) GasEstimate {
     return estimateWithOptions(root, .{});
 }
 
-    pub const AccessList = struct {
+pub const AccessList = struct {
         addresses: []const ast.U256 = &.{},
         storage_slots: []const ast.U256 = &.{},
         storage_values: []const StorageValue = &.{},
 
-        pub const StorageValue = struct {
-            slot: ast.U256,
-            value: ast.U256,
+    pub const StorageValue = struct {
+        slot: ast.U256,
+        value: ast.U256,
+    };
+};
+
+pub const AccessListOwned = struct {
+    addresses: []ast.U256,
+    storage_slots: []ast.U256,
+    storage_values: []AccessList.StorageValue,
+
+    pub fn deinit(self: *AccessListOwned, allocator: std.mem.Allocator) void {
+        allocator.free(self.addresses);
+        allocator.free(self.storage_slots);
+        allocator.free(self.storage_values);
+    }
+
+    pub fn asAccessList(self: *const AccessListOwned) AccessList {
+        return .{
+            .addresses = self.addresses,
+            .storage_slots = self.storage_slots,
+            .storage_values = self.storage_values,
+        };
+    }
+};
+
+pub fn parseAccessListJson(allocator: std.mem.Allocator, json: []const u8) !AccessListOwned {
+    const AccessListJson = struct {
+        addresses: ?[]const []const u8 = null,
+        storage_slots: ?[]const []const u8 = null,
+        storage_values: ?[]const StorageValueJson = null,
+
+        const StorageValueJson = struct {
+            slot: []const u8,
+            value: []const u8,
         };
     };
+
+    const parsed = try std.json.parseFromSlice(AccessListJson, allocator, json, .{});
+    defer parsed.deinit();
+
+    var addrs = std.ArrayList(ast.U256).empty;
+    defer addrs.deinit(allocator);
+    var slots = std.ArrayList(ast.U256).empty;
+    defer slots.deinit(allocator);
+    var values = std.ArrayList(AccessList.StorageValue).empty;
+    defer values.deinit(allocator);
+
+    if (parsed.value.addresses) |items| {
+        for (items) |item| {
+            try addrs.append(allocator, try parseU256String(item));
+        }
+    }
+    if (parsed.value.storage_slots) |items| {
+        for (items) |item| {
+            try slots.append(allocator, try parseU256String(item));
+        }
+    }
+    if (parsed.value.storage_values) |items| {
+        for (items) |item| {
+            try values.append(allocator, .{
+                .slot = try parseU256String(item.slot),
+                .value = try parseU256String(item.value),
+            });
+        }
+    }
+
+    return .{
+        .addresses = try addrs.toOwnedSlice(allocator),
+        .storage_slots = try slots.toOwnedSlice(allocator),
+        .storage_values = try values.toOwnedSlice(allocator),
+    };
+}
 
 pub const EstimateOptions = struct {
     access_list: AccessList = .{},
     assume_words: u64 = 1,
     assume_exp_bytes: u64 = 1,
     assume_unknown_storage_zero: bool = true,
+    loop_iterations: u64 = 1,
 };
 
 pub fn estimateWithOptions(root: ast.AST, opts: EstimateOptions) GasEstimate {
@@ -128,9 +198,22 @@ fn visitStatement(stmt: ast.Statement, out: *GasEstimate, ctx: *EstimatorContext
         },
         .for_loop => |s| {
             visitBlock(s.pre, out, ctx);
+            const cond_value = constEvalBool(s.condition);
             visitExpression(s.condition, out, ctx);
-            visitBlock(s.post, out, ctx);
+            if (cond_value == false) return;
             visitBlock(s.body, out, ctx);
+            visitBlock(s.post, out, ctx);
+            if (ctx.opts.loop_iterations > 1) {
+                out.assumed_loop_iterations += ctx.opts.loop_iterations - 1;
+                var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+                defer arena.deinit();
+                var ctx_clone = cloneContext(ctx, arena.allocator());
+                var step = GasEstimate{};
+                visitExpression(s.condition, &step, &ctx_clone);
+                visitBlock(s.body, &step, &ctx_clone);
+                visitBlock(s.post, &step, &ctx_clone);
+                addScaledEstimate(out, step, ctx.opts.loop_iterations - 1);
+            }
         },
         .function_definition => {},
         .break_statement, .continue_statement, .leave_statement => {},
@@ -505,8 +588,23 @@ fn constEvalU256(expr: ast.Expression) ?ast.U256 {
     return null;
 }
 
+fn constEvalBool(expr: ast.Expression) ?bool {
+    if (constEvalU256(expr)) |val| {
+        return val != 0;
+    }
+    return null;
+}
+
 fn bytesToU64(value: ast.U256) ?u64 {
     return std.math.cast(u64, value);
+}
+
+fn parseU256String(value: []const u8) !ast.U256 {
+    const trimmed = std.mem.trim(u8, value, " \t\r\n");
+    if (std.mem.startsWith(u8, trimmed, "0x") or std.mem.startsWith(u8, trimmed, "0X")) {
+        return std.fmt.parseInt(ast.U256, trimmed[2..], 16);
+    }
+    return std.fmt.parseInt(ast.U256, trimmed, 10);
 }
 
 fn wordsForSize(size_bytes: u64) u64 {
@@ -649,6 +747,37 @@ fn isFirstAccess(value: ast.U256, list: *std.ArrayList(ast.U256)) bool {
     return true;
 }
 
+fn cloneContext(ctx: *EstimatorContext, allocator: std.mem.Allocator) EstimatorContext {
+    var out = EstimatorContext{
+        .allocator = allocator,
+        .storage_slots = std.ArrayList(ast.U256).init(allocator),
+        .account_addrs = std.ArrayList(ast.U256).init(allocator),
+        .storage_values = std.ArrayList(EstimatorContext.StorageValue).init(allocator),
+        .created_accounts = std.ArrayList(ast.U256).init(allocator),
+        .opts = ctx.opts,
+    };
+    out.storage_slots.appendSlice(ctx.storage_slots.items) catch {};
+    out.account_addrs.appendSlice(ctx.account_addrs.items) catch {};
+    out.created_accounts.appendSlice(ctx.created_accounts.items) catch {};
+    out.storage_values.appendSlice(ctx.storage_values.items) catch {};
+    return out;
+}
+
+fn addScaledEstimate(out: *GasEstimate, step: GasEstimate, scale: u64) void {
+    out.total += step.total * scale;
+    out.dynamic_ops += @intCast(step.dynamic_ops * @as(u32, @intCast(scale)));
+    out.unknown_ops += @intCast(step.unknown_ops * @as(u32, @intCast(scale)));
+    out.memory_words = @max(out.memory_words, step.memory_words);
+    out.memory_gas = @max(out.memory_gas, step.memory_gas);
+    out.cold_storage_accesses += @intCast(step.cold_storage_accesses * @as(u32, @intCast(scale)));
+    out.warm_storage_accesses += @intCast(step.warm_storage_accesses * @as(u32, @intCast(scale)));
+    out.cold_account_accesses += @intCast(step.cold_account_accesses * @as(u32, @intCast(scale)));
+    out.warm_account_accesses += @intCast(step.warm_account_accesses * @as(u32, @intCast(scale)));
+    out.refund_estimate += step.refund_estimate * scale;
+    out.refund_capped = std.math.min(out.refund_estimate, out.total / 5);
+    out.assumed_dynamic_ops += @intCast(step.assumed_dynamic_ops * @as(u32, @intCast(scale)));
+}
+
 test "estimate basic gas" {
     const code_block = ast.Block.init(&.{
         ast.Statement.expr(ast.Expression.builtinCall("add", &.{
@@ -776,4 +905,46 @@ test "estimate const expression sizing" {
 
     const result = estimate(root);
     try std.testing.expectEqual(@as(u32, 0), result.assumed_dynamic_ops);
+}
+
+test "parse access list json" {
+    const allocator = std.testing.allocator;
+    const input =
+        \\{
+        \\  "addresses": ["0x01"],
+        \\  "storage_slots": ["0x02"],
+        \\  "storage_values": [{"slot": "0x03", "value": "0x04"}]
+        \\}
+    ;
+
+    var owned = try parseAccessListJson(allocator, input);
+    defer owned.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), owned.addresses.len);
+    try std.testing.expectEqual(@as(ast.U256, 1), owned.addresses[0]);
+    try std.testing.expectEqual(@as(ast.U256, 2), owned.storage_slots[0]);
+    try std.testing.expectEqual(@as(ast.U256, 3), owned.storage_values[0].slot);
+    try std.testing.expectEqual(@as(ast.U256, 4), owned.storage_values[0].value);
+}
+
+test "estimate loop iterations" {
+    const code_block = ast.Block.init(&.{
+        ast.Statement.forStmt(
+            ast.Block.init(&.{}),
+            ast.Expression.lit(ast.Literal.boolean(true)),
+            ast.Block.init(&.{}),
+            ast.Block.init(&.{
+                ast.Statement.expr(ast.Expression.builtinCall("mload", &.{
+                    ast.Expression.lit(ast.Literal.number(0)),
+                })),
+            }),
+        ),
+    });
+
+    const obj = ast.Object.init("Gas", code_block, &.{}, &.{});
+    const root = ast.AST.init(obj);
+
+    const opts: EstimateOptions = .{ .loop_iterations = 3 };
+    const result = estimateWithOptions(root, opts);
+    try std.testing.expectEqual(@as(u64, 2), result.assumed_loop_iterations);
 }
