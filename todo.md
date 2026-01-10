@@ -17,7 +17,7 @@
     - Gas/执行语义：补充 gas table 与语义规则
     - 测试：对齐上游向量与单元测试
 - CLI/SDK 主线（方向C）：
-  - CLI：`build` / `deploy` / `call` / `profile`
+  - CLI：`build` / `deploy` / `call` / `profile` / `--project` root_module（已完成）
   - SDK：storage / abi / event / precompile
   - ABI 导出：`abi-export` 供前端调用
   - 网络 profiles：name → RPC + chainId（deploy/call 直接用 name）

@@ -54,13 +54,16 @@ pub fn main() !void {
 fn runCompile(allocator: std.mem.Allocator, args: []const []const u8) !void {
     const opts = try parseOptions(args);
 
-    if (opts.input_file == null) {
-        std.debug.print("Error: No input file specified\n", .{});
+    if (opts.input_file == null and opts.project_dir == null) {
+        std.debug.print("Error: No input file or project specified\n", .{});
         printCompileUsageStderr();
         std.process.exit(1);
     }
 
-    const source = try readFile(allocator, opts.input_file.?);
+    const resolved = try resolveInputPath(allocator, opts.input_file, opts.project_dir);
+    defer resolved.deinit(allocator);
+
+    const source = try readFile(allocator, resolved.path);
     defer allocator.free(source);
 
     // Use new AST-based compiler with proper dispatcher
@@ -69,7 +72,7 @@ fn runCompile(allocator: std.mem.Allocator, args: []const []const u8) !void {
 
     var ast = trans.transform(source) catch |err| {
         // Print detailed error diagnostics
-        printTransformErrorsStderr(&trans, opts.input_file.?);
+        printTransformErrorsStderr(&trans, resolved.path);
         std.debug.print("Compilation failed: {}\n", .{err});
         std.process.exit(1);
     };
@@ -89,7 +92,7 @@ fn runCompile(allocator: std.mem.Allocator, args: []const []const u8) !void {
             std.process.exit(1);
         }
 
-        const result = printer.formatWithSourceMap(allocator, ast, opts.input_file.?) catch |err| {
+        const result = printer.formatWithSourceMap(allocator, ast, resolved.path) catch |err| {
             std.debug.print("Code generation error: {}\n", .{err});
             std.process.exit(1);
         };
@@ -126,8 +129,8 @@ fn runCompile(allocator: std.mem.Allocator, args: []const []const u8) !void {
 fn runBuild(allocator: std.mem.Allocator, args: []const []const u8) !void {
     const opts = try parseOptions(args);
 
-    if (opts.input_file == null) {
-        std.debug.print("Error: No input file specified\n", .{});
+    if (opts.input_file == null and opts.project_dir == null) {
+        std.debug.print("Error: No input file or project specified\n", .{});
         printBuildUsageStderr();
         std.process.exit(1);
     }
@@ -140,15 +143,17 @@ fn runBuild(allocator: std.mem.Allocator, args: []const []const u8) !void {
         std.process.exit(1);
     }
 
-    const source = try readFile(allocator, opts.input_file.?);
+    const resolved = try resolveInputPath(allocator, opts.input_file, opts.project_dir);
+    defer resolved.deinit(allocator);
+
+    const source = try readFile(allocator, resolved.path);
     defer allocator.free(source);
 
-    // Step 1: Compile Zig to Yul (AST-based)
     var trans = Transformer.init(allocator);
     defer trans.deinit();
 
     const ast = trans.transform(source) catch |err| {
-        printTransformErrorsStderr(&trans, opts.input_file.?);
+        printTransformErrorsStderr(&trans, resolved.path);
         std.debug.print("Compilation failed: {}\n", .{err});
         std.process.exit(1);
     };
@@ -159,11 +164,9 @@ fn runBuild(allocator: std.mem.Allocator, args: []const []const u8) !void {
     };
     defer allocator.free(yul_code);
 
-    // Step 2: Write Yul to temp file and compile with solc
     const bytecode = try compileSolc(allocator, yul_code, opts.optimize);
     defer allocator.free(bytecode);
 
-    // Output bytecode with 0x prefix
     if (opts.output_file) |out_path| {
         const file = try std.fs.cwd().createFile(out_path, .{});
         defer file.close();
@@ -171,7 +174,6 @@ fn runBuild(allocator: std.mem.Allocator, args: []const []const u8) !void {
         try file.writeAll(bytecode);
         std.debug.print("Built successfully: {s}\n", .{out_path});
     } else {
-        // Output with 0x prefix for deploy-ready format
         const stdout = std.fs.File.stdout();
         stdout.writeAll("0x") catch {};
         stdout.writeAll(bytecode) catch {};
@@ -182,20 +184,23 @@ fn runBuild(allocator: std.mem.Allocator, args: []const []const u8) !void {
 fn runEstimate(allocator: std.mem.Allocator, args: []const []const u8) !void {
     const opts = try parseEstimateOptions(args);
 
-    if (opts.input_file == null) {
-        std.debug.print("Error: No input file specified\n", .{});
+    if (opts.input_file == null and opts.project_dir == null) {
+        std.debug.print("Error: No input file or project specified\n", .{});
         printEstimateUsageStderr();
         std.process.exit(1);
     }
 
-    const source = try readFile(allocator, opts.input_file.?);
+    const resolved = try resolveInputPath(allocator, opts.input_file, opts.project_dir);
+    defer resolved.deinit(allocator);
+
+    const source = try readFile(allocator, resolved.path);
     defer allocator.free(source);
 
     var trans = Transformer.init(allocator);
     defer trans.deinit();
 
     const yul_ast_root = trans.transform(source) catch |err| {
-        printTransformErrorsStderr(&trans, opts.input_file.?);
+        printTransformErrorsStderr(&trans, resolved.path);
         std.debug.print("Compilation failed: {}\n", .{err});
         std.process.exit(1);
     };
@@ -231,20 +236,23 @@ fn runProfile(allocator: std.mem.Allocator, args: []const []const u8) !void {
     var opts = try parseProfileOptions(allocator, args);
     defer opts.deinit(allocator);
 
-    if (opts.input_file == null) {
-        std.debug.print("Error: No input file specified\n", .{});
+    if (opts.input_file == null and opts.project_dir == null) {
+        std.debug.print("Error: No input file or project specified\n", .{});
         printProfileUsageStderr();
         std.process.exit(1);
     }
 
-    const source = try readFile(allocator, opts.input_file.?);
+    const resolved = try resolveInputPath(allocator, opts.input_file, opts.project_dir);
+    defer resolved.deinit(allocator);
+
+    const source = try readFile(allocator, resolved.path);
     defer allocator.free(source);
 
     var trans = Transformer.init(allocator);
     defer trans.deinit();
 
     const yul_ast_root = trans.transform(source) catch |err| {
-        printTransformErrorsStderr(&trans, opts.input_file.?);
+        printTransformErrorsStderr(&trans, resolved.path);
         std.debug.print("Compilation failed: {}\n", .{err});
         std.process.exit(1);
     };
@@ -700,6 +708,7 @@ fn invalidDecodeAbi() !void {
 
 const Options = struct {
     input_file: ?[]const u8 = null,
+    project_dir: ?[]const u8 = null,
     output_file: ?[]const u8 = null,
     optimize: bool = false,
     source_map: bool = false,
@@ -708,6 +717,7 @@ const Options = struct {
 
 const EstimateCliOptions = struct {
     input_file: ?[]const u8 = null,
+    project_dir: ?[]const u8 = null,
     output_file: ?[]const u8 = null,
     profile_path: ?[]const u8 = null,
     evm_version: yul_ast.EvmVersion = .cancun,
@@ -715,6 +725,7 @@ const EstimateCliOptions = struct {
 
 const ProfileCliOptions = struct {
     input_file: ?[]const u8 = null,
+    project_dir: ?[]const u8 = null,
     output_file: ?[]const u8 = null,
     map_file: ?[]const u8 = null,
     profile_out: ?[]const u8 = null,
@@ -752,6 +763,14 @@ fn parseEstimateOptions(args: []const []const u8) !EstimateCliOptions {
                 opts.profile_path = args[i];
             } else {
                 std.debug.print("Error: --profile requires a file\n", .{});
+                std.process.exit(1);
+            }
+        } else if (std.mem.eql(u8, arg, "--project")) {
+            i += 1;
+            if (i < args.len) {
+                opts.project_dir = args[i];
+            } else {
+                std.debug.print("Error: --project requires a directory\n", .{});
                 std.process.exit(1);
             }
         } else if (std.mem.eql(u8, arg, "--evm-version")) {
@@ -815,6 +834,14 @@ fn parseProfileOptions(allocator: std.mem.Allocator, args: []const []const u8) !
                 try opts.counts_files.append(allocator, args[i]);
             } else {
                 std.debug.print("Error: --counts requires a file\n", .{});
+                std.process.exit(1);
+            }
+        } else if (std.mem.eql(u8, arg, "--project")) {
+            i += 1;
+            if (i < args.len) {
+                opts.project_dir = args[i];
+            } else {
+                std.debug.print("Error: --project requires a directory\n", .{});
                 std.process.exit(1);
             }
         } else if (std.mem.eql(u8, arg, "--rpc-url")) {
@@ -913,6 +940,14 @@ fn parseOptions(args: []const []const u8) !Options {
             }
         } else if (std.mem.eql(u8, arg, "-O") or std.mem.eql(u8, arg, "--optimize")) {
             opts.optimize = true;
+        } else if (std.mem.eql(u8, arg, "--project")) {
+            i += 1;
+            if (i < args.len) {
+                opts.project_dir = args[i];
+            } else {
+                std.debug.print("Error: --project requires a directory\n", .{});
+                std.process.exit(1);
+            }
         } else if (std.mem.eql(u8, arg, "--sourcemap") or std.mem.eql(u8, arg, "--source-map")) {
             opts.source_map = true;
         } else if (std.mem.eql(u8, arg, "--optimize-yul")) {
@@ -947,6 +982,50 @@ fn readFile(allocator: std.mem.Allocator, path: []const u8) ![:0]const u8 {
     }
 
     return contents;
+}
+
+const ResolvedInput = struct {
+    path: []const u8,
+    owned: bool,
+
+    pub fn deinit(self: ResolvedInput, allocator: std.mem.Allocator) void {
+        if (self.owned) allocator.free(self.path);
+    }
+};
+
+fn resolveInputPath(allocator: std.mem.Allocator, input_file: ?[]const u8, project_dir: ?[]const u8) !ResolvedInput {
+    if (input_file) |path| {
+        return .{ .path = path, .owned = false };
+    }
+    if (project_dir) |dir| {
+        const build_path = try std.fs.path.join(allocator, &.{ dir, "build.zig" });
+        defer allocator.free(build_path);
+        const build_contents = try readFile(allocator, build_path);
+        defer allocator.free(build_contents);
+        const root_rel = try findRootSource(allocator, build_contents);
+        if (std.fs.path.isAbsolute(root_rel)) {
+            return .{ .path = root_rel, .owned = true };
+        }
+        defer allocator.free(root_rel);
+        const joined = try std.fs.path.join(allocator, &.{ dir, root_rel });
+        return .{ .path = joined, .owned = true };
+    }
+    return error.MissingInput;
+}
+
+fn findRootSource(allocator: std.mem.Allocator, build_contents: []const u8) ![]const u8 {
+    var offset: usize = 0;
+    while (true) {
+        const idx = std.mem.indexOfPos(u8, build_contents, offset, "root_source_file") orelse break;
+        const quote_start = std.mem.indexOfPos(u8, build_contents, idx, "\"") orelse break;
+        const quote_end = std.mem.indexOfPos(u8, build_contents, quote_start + 1, "\"") orelse break;
+        const candidate = build_contents[quote_start + 1 .. quote_end];
+        if (candidate.len > 0) {
+            return try allocator.dupe(u8, candidate);
+        }
+        offset = quote_end + 1;
+    }
+    return error.RootSourceNotFound;
 }
 
 fn writeOutput(content: []const u8, output_file: ?[]const u8) !void {
@@ -1109,6 +1188,7 @@ fn printUsageStderr() void {
         \\OPTIONS:
         \\    -o, --output <file>    Write output to <file>
         \\    -O, --optimize         Enable solc optimizer (build only)
+        \\    --project <dir>       Use build.zig root module
         \\    --sourcemap           Write a .map file next to output (compile only)
         \\    --optimize-yul        Run basic Yul optimizer (compile only)
         \\    --profile <file>       Profile counts JSON (estimate only)
@@ -1143,6 +1223,7 @@ fn printCompileUsageStderr() void {
         \\
         \\OPTIONS:
         \\    -o, --output <file>    Write Yul output to <file>
+        \\    --project <dir>       Use build.zig root module
         \\    --sourcemap           Write a .map file next to output
         \\    --optimize-yul        Run basic Yul optimizer
         \\    -h, --help             Print help
@@ -1195,6 +1276,7 @@ fn printBuildUsageStderr() void {
         \\
         \\OPTIONS:
         \\    -o, --output <file>    Write bytecode to <file>
+        \\    --project <dir>       Use build.zig root module
         \\    -O, --optimize         Enable solc optimizer
         \\    -h, --help             Print help
         \\
@@ -1211,6 +1293,7 @@ fn printEstimateUsageStderr() void {
         \\
         \\OPTIONS:
         \\    -o, --output <file>    Write JSON output to <file> (default stdout)
+        \\    --project <dir>       Use build.zig root module
         \\    --profile <file>       Profile JSON with branch/switch/loop counts
         \\    --evm-version <name>   EVM version (homestead..prague)
         \\    -h, --help             Print help
@@ -1224,6 +1307,7 @@ fn printProfileUsageStderr() void {
         \\
         \\OPTIONS:
         \\    -o, --output <file>      Write instrumented Yul to <file>
+        \\    --project <dir>         Use build.zig root module
         \\    --map <file>            Write profile map JSON to <file>
         \\    --counts <file>         Raw counter JSON (repeatable)
         \\    --profile-out <file>    Write aggregated profile.json
@@ -1263,6 +1347,7 @@ fn printUsageTo(writer: anytype) !void {
         \\OPTIONS:
         \\    -o, --output <file>    Write output to <file>
         \\    -O, --optimize         Enable solc optimizer (build only)
+        \\    --project <dir>       Use build.zig root module
         \\    --sourcemap           Write a .map file next to output (compile only)
         \\    --optimize-yul        Run basic Yul optimizer (compile only)
         \\    --profile <file>       Profile counts JSON (estimate only)
