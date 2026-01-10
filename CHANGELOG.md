@@ -15,6 +15,19 @@
 #### Test Results
 - Unit tests: `zig build test --summary all`
 
+### Session 2026-01-10-008
+
+**Date**: 2026-01-10
+**Goal**: Align ABI JSON output with tooling
+
+#### Completed Work
+1. Added stateMutability to ABI JSON output
+2. Emitted tuple components for struct inputs/outputs
+3. Normalized tuple types and omitted null components
+
+#### Test Results
+- Unit tests: `zig build test --summary all`
+
 ### Session 2026-01-10-007
 
 **Date**: 2026-01-10

@@ -542,19 +542,22 @@ fn resolveCallData(allocator: std.mem.Allocator, arg: []const u8) ![]u8 {
     return try allocator.dupe(u8, arg);
 }
 
+const AbiItem = struct {
+    type: []const u8,
+    name: []const u8,
+    inputs: []const Param,
+    outputs: []const Param,
+    stateMutability: []const u8,
+
+    const Param = struct {
+        name: []const u8,
+        type: []const u8,
+        components: ?[]const Param = null,
+    };
+};
+
 fn buildAbiJson(allocator: std.mem.Allocator, trans: *Transformer, source_path: []const u8) ![]u8 {
     _ = source_path;
-    const AbiItem = struct {
-        type: []const u8,
-        name: []const u8,
-        inputs: []const Param,
-        outputs: []const Param,
-
-        const Param = struct {
-            name: []const u8,
-            type: []const u8,
-        };
-    };
 
     var items = std.ArrayList(AbiItem).empty;
     defer items.deinit(allocator);
@@ -566,18 +569,17 @@ fn buildAbiJson(allocator: std.mem.Allocator, trans: *Transformer, source_path: 
         defer inputs.deinit(allocator);
         for (fi.params, 0..) |param, idx| {
             const abi_type = fi.param_types[idx];
-            try inputs.append(allocator, .{ .name = param, .type = abi_type });
+            const struct_name = fi.param_struct_names[idx];
+            try inputs.append(allocator, try buildAbiParam(allocator, trans, param, abi_type, if (struct_name.len > 0) struct_name else null));
         }
 
         var outputs = std.ArrayList(AbiItem.Param).empty;
         defer outputs.deinit(allocator);
         if (fi.has_return) {
             if (fi.return_abi) |ret| {
-                try outputs.append(allocator, .{ .name = "", .type = ret });
-            } else if (fi.return_struct_name) |name| {
-                const abi_type = try std.fmt.allocPrint(allocator, "tuple({s})", .{name});
-                defer allocator.free(abi_type);
-                try outputs.append(allocator, .{ .name = "", .type = abi_type });
+                try outputs.append(allocator, try buildAbiParam(allocator, trans, "", ret, null));
+            } else if (fi.return_struct_name) |struct_name| {
+                try outputs.append(allocator, try buildAbiParam(allocator, trans, "", "tuple", struct_name));
             }
         }
 
@@ -586,15 +588,78 @@ fn buildAbiJson(allocator: std.mem.Allocator, trans: *Transformer, source_path: 
             .name = fi.name,
             .inputs = try inputs.toOwnedSlice(allocator),
             .outputs = try outputs.toOwnedSlice(allocator),
+            .stateMutability = "nonpayable",
         });
     }
 
     const json_out = try jsonStringifyAlloc(allocator, items.items);
     for (items.items) |item| {
+        freeAbiParams(allocator, item.inputs);
+        freeAbiParams(allocator, item.outputs);
         allocator.free(item.inputs);
         allocator.free(item.outputs);
     }
     return json_out;
+}
+
+fn buildAbiParam(
+    allocator: std.mem.Allocator,
+    trans: *Transformer,
+    name: []const u8,
+    abi_type: []const u8,
+    struct_name_opt: ?[]const u8,
+) !AbiItem.Param {
+    if (struct_name_opt) |struct_name| {
+        const components = try buildStructComponents(allocator, trans, struct_name);
+        const tuple_type = if (std.mem.endsWith(u8, abi_type, "[]")) "tuple[]" else "tuple";
+        return .{ .name = name, .type = tuple_type, .components = components };
+    }
+    return .{ .name = name, .type = abi_type };
+}
+
+fn buildStructComponents(allocator: std.mem.Allocator, trans: *Transformer, struct_name: []const u8) ![]AbiItem.Param {
+    const fields = trans.struct_defs.get(struct_name) orelse return error.InvalidAbi;
+
+    var params = std.ArrayList(AbiItem.Param).empty;
+    defer params.deinit(allocator);
+
+    for (fields) |field| {
+        if (trans.struct_defs.get(field.type_name)) |nested| {
+            _ = nested;
+            const nested_components = try buildStructComponents(allocator, trans, field.type_name);
+            try params.append(allocator, .{ .name = field.name, .type = "tuple", .components = nested_components });
+        } else {
+            const field_abi = mapZigTypeToAbi(field.type_name);
+            try params.append(allocator, .{ .name = field.name, .type = field_abi });
+        }
+    }
+
+    return try params.toOwnedSlice(allocator);
+}
+
+fn freeAbiParams(allocator: std.mem.Allocator, params: []const AbiItem.Param) void {
+    for (params) |param| {
+        if (param.components) |components| {
+            freeAbiParams(allocator, components);
+            allocator.free(components);
+        }
+    }
+}
+
+fn mapZigTypeToAbi(zig_type: []const u8) []const u8 {
+    if (std.mem.eql(u8, zig_type, "u256")) return "uint256";
+    if (std.mem.eql(u8, zig_type, "u128")) return "uint128";
+    if (std.mem.eql(u8, zig_type, "u64")) return "uint64";
+    if (std.mem.eql(u8, zig_type, "u32")) return "uint32";
+    if (std.mem.eql(u8, zig_type, "u8")) return "uint8";
+    if (std.mem.eql(u8, zig_type, "bool")) return "bool";
+    if (std.mem.eql(u8, zig_type, "Address") or std.mem.eql(u8, zig_type, "evm.Address")) return "address";
+    if (std.mem.eql(u8, zig_type, "[20]u8")) return "address";
+    if (std.mem.eql(u8, zig_type, "[32]u8")) return "bytes32";
+    if (std.mem.eql(u8, zig_type, "[]u8")) return "bytes";
+    if (std.mem.eql(u8, zig_type, "[]const u8")) return "string";
+    if (std.mem.startsWith(u8, zig_type, "[]")) return "uint256[]";
+    return "uint256";
 }
 
 fn jsonStringifyAlloc(allocator: std.mem.Allocator, value: anytype) ![]u8 {
@@ -603,7 +668,7 @@ fn jsonStringifyAlloc(allocator: std.mem.Allocator, value: anytype) ![]u8 {
 
     var write_stream: std.json.Stringify = .{
         .writer = &out.writer,
-        .options = .{},
+        .options = .{ .emit_null_optional_fields = false },
     };
     try write_stream.write(value);
     return try allocator.dupe(u8, out.written());
