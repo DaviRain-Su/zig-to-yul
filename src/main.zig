@@ -116,6 +116,12 @@ fn runCompile(allocator: std.mem.Allocator, args: []const []const u8) !void {
         return;
     }
 
+    if (opts.abi_output) |abi_path| {
+        const abi_json = try buildAbiJson(allocator, &trans, resolved.path);
+        defer allocator.free(abi_json);
+        try writeOutput(abi_json, abi_path);
+    }
+
     const yul_code = printer.format(allocator, ast) catch |err| {
         std.debug.print("Code generation error: {}\n", .{err});
         std.process.exit(1);
@@ -230,6 +236,12 @@ fn runEstimate(allocator: std.mem.Allocator, args: []const []const u8) !void {
         stdout.writeAll(json_out) catch {};
         stdout.writeAll("\n") catch {};
     }
+
+    if (opts.abi_output) |abi_path| {
+        const abi_json = try buildAbiJson(allocator, &trans, resolved.path);
+        defer allocator.free(abi_json);
+        try writeOutput(abi_json, abi_path);
+    }
 }
 
 fn runProfile(allocator: std.mem.Allocator, args: []const []const u8) !void {
@@ -257,6 +269,12 @@ fn runProfile(allocator: std.mem.Allocator, args: []const []const u8) !void {
         std.process.exit(1);
     };
 
+    if (opts.abi_output) |abi_path| {
+        const abi_json = try buildAbiJson(allocator, &trans, resolved.path);
+        defer allocator.free(abi_json);
+        try writeOutput(abi_json, abi_path);
+    }
+
     const should_return_counts = opts.return_counts or opts.rpc_url != null;
     var instrumenter = profile_instrumenter.Instrumenter.initWithOptions(allocator, should_return_counts);
     defer instrumenter.deinit();
@@ -282,6 +300,12 @@ fn runProfile(allocator: std.mem.Allocator, args: []const []const u8) !void {
         const map_json = try profile.profileMapToJson(allocator, instrumented.map);
         defer allocator.free(map_json);
         try writeOutput(map_json, path);
+    }
+
+    if (opts.abi_output) |abi_path| {
+        const abi_json = try buildAbiJson(allocator, &trans, resolved.path);
+        defer allocator.free(abi_json);
+        try writeOutput(abi_json, abi_path);
     }
 
     if (opts.counts_files.items.len > 0) {
@@ -581,6 +605,61 @@ fn resolveCallData(allocator: std.mem.Allocator, arg: []const u8) ![]u8 {
     return try allocator.dupe(u8, arg);
 }
 
+fn buildAbiJson(allocator: std.mem.Allocator, trans: *Transformer, source_path: []const u8) ![]u8 {
+    _ = source_path;
+    const AbiItem = struct {
+        type: []const u8,
+        name: []const u8,
+        inputs: []const Param,
+        outputs: []const Param,
+
+        const Param = struct {
+            name: []const u8,
+            type: []const u8,
+        };
+    };
+
+    var items = std.ArrayList(AbiItem).empty;
+    defer items.deinit(allocator);
+
+    for (trans.function_infos.items) |fi| {
+        if (!fi.is_public) continue;
+
+        var inputs = std.ArrayList(AbiItem.Param).empty;
+        defer inputs.deinit(allocator);
+        for (fi.params, 0..) |param, idx| {
+            const abi_type = fi.param_types[idx];
+            try inputs.append(allocator, .{ .name = param, .type = abi_type });
+        }
+
+        var outputs = std.ArrayList(AbiItem.Param).empty;
+        defer outputs.deinit(allocator);
+        if (fi.has_return) {
+            if (fi.return_abi) |ret| {
+                try outputs.append(allocator, .{ .name = "", .type = ret });
+            } else if (fi.return_struct_name) |name| {
+                const abi_type = try std.fmt.allocPrint(allocator, "tuple({s})", .{name});
+                defer allocator.free(abi_type);
+                try outputs.append(allocator, .{ .name = "", .type = abi_type });
+            }
+        }
+
+        try items.append(allocator, .{
+            .type = "function",
+            .name = fi.name,
+            .inputs = try inputs.toOwnedSlice(allocator),
+            .outputs = try outputs.toOwnedSlice(allocator),
+        });
+    }
+
+    const json_out = try std.json.stringifyAlloc(allocator, items.items, .{});
+    for (items.items) |item| {
+        allocator.free(item.inputs);
+        allocator.free(item.outputs);
+    }
+    return json_out;
+}
+
 fn rpcPickFromAccount(allocator: std.mem.Allocator, url: []const u8) ![]u8 {
     const parsed = try rpcCallValue(allocator, url, "eth_accounts", "[]");
     defer parsed.deinit();
@@ -710,6 +789,7 @@ const Options = struct {
     input_file: ?[]const u8 = null,
     project_dir: ?[]const u8 = null,
     output_file: ?[]const u8 = null,
+    abi_output: ?[]const u8 = null,
     optimize: bool = false,
     source_map: bool = false,
     optimize_yul: bool = false,
@@ -719,6 +799,7 @@ const EstimateCliOptions = struct {
     input_file: ?[]const u8 = null,
     project_dir: ?[]const u8 = null,
     output_file: ?[]const u8 = null,
+    abi_output: ?[]const u8 = null,
     profile_path: ?[]const u8 = null,
     evm_version: yul_ast.EvmVersion = .cancun,
 };
@@ -730,6 +811,7 @@ const ProfileCliOptions = struct {
     map_file: ?[]const u8 = null,
     profile_out: ?[]const u8 = null,
     counts_files: std.ArrayList([]const u8) = .empty,
+    abi_output: ?[]const u8 = null,
     rpc_url: ?[]const u8 = null,
     call_data: ?[]const u8 = null,
     contract_addr: ?[]const u8 = null,
@@ -771,6 +853,14 @@ fn parseEstimateOptions(args: []const []const u8) !EstimateCliOptions {
                 opts.project_dir = args[i];
             } else {
                 std.debug.print("Error: --project requires a directory\n", .{});
+                std.process.exit(1);
+            }
+        } else if (std.mem.eql(u8, arg, "--abi")) {
+            i += 1;
+            if (i < args.len) {
+                opts.abi_output = args[i];
+            } else {
+                std.debug.print("Error: --abi requires a file\n", .{});
                 std.process.exit(1);
             }
         } else if (std.mem.eql(u8, arg, "--evm-version")) {
@@ -826,6 +916,14 @@ fn parseProfileOptions(allocator: std.mem.Allocator, args: []const []const u8) !
                 opts.profile_out = args[i];
             } else {
                 std.debug.print("Error: --profile-out requires a file\n", .{});
+                std.process.exit(1);
+            }
+        } else if (std.mem.eql(u8, arg, "--abi")) {
+            i += 1;
+            if (i < args.len) {
+                opts.abi_output = args[i];
+            } else {
+                std.debug.print("Error: --abi requires a file\n", .{});
                 std.process.exit(1);
             }
         } else if (std.mem.eql(u8, arg, "--counts")) {
@@ -946,6 +1044,14 @@ fn parseOptions(args: []const []const u8) !Options {
                 opts.project_dir = args[i];
             } else {
                 std.debug.print("Error: --project requires a directory\n", .{});
+                std.process.exit(1);
+            }
+        } else if (std.mem.eql(u8, arg, "--abi")) {
+            i += 1;
+            if (i < args.len) {
+                opts.abi_output = args[i];
+            } else {
+                std.debug.print("Error: --abi requires a file\n", .{});
                 std.process.exit(1);
             }
         } else if (std.mem.eql(u8, arg, "--sourcemap") or std.mem.eql(u8, arg, "--source-map")) {
@@ -1189,6 +1295,7 @@ fn printUsageStderr() void {
         \\    -o, --output <file>    Write output to <file>
         \\    -O, --optimize         Enable solc optimizer (build only)
         \\    --project <dir>       Use build.zig root module
+        \\    --abi <file>          Write ABI JSON
         \\    --sourcemap           Write a .map file next to output (compile only)
         \\    --optimize-yul        Run basic Yul optimizer (compile only)
         \\    --profile <file>       Profile counts JSON (estimate only)
@@ -1224,6 +1331,7 @@ fn printCompileUsageStderr() void {
         \\OPTIONS:
         \\    -o, --output <file>    Write Yul output to <file>
         \\    --project <dir>       Use build.zig root module
+        \\    --abi <file>          Write ABI JSON
         \\    --sourcemap           Write a .map file next to output
         \\    --optimize-yul        Run basic Yul optimizer
         \\    -h, --help             Print help
@@ -1294,6 +1402,7 @@ fn printEstimateUsageStderr() void {
         \\OPTIONS:
         \\    -o, --output <file>    Write JSON output to <file> (default stdout)
         \\    --project <dir>       Use build.zig root module
+        \\    --abi <file>          Write ABI JSON
         \\    --profile <file>       Profile JSON with branch/switch/loop counts
         \\    --evm-version <name>   EVM version (homestead..prague)
         \\    -h, --help             Print help
@@ -1308,6 +1417,7 @@ fn printProfileUsageStderr() void {
         \\OPTIONS:
         \\    -o, --output <file>      Write instrumented Yul to <file>
         \\    --project <dir>         Use build.zig root module
+        \\    --abi <file>            Write ABI JSON
         \\    --map <file>            Write profile map JSON to <file>
         \\    --counts <file>         Raw counter JSON (repeatable)
         \\    --profile-out <file>    Write aggregated profile.json
@@ -1348,6 +1458,7 @@ fn printUsageTo(writer: anytype) !void {
         \\    -o, --output <file>    Write output to <file>
         \\    -O, --optimize         Enable solc optimizer (build only)
         \\    --project <dir>       Use build.zig root module
+        \\    --abi <file>          Write ABI JSON
         \\    --sourcemap           Write a .map file next to output (compile only)
         \\    --optimize-yul        Run basic Yul optimizer (compile only)
         \\    --profile <file>       Profile counts JSON (estimate only)

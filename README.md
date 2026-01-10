@@ -47,8 +47,11 @@ zig-to-yul compile contract.zig
 # Output to file
 zig-to-yul compile contract.zig -o contract.yul
 
+# Emit ABI JSON
+zig-to-yul compile contract.zig -o contract.yul --abi out/Contract.abi.json
+
 # Use project build.zig root module
-zig-to-yul compile --project . -o contract.yul
+zig-to-yul compile --project . -o contract.yul --abi out/Contract.abi.json
 
 # Emit source map (Solidity-compatible entries: start:length:source)
 zig-to-yul compile contract.zig -o contract.yul --sourcemap
@@ -113,6 +116,7 @@ zig-to-yul profile contract.zig --rpc-url http://127.0.0.1:8545 \
 | `-o, --output <file>` | Write output to file |
 | `-O, --optimize` | Enable solc optimizer (build only) |
 | `--project <dir>` | Use build.zig root module |
+| `--abi <file>` | Write ABI JSON (compile/estimate/profile) |
 | `--profile <file>` | Profile counts JSON (estimate only) |
 | `--evm-version <name>` | EVM version (estimate only) |
 | `--rpc-url <url>` | Collect profile via JSON-RPC (profile only) |

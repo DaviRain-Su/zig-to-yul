@@ -65,6 +65,7 @@ pub const Transformer = struct {
         return_abi: ?[]const u8,
         return_struct_len: usize,
         return_is_dynamic: bool,
+        return_struct_name: ?[]const u8,
 
         /// Calculate function selector using keccak256
         /// Selector = first 4 bytes of keccak256("funcName(type1,type2,...)")
@@ -208,7 +209,9 @@ pub const Transformer = struct {
             }
             self.allocator.free(fi.param_struct_names);
             if (fi.return_abi) |ret| self.allocator.free(ret);
+            if (fi.return_struct_name) |name| self.allocator.free(name);
         }
+
         self.function_infos.deinit(self.allocator);
 
         // Free all temporary strings
@@ -633,6 +636,7 @@ pub const Transformer = struct {
                     .return_abi = return_abi,
                     .return_struct_len = return_struct_len,
                     .return_is_dynamic = return_is_dynamic,
+                    .return_struct_name = return_struct_name,
                 });
             }
 
