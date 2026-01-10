@@ -118,6 +118,28 @@ pub const EstimateOptions = struct {
     max_refund_divisor: u64 = 5,
     base_access_list_costs: bool = true,
     enable_refund_clamp: bool = true,
+    refund_sstore_clear: u64 = 4800,
+    refund_selfdestruct: u64 = 0,
+    branch_mode: BranchMode = .worst_case,
+    branch_weight_num: u64 = 1,
+    branch_weight_den: u64 = 2,
+    switch_mode: SwitchMode = .worst_case,
+};
+
+pub const BranchMode = enum {
+    worst_case,
+    sum,
+    average,
+    assume_true,
+    assume_false,
+};
+
+pub const SwitchMode = enum {
+    worst_case,
+    sum,
+    average,
+    assume_first,
+    assume_none,
 };
 
 pub fn estimateWithOptions(root: ast.AST, opts: EstimateOptions) GasEstimate {
@@ -213,7 +235,7 @@ fn visitStatement(stmt: ast.Statement, out: *GasEstimate, ctx: *EstimatorContext
             var ctx_clone = cloneContext(ctx, arena.allocator());
             var body_estimate = GasEstimate{};
             visitBlock(s.body, &body_estimate, &ctx_clone);
-            addEstimate(out, body_estimate);
+            addBranchEstimate(out, body_estimate, ctx.opts);
         },
         .switch_statement => |s| {
             visitExpression(s.expression, out, ctx);
@@ -236,7 +258,10 @@ fn visitStatement(stmt: ast.Statement, out: *GasEstimate, ctx: *EstimatorContext
             defer arena.deinit();
             var ctx_clone = cloneContext(ctx, arena.allocator());
             var worst = GasEstimate{};
+            var total = GasEstimate{};
             var first = true;
+            var first_case = GasEstimate{};
+            var count: u64 = 0;
             for (s.cases) |case_| {
                 var case_est = GasEstimate{};
                 visitBlock(case_.body, &case_est, &ctx_clone);
@@ -244,8 +269,19 @@ fn visitStatement(stmt: ast.Statement, out: *GasEstimate, ctx: *EstimatorContext
                     worst = case_est;
                     first = false;
                 }
+                if (count == 0) {
+                    first_case = case_est;
+                }
+                addEstimate(&total, case_est);
+                count += 1;
             }
-            addEstimate(out, worst);
+            switch (ctx.opts.switch_mode) {
+                .worst_case => addEstimate(out, worst),
+                .sum => addEstimate(out, total),
+                .average => if (count > 0) addScaledEstimateFraction(out, total, 1, count) else {},
+                .assume_first => if (count > 0) addEstimate(out, first_case) else {},
+                .assume_none => {},
+            }
         },
         .for_loop => |s| {
             visitBlock(s.pre, out, ctx);
@@ -473,6 +509,18 @@ fn applyDynamicCosts(name: []const u8, args: []const ast.Expression, out: *GasEs
         applyAssumedMemoryGrowth(out, ctx.opts.assume_words);
         out.assumed_dynamic_ops += 1;
         return false;
+    }
+
+    if (std.mem.eql(u8, name, "selfdestruct")) {
+        if (args.len >= 1) {
+            if (constEvalU256(args[0])) |addr| {
+                applyAccountAccess(addr, out, ctx);
+            }
+        }
+        if (ctx.opts.refund_selfdestruct > 0) {
+            out.refund_estimate += ctx.opts.refund_selfdestruct;
+        }
+        return true;
     }
 
     if (std.mem.startsWith(u8, name, "log") and args.len >= 2) {
@@ -836,16 +884,18 @@ fn applySstoreCostKnown(slot: ast.U256, original: ast.U256, prev: ast.U256, new_
             out.total += 20000;
         } else if (original != 0 and new_value == 0) {
             out.total += 5000;
-            out.refund_estimate += 4800;
+            out.refund_estimate += ctx.opts.refund_sstore_clear;
         } else {
             out.total += 5000;
         }
     } else {
         out.total += 5000;
         if (original != 0 and prev == 0 and new_value != 0) {
-            if (out.refund_estimate >= 4800) out.refund_estimate -= 4800;
+            if (out.refund_estimate >= ctx.opts.refund_sstore_clear) {
+                out.refund_estimate -= ctx.opts.refund_sstore_clear;
+            }
         } else if (original != 0 and new_value == 0) {
-            out.refund_estimate += 4800;
+            out.refund_estimate += ctx.opts.refund_sstore_clear;
         }
     }
 
@@ -935,6 +985,34 @@ fn addEstimate(out: *GasEstimate, step: GasEstimate) void {
     out.assumed_dynamic_ops += step.assumed_dynamic_ops;
     if (step.max_stack_depth > out.max_stack_depth) {
         out.max_stack_depth = step.max_stack_depth;
+    }
+}
+
+fn addScaledEstimateFraction(out: *GasEstimate, step: GasEstimate, num: u64, den: u64) void {
+    if (den == 0) return;
+    out.total += step.total * num / den;
+    out.dynamic_ops += @intCast(@as(u64, step.dynamic_ops) * num / den);
+    out.unknown_ops += @intCast(@as(u64, step.unknown_ops) * num / den);
+    out.memory_words = @max(out.memory_words, step.memory_words);
+    out.memory_gas = @max(out.memory_gas, step.memory_gas);
+    out.cold_storage_accesses += @intCast(@as(u64, step.cold_storage_accesses) * num / den);
+    out.warm_storage_accesses += @intCast(@as(u64, step.warm_storage_accesses) * num / den);
+    out.cold_account_accesses += @intCast(@as(u64, step.cold_account_accesses) * num / den);
+    out.warm_account_accesses += @intCast(@as(u64, step.warm_account_accesses) * num / den);
+    out.refund_estimate += step.refund_estimate * num / den;
+    out.refund_capped = std.math.min(out.refund_estimate, if (out.total > 0) out.total / 5 else 0);
+    out.assumed_dynamic_ops += @intCast(@as(u64, step.assumed_dynamic_ops) * num / den);
+    if (step.max_stack_depth > out.max_stack_depth) {
+        out.max_stack_depth = step.max_stack_depth;
+    }
+}
+
+fn addBranchEstimate(out: *GasEstimate, body: GasEstimate, opts: EstimateOptions) void {
+    switch (opts.branch_mode) {
+        .worst_case, .sum => addEstimate(out, body),
+        .average => addScaledEstimateFraction(out, body, opts.branch_weight_num, opts.branch_weight_den),
+        .assume_true => addEstimate(out, body),
+        .assume_false => {},
     }
 }
 
@@ -1032,6 +1110,21 @@ test "estimate warm access list" {
     try std.testing.expectEqual(@as(u32, 1), result.warm_storage_accesses);
     try std.testing.expectEqual(@as(u32, 0), result.cold_account_accesses);
     try std.testing.expectEqual(@as(u32, 1), result.warm_account_accesses);
+}
+
+test "estimate selfdestruct refund option" {
+    const code_block = ast.Block.init(&.{
+        ast.Statement.expr(ast.Expression.builtinCall("selfdestruct", &.{
+            ast.Expression.lit(ast.Literal.number(0)),
+        })),
+    });
+
+    const obj = ast.Object.init("Gas", code_block, &.{}, &.{});
+    const root = ast.AST.init(obj);
+
+    const opts: EstimateOptions = .{ .refund_selfdestruct = 24000 };
+    const result = estimateWithOptions(root, opts);
+    try std.testing.expectEqual(@as(u64, 24000), result.refund_estimate);
 }
 
 test "estimate assumed dynamic sizing" {
