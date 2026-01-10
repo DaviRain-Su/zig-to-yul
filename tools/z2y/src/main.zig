@@ -41,9 +41,9 @@ const Template = struct {
         \\        "--project",
         \\        ".",
         \\        "--abi",
-        \\        "contracts/Contract.abi.json",
+        \\        "out/Contract.abi.json",
         \\        "-o",
-        \\        "contracts/Contract.yul",
+        \\        "out/Contract.yul",
         \\        "src/Contract.zig",
         \\    });
         \\
@@ -51,9 +51,9 @@ const Template = struct {
         \\        "solc",
         \\        "--strict-assembly",
         \\        "--bin",
-        \\        "contracts/Contract.yul",
+        \\        "out/Contract.yul",
         \\        "-o",
-        \\        "contracts",
+        \\        "out",
         \\    });
         \\    solc_step.step.dependOn(&compile_step.step);
         \\
@@ -99,23 +99,26 @@ const Template = struct {
         \\const evm = @import("evm");
         \\
         \\pub const Contract = struct {
-        \\    value: u256,
+        \\    value: evm.U256,
         \\
-        \\    pub fn set(self: *Contract, next: u256) void {
+        \\    pub fn set(self: *Contract, next: evm.U256) void {
         \\        self.value = next;
         \\    }
         \\
-        \\    pub fn get(self: *Contract) u256 {
+        \\    pub fn get(self: *Contract) evm.U256 {
         \\        return self.value;
         \\    }
         \\
-        \\    pub fn add(self: *Contract, delta: u256) u256 {
+        \\    pub fn add(self: *Contract, delta: evm.U256) evm.U256 {
         \\        self.value = self.value + delta;
         \\        return self.value;
         \\    }
         \\};
     ;
 };
+
+const default_rpc_url = "http://localhost:8545";
+const default_anvil_private_key = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -159,6 +162,45 @@ pub fn main() !void {
         return;
     }
 
+    if (std.mem.eql(u8, command, "build-abi")) {
+        if (args.len > 2) {
+            try printUsage();
+            return;
+        }
+        try buildAbi(allocator);
+        return;
+    }
+
+    if (std.mem.eql(u8, command, "test")) {
+        if (args.len > 2) {
+            try printUsage();
+            return;
+        }
+        try runLocalTest(allocator);
+        return;
+    }
+
+    if (std.mem.eql(u8, command, "deploy")) {
+        var rpc_url: []const u8 = default_rpc_url;
+        var i: usize = 2;
+        while (i < args.len) : (i += 1) {
+            const arg = args[i];
+            if (std.mem.eql(u8, arg, "--rpc-url")) {
+                i += 1;
+                if (i >= args.len) {
+                    try printUsage();
+                    return;
+                }
+                rpc_url = args[i];
+                continue;
+            }
+            try printUsage();
+            return;
+        }
+        try deployRemote(allocator, rpc_url);
+        return;
+    }
+
     try printUsage();
 }
 
@@ -170,9 +212,13 @@ fn printUsage() !void {
         "Usage:\n" ++
             "  z2y init [dir]\n" ++
             "  z2y install\n" ++
-            "  z2y info\n",
+            "  z2y info\n" ++
+            "  z2y build-abi\n" ++
+            "  z2y test\n" ++
+            "  z2y deploy [--rpc-url <url>]\n",
         .{},
     );
+
     try stdout.flush();
 }
 
@@ -186,7 +232,7 @@ fn printInstallInstructions() !void {
     try stdout.print("- Zig 0.15.x\n", .{});
     try stdout.print("- solc (Solidity compiler)\n", .{});
     try stdout.print("- zig-to-yul binary in PATH\n", .{});
-    try stdout.print("- Foundry (anvil/forge)\n\n", .{});
+    try stdout.print("- Foundry (anvil/forge/cast)\n\n", .{});
 
     switch (builtin.os.tag) {
         .macos => {
@@ -220,6 +266,7 @@ fn printToolInfo(allocator: std.mem.Allocator) !void {
     try printToolStatus(allocator, stdout, "solc");
     try printToolStatus(allocator, stdout, "anvil");
     try printToolStatus(allocator, stdout, "forge");
+    try printToolStatus(allocator, stdout, "cast");
     try stdout.flush();
 }
 
@@ -273,6 +320,7 @@ fn checkExecutableCandidate(allocator: std.mem.Allocator, dir: []const u8, name:
 }
 
 fn initProject(allocator: std.mem.Allocator, dir_path: []const u8) !void {
+    _ = allocator;
     var cwd = std.fs.cwd();
     if (dir_path.len > 0 and !std.mem.eql(u8, dir_path, ".")) {
         try cwd.makePath(dir_path);
@@ -282,34 +330,228 @@ fn initProject(allocator: std.mem.Allocator, dir_path: []const u8) !void {
     defer dir.close();
 
     try dir.makePath("src");
-    try dir.makePath("contracts");
+    try dir.makePath("out");
 
     try dir.writeFile(.{ .sub_path = "build.zig", .data = Template.build_zig });
     try dir.writeFile(.{ .sub_path = "build.zig.zon", .data = Template.build_zig_zon });
     try dir.writeFile(.{ .sub_path = "src/Contract.zig", .data = Template.contract_zig });
     try dir.writeFile(.{ .sub_path = "src/evm.zig", .data = Template.evm_zig });
-
-    try addDependency(allocator, dir);
 }
 
-fn addDependency(allocator: std.mem.Allocator, dir: std.fs.Dir) !void {
+fn buildAbi(allocator: std.mem.Allocator) !void {
+    try ensureOutDir();
+
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(allocator);
 
-    try argv.append(allocator, "zig");
-    try argv.append(allocator, "fetch");
-    try argv.append(allocator, "--save");
-    try argv.append(allocator, "git@github.com:DaviRain-Su/zig-to-yul.git");
+    try argv.append(allocator, "zig-to-yul");
+    try argv.append(allocator, "compile");
+    try argv.append(allocator, "--project");
+    try argv.append(allocator, ".");
+    try argv.append(allocator, "--abi");
+    try argv.append(allocator, "out/Contract.abi.json");
+    try argv.append(allocator, "-o");
+    try argv.append(allocator, "out/Contract.yul");
+    try argv.append(allocator, "src/Contract.zig");
 
-    var child = std.process.Child.init(argv.items, allocator);
-    child.cwd_dir = dir;
+    const output = try runCommandCapture(allocator, argv.items);
+    defer allocator.free(output);
+}
+
+fn buildBytecode(allocator: std.mem.Allocator) ![]u8 {
+    try ensureOutDir();
+
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(allocator);
+
+    try argv.append(allocator, "zig-to-yul");
+    try argv.append(allocator, "build");
+    try argv.append(allocator, "--project");
+    try argv.append(allocator, ".");
+    try argv.append(allocator, "-o");
+    try argv.append(allocator, "out/Contract.bin");
+    try argv.append(allocator, "src/Contract.zig");
+
+    const output = try runCommandCapture(allocator, argv.items);
+    defer allocator.free(output);
+    return try readTrimmedFile(allocator, "out/Contract.bin");
+}
+
+fn runLocalTest(allocator: std.mem.Allocator) !void {
+    var anvil_argv: std.ArrayList([]const u8) = .empty;
+    defer anvil_argv.deinit(allocator);
+
+    try anvil_argv.append(allocator, "anvil");
+
+    var anvil_child = std.process.Child.init(anvil_argv.items, allocator);
+    anvil_child.stderr_behavior = .Ignore;
+    anvil_child.stdout_behavior = .Ignore;
+
+    try anvil_child.spawn();
+    defer {
+        _ = anvil_child.kill() catch {};
+    }
+
+    std.Thread.sleep(500 * std.time.ns_per_ms);
+
+    const bytecode = try buildBytecode(allocator);
+    defer allocator.free(bytecode);
+
+    const address = try deployWithCast(allocator, default_rpc_url, default_anvil_private_key, bytecode);
+    defer allocator.free(address);
+
+    const send_output = try castSend(allocator, default_rpc_url, default_anvil_private_key, address, "set(uint256)", &.{"7"});
+    defer allocator.free(send_output);
+    const result = try castCall(allocator, default_rpc_url, address, "get()(uint256)");
+    defer allocator.free(result);
+    const trimmed = std.mem.trim(u8, result, " \n\r\t");
+
+    var stdout_buffer: [1024]u8 = undefined;
+    var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
+    const stdout: *std.Io.Writer = &stdout_writer.interface;
+    try stdout.print("Deployed: {s}\n", .{address});
+    try stdout.print("get() => {s}\n", .{trimmed});
+    try stdout.flush();
+}
+
+fn deployRemote(allocator: std.mem.Allocator, rpc_url: []const u8) !void {
+    const private_key = try getEnvRequired(allocator, "PRIVATE_KEY");
+    defer allocator.free(private_key);
+
+    const bytecode = try buildBytecode(allocator);
+    defer allocator.free(bytecode);
+
+    const address = try deployWithCast(allocator, rpc_url, private_key, bytecode);
+    defer allocator.free(address);
+
+    try writeCallScript(allocator, rpc_url, address);
+
+    var stdout_buffer: [1024]u8 = undefined;
+    var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
+    const stdout: *std.Io.Writer = &stdout_writer.interface;
+    try stdout.print("Contract deployed: {s}\n", .{address});
+    try stdout.print("Script written: out/call_contract.sh\n", .{});
+    try stdout.flush();
+}
+
+fn deployWithCast(
+    allocator: std.mem.Allocator,
+    rpc_url: []const u8,
+    private_key: []const u8,
+    bytecode: []const u8,
+) ![]u8 {
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(allocator);
+
+    try argv.append(allocator, "cast");
+    try argv.append(allocator, "send");
+    try argv.append(allocator, "--create");
+    try argv.append(allocator, bytecode);
+    try argv.append(allocator, "--rpc-url");
+    try argv.append(allocator, rpc_url);
+    try argv.append(allocator, "--private-key");
+    try argv.append(allocator, private_key);
+    try argv.append(allocator, "--json");
+
+    const output = try runCommandCapture(allocator, argv.items);
+    defer allocator.free(output);
+
+    const address = extractContractAddress(output) orelse {
+        std.debug.print("cast send output:\n{s}\n", .{output});
+        return error.DeployFailed;
+    };
+    return try allocator.dupe(u8, address);
+}
+
+fn castSend(
+    allocator: std.mem.Allocator,
+    rpc_url: []const u8,
+    private_key: []const u8,
+    address: []const u8,
+    signature: []const u8,
+    args: []const []const u8,
+) ![]u8 {
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(allocator);
+
+    try argv.append(allocator, "cast");
+    try argv.append(allocator, "send");
+    try argv.append(allocator, "--rpc-url");
+    try argv.append(allocator, rpc_url);
+    try argv.append(allocator, "--private-key");
+    try argv.append(allocator, private_key);
+    try argv.append(allocator, address);
+    try argv.append(allocator, signature);
+    for (args) |arg| {
+        try argv.append(allocator, arg);
+    }
+
+    return try runCommandCapture(allocator, argv.items);
+}
+
+fn castCall(
+    allocator: std.mem.Allocator,
+    rpc_url: []const u8,
+    address: []const u8,
+    signature: []const u8,
+) ![]u8 {
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(allocator);
+
+    try argv.append(allocator, "cast");
+    try argv.append(allocator, "call");
+    try argv.append(allocator, "--rpc-url");
+    try argv.append(allocator, rpc_url);
+    try argv.append(allocator, address);
+    try argv.append(allocator, signature);
+
+    return try runCommandCapture(allocator, argv.items);
+}
+
+fn writeCallScript(allocator: std.mem.Allocator, rpc_url: []const u8, address: []const u8) !void {
+    try ensureOutDir();
+
+    const script = try std.fmt.allocPrint(
+        allocator,
+        "#!/usr/bin/env bash\n" ++
+            "set -euo pipefail\n\n" ++
+            "RPC_URL=\"{s}\"\n" ++
+            "PRIVATE_KEY=\"${{PRIVATE_KEY:?set PRIVATE_KEY}}\"\n" ++
+            "ADDR=\"{s}\"\n\n" ++
+            "cast send --rpc-url \"$RPC_URL\" --private-key \"$PRIVATE_KEY\" \"$ADDR\" \"set(uint256)\" 7\n" ++
+            "cast call --rpc-url \"$RPC_URL\" \"$ADDR\" \"get()(uint256)\"\n",
+        .{ rpc_url, address },
+    );
+    defer allocator.free(script);
+
+    const file = try std.fs.cwd().createFile("out/call_contract.sh", .{ .mode = 0o755 });
+    defer file.close();
+    try file.writeAll(script);
+}
+
+fn ensureOutDir() !void {
+    try std.fs.cwd().makePath("out");
+}
+
+fn getEnvRequired(allocator: std.mem.Allocator, key: []const u8) ![]u8 {
+    return std.process.getEnvVarOwned(allocator, key) catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => {
+            std.debug.print("Missing required environment variable: {s}\n", .{key});
+            return error.MissingEnv;
+        },
+        else => return err,
+    };
+}
+
+fn runCommandCapture(allocator: std.mem.Allocator, argv: []const []const u8) ![]u8 {
+    var child = std.process.Child.init(argv, allocator);
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Pipe;
 
     try child.spawn();
 
-    var stdout_buf: [32 * 1024]u8 = undefined;
-    var stderr_buf: [32 * 1024]u8 = undefined;
+    var stdout_buf: [64 * 1024]u8 = undefined;
+    var stderr_buf: [64 * 1024]u8 = undefined;
     const stdout_len = child.stdout.?.readAll(&stdout_buf) catch 0;
     const stderr_len = child.stderr.?.readAll(&stderr_buf) catch 0;
 
@@ -317,7 +559,28 @@ fn addDependency(allocator: std.mem.Allocator, dir: std.fs.Dir) !void {
     if (term.Exited != 0) {
         const stderr = stderr_buf[0..stderr_len];
         const stdout = stdout_buf[0..stdout_len];
-        std.debug.print("zig fetch --save failed\n{s}\n{s}\n", .{ stdout, stderr });
-        return error.DependencyFetchFailed;
+        std.debug.print("Command failed: {s}\n{s}\n{s}\n", .{ argv[0], stdout, stderr });
+        return error.CommandFailed;
     }
+
+    return try allocator.dupe(u8, stdout_buf[0..stdout_len]);
+}
+
+fn readTrimmedFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    const file = try std.fs.cwd().openFile(path, .{});
+    defer file.close();
+
+    const data = try file.readToEndAlloc(allocator, 1024 * 1024);
+    defer allocator.free(data);
+
+    const trimmed = std.mem.trim(u8, data, " \n\r\t");
+    return try allocator.dupe(u8, trimmed);
+}
+
+fn extractContractAddress(output: []const u8) ?[]const u8 {
+    const key = "\"contractAddress\":\"";
+    const start = std.mem.indexOf(u8, output, key) orelse return null;
+    const addr_start = start + key.len;
+    const addr_end = std.mem.indexOfPos(u8, output, addr_start, "\"") orelse return null;
+    return output[addr_start..addr_end];
 }

@@ -87,13 +87,22 @@ zig-to-yul build -O contract.zig -o contract.bin
 
 ```bash
 # Build the z2y tool
-zig build -C tools/z2y
+cd tools/z2y && zig build
 
 # Install prerequisites (prints commands)
 ./tools/z2y/zig-out/bin/z2y install
 
-# Check tool availability (zig, zig-to-yul, solc, anvil, forge)
+# Check tool availability (zig, zig-to-yul, solc, anvil, forge, cast)
 ./tools/z2y/zig-out/bin/z2y info
+
+# Generate ABI + Yul into out/
+./tools/z2y/zig-out/bin/z2y build-abi
+
+# Run local test (starts anvil, deploys, calls set/get)
+./tools/z2y/zig-out/bin/z2y test
+
+# Deploy to remote RPC (reads PRIVATE_KEY env)
+./tools/z2y/zig-out/bin/z2y deploy --rpc-url https://rpc.example
 
 # Initialize a new contract project (current directory)
 ./tools/z2y/zig-out/bin/z2y init .
