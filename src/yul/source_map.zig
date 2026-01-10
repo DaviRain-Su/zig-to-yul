@@ -70,7 +70,7 @@ pub const Builder = struct {
         for (self.entries.items, 0..) |entry, idx| {
             if (idx > 0) try mapping_buf.append(allocator, ';');
             const len: u32 = if (entry.end >= entry.start) entry.end - entry.start else 0;
-            try mapping_buf.writer(allocator).print("{d}:{d}:{d}", .{ entry.start, len, entry.source });
+            try mapping_buf.writer(allocator).print("{d}:{d}:{d}::", .{ entry.start, len, entry.source });
         }
         const mappings = try mapping_buf.toOwnedSlice(allocator);
 

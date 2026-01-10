@@ -434,5 +434,5 @@ test "print with source map" {
 
     try std.testing.expect(result.map.sources.len == 1);
     try std.testing.expect(std.mem.eql(u8, result.map.sources[0], "input.zig"));
-    try std.testing.expectEqualStrings("5:5:0;12:3:0", result.map.mappings);
+    try std.testing.expectEqualStrings("5:5:0::;12:3:0::", result.map.mappings);
 }

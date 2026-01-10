@@ -28,6 +28,18 @@
 #### Test Results
 - Unit tests: `zig build test --summary all`
 
+### Session 2026-01-10-009
+
+**Date**: 2026-01-10
+**Goal**: Align SourceMap format with Solidity
+
+#### Completed Work
+1. Emit Solidity-compatible sourcemap fields (start:length:file:jump:modifierDepth)
+2. Updated sourcemap test expectations
+
+#### Test Results
+- Unit tests: `zig build test --summary all`
+
 ### Session 2026-01-10-007
 
 **Date**: 2026-01-10

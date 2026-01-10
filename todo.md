@@ -17,11 +17,11 @@
   - JSON-RPC 兼容（已覆盖 Hardhat/Alchemy/Infura/QuickNode 基础差异）
   - ABI JSON 输出（已补全 stateMutability/tuple components）
   - keystore/私钥签名兼容
-  - SourceMap 格式对齐 solidity 生态
+  - SourceMap 格式对齐 solidity 生态（已完成）
   - 总体实现规划（生态）：
     - RPC：覆盖常见 provider 兼容性差异
     - ABI：输出 schema 与字段排序一致性（已完成）
-    - SourceMap：对齐 Solidity map 格式与工具链
+    - SourceMap：对齐 Solidity map 格式与工具链（已完成）
 
 如果你想继续：建议优先推进 5.1 EOF Prague → SDK/生态。
 
