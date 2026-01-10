@@ -8,7 +8,7 @@
     - Gas/执行语义：补充 gas table 与语义规则
     - 测试：对齐上游向量与单元测试
 - SDK 主线（方向C）：
-  - 交易：支持 EIP-1559/Legacy 参数与签名
+  - 交易：支持 EIP-1559/Legacy 参数与签名（已完成 Legacy）
   - SDK：提供高层调用封装与类型映射
   - 测试：本地 Anvil/Foundry 集成测试
 - 优化研究：对比 https://github.com/Vectorized/solady

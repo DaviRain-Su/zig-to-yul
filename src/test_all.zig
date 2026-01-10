@@ -23,6 +23,7 @@ const evm_types = @import("evm/types.zig");
 const evm_abi = @import("evm/abi.zig");
 const evm_precompile = @import("evm/precompile.zig");
 const evm_rpc = @import("evm/rpc.zig");
+const evm_tx = @import("evm/tx.zig");
 
 const builtin = @import("builtin");
 
@@ -46,6 +47,7 @@ test {
     std.testing.refAllDecls(evm_abi);
     std.testing.refAllDecls(evm_precompile);
     std.testing.refAllDecls(evm_rpc);
+    std.testing.refAllDecls(evm_tx);
 
     if (builtin.os.tag == .freestanding or builtin.cpu.arch == .wasm32) {
         const evm_event_decode = @import("evm/event_decode.zig");

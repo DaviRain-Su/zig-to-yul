@@ -29,6 +29,27 @@ pub fn ethCall(allocator: std.mem.Allocator, rpc_url: []const u8, to: []const u8
     return try allocator.dupe(u8, result_value.string);
 }
 
+pub fn ethSendRawTransaction(allocator: std.mem.Allocator, rpc_url: []const u8, raw_tx: []const u8) ![]u8 {
+    const payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_sendRawTransaction\",\"params\":[\"{s}\"]}}",
+        .{raw_tx},
+    );
+    defer allocator.free(payload);
+
+    const response = try rpcRequest(allocator, rpc_url, payload);
+    defer allocator.free(response);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+    defer parsed.deinit();
+
+    if (parsed.value != .object) return RpcError.InvalidResponse;
+    const result_value = parsed.value.object.get("result") orelse return RpcError.MissingResult;
+    if (result_value != .string) return RpcError.InvalidResponse;
+
+    return try allocator.dupe(u8, result_value.string);
+}
+
 fn rpcRequest(allocator: std.mem.Allocator, rpc_url: []const u8, payload: []const u8) ![]u8 {
     var client: std.http.Client = .{ .allocator = allocator };
     defer client.deinit();

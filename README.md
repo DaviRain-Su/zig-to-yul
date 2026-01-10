@@ -99,6 +99,7 @@ Available namespaces:
 - `evm.precompile`
 - `evm.rpc`
 - `evm.contract`
+- `evm.tx` (legacy tx signing)
 - `evm.builtins_stub` (IDE-only)
 
 ### Scaffold Project (z2y)
@@ -171,6 +172,22 @@ const result_hex = try evm.contract.call(
     "balanceOf(address)",
     &.{ .{ .address = some_address } },
 );
+```
+
+SDK example (sign legacy transaction):
+
+```zig
+const evm = @import("zig_to_yul").evm;
+
+const raw = try evm.tx.signLegacy(allocator, .{
+    .nonce = 0,
+    .gas_price = 1_000_000_000,
+    .gas_limit = 21000,
+    .to = 0x1234,
+    .value = 0,
+    .data = &.{},
+    .chain_id = 1,
+}, "0x<private_key>");
 ```
 
 On-chain wrapper example (generated):

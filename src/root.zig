@@ -12,6 +12,7 @@ pub const evm = struct {
     pub const precompile = @import("evm/precompile.zig");
     pub const rpc = @import("evm/rpc.zig");
     pub const contract = @import("evm/contract.zig");
+    pub const tx = @import("evm/tx.zig");
 
     pub const event = struct {
         pub const encode = event_encode;
