@@ -20,6 +20,7 @@ pub const GasEstimate = struct {
     cold_account_accesses: u32 = 0,
     warm_account_accesses: u32 = 0,
     refund_estimate: u64 = 0,
+    refund_capped: u64 = 0,
     assumed_dynamic_ops: u32 = 0,
 };
 
@@ -53,6 +54,7 @@ pub fn estimateWithOptions(root: ast.AST, opts: EstimateOptions) GasEstimate {
 
     var out = GasEstimate{};
     visitObject(root.root, &out, &ctx);
+    out.refund_capped = std.math.min(out.refund_estimate, out.total / 5);
     return out;
 }
 
@@ -228,12 +230,12 @@ fn gasForBuiltin(name: []const u8) ?GasCost {
 
 fn applyDynamicCosts(name: []const u8, args: []const ast.Expression, out: *GasEstimate, ctx: *EstimatorContext) bool {
     if (std.mem.eql(u8, name, "keccak256") and args.len == 2) {
-        const maybe_size = literalU256(args[1]);
+        const maybe_size = constEvalU256(args[1]);
         if (maybe_size) |size| {
             if (bytesToU64(size)) |size_bytes| {
                 const words = wordsForSize(size_bytes);
                 out.total += 6 * words;
-                if (literalU256(args[0])) |offset| {
+                if (constEvalU256(args[0])) |offset| {
                     _ = applyMemoryExpansion(out, offset, size_bytes);
                 }
                 return true;
@@ -248,7 +250,7 @@ fn applyDynamicCosts(name: []const u8, args: []const ast.Expression, out: *GasEs
     }
 
     if (std.mem.eql(u8, name, "exp") and args.len == 2) {
-        if (literalU256(args[1])) |exp| {
+        if (constEvalU256(args[1])) |exp| {
             const bytes = byteLen(exp);
             out.total += 50 * bytes;
             return true;
@@ -259,11 +261,11 @@ fn applyDynamicCosts(name: []const u8, args: []const ast.Expression, out: *GasEs
     }
 
     if (isOneOf(name, &.{ "calldatacopy", "codecopy", "returndatacopy", "datacopy", "mcopy" }) and args.len == 3) {
-        if (literalU256(args[2])) |len| {
+        if (constEvalU256(args[2])) |len| {
             if (bytesToU64(len)) |size_bytes| {
                 const words = wordsForSize(size_bytes);
                 out.total += 3 * words;
-                if (literalU256(args[0])) |offset| {
+                if (constEvalU256(args[0])) |offset| {
                     _ = applyMemoryExpansion(out, offset, size_bytes);
                 }
                 return true;
@@ -276,14 +278,14 @@ fn applyDynamicCosts(name: []const u8, args: []const ast.Expression, out: *GasEs
     }
 
     if (std.mem.eql(u8, name, "extcodecopy") and args.len == 4) {
-        if (literalU256(args[0])) |addr| {
+        if (constEvalU256(args[0])) |addr| {
             applyAccountAccess(addr, out, ctx);
         }
-        if (literalU256(args[3])) |len| {
+        if (constEvalU256(args[3])) |len| {
             if (bytesToU64(len)) |size_bytes| {
                 const words = wordsForSize(size_bytes);
                 out.total += 3 * words;
-                if (literalU256(args[1])) |offset| {
+                if (constEvalU256(args[1])) |offset| {
                     _ = applyMemoryExpansion(out, offset, size_bytes);
                 }
                 return true;
@@ -296,7 +298,7 @@ fn applyDynamicCosts(name: []const u8, args: []const ast.Expression, out: *GasEs
     }
 
     if (isOneOf(name, &.{ "mload", "mstore" }) and args.len >= 1) {
-        if (literalU256(args[0])) |offset| {
+        if (constEvalU256(args[0])) |offset| {
             _ = applyMemoryExpansion(out, offset, 32);
             return true;
         }
@@ -306,7 +308,7 @@ fn applyDynamicCosts(name: []const u8, args: []const ast.Expression, out: *GasEs
     }
 
     if (std.mem.eql(u8, name, "mstore8") and args.len >= 1) {
-        if (literalU256(args[0])) |offset| {
+        if (constEvalU256(args[0])) |offset| {
             _ = applyMemoryExpansion(out, offset, 1);
             return true;
         }
@@ -317,8 +319,8 @@ fn applyDynamicCosts(name: []const u8, args: []const ast.Expression, out: *GasEs
 
     if (std.mem.eql(u8, name, "return") or std.mem.eql(u8, name, "revert")) {
         if (args.len == 2) {
-            if (literalU256(args[0])) |offset| {
-                if (literalU256(args[1])) |len| {
+            if (constEvalU256(args[0])) |offset| {
+                if (constEvalU256(args[1])) |len| {
                     if (bytesToU64(len)) |size_bytes| {
                         _ = applyMemoryExpansion(out, offset, size_bytes);
                         return true;
@@ -332,8 +334,8 @@ fn applyDynamicCosts(name: []const u8, args: []const ast.Expression, out: *GasEs
     }
 
     if (std.mem.startsWith(u8, name, "log") and args.len >= 2) {
-        if (literalU256(args[0])) |offset| {
-            if (literalU256(args[1])) |len| {
+        if (constEvalU256(args[0])) |offset| {
+            if (constEvalU256(args[1])) |len| {
                 if (bytesToU64(len)) |size_bytes| {
                     out.total += 8 * size_bytes;
                     _ = applyMemoryExpansion(out, offset, size_bytes);
@@ -357,9 +359,9 @@ fn applyDynamicCosts(name: []const u8, args: []const ast.Expression, out: *GasEs
     }
 
     if (std.mem.eql(u8, name, "sstore") and args.len >= 2) {
-        if (literalU256(args[0])) |slot| {
+        if (constEvalU256(args[0])) |slot| {
             applyStorageAccess(slot, out, ctx);
-            if (literalU256(args[1])) |value| {
+            if (constEvalU256(args[1])) |value| {
                 applySstoreCost(slot, value, out, ctx);
                 return true;
             }
@@ -370,7 +372,7 @@ fn applyDynamicCosts(name: []const u8, args: []const ast.Expression, out: *GasEs
     }
 
     if (isOneOf(name, &.{ "balance", "extcodesize", "extcodehash" }) and args.len >= 1) {
-        if (literalU256(args[0])) |addr| {
+        if (constEvalU256(args[0])) |addr| {
             applyAccountAccess(addr, out, ctx);
             return true;
         }
@@ -378,27 +380,27 @@ fn applyDynamicCosts(name: []const u8, args: []const ast.Expression, out: *GasEs
     }
 
     if ((std.mem.eql(u8, name, "call") or std.mem.eql(u8, name, "callcode")) and args.len >= 7) {
-        if (literalU256(args[1])) |addr| {
+        if (constEvalU256(args[1])) |addr| {
             applyAccountAccess(addr, out, ctx);
         }
-        if (literalU256(args[2])) |value| {
+        if (constEvalU256(args[2])) |value| {
             if (value != 0) out.total += 9000;
-            if (value != 0 and literalU256(args[1]) != null) {
-                const addr = literalU256(args[1]).?;
+            if (value != 0 and constEvalU256(args[1]) != null) {
+                const addr = constEvalU256(args[1]).?;
                 if (isNewAccount(addr, ctx)) {
                     out.total += 25000;
                 }
             }
         }
-        if (literalU256(args[3])) |in_offset| {
-            if (literalU256(args[4])) |in_len| {
+        if (constEvalU256(args[3])) |in_offset| {
+            if (constEvalU256(args[4])) |in_len| {
                 if (bytesToU64(in_len)) |size_bytes| {
                     _ = applyMemoryExpansion(out, in_offset, size_bytes);
                 }
             }
         }
-        if (literalU256(args[5])) |out_offset| {
-            if (literalU256(args[6])) |out_len| {
+        if (constEvalU256(args[5])) |out_offset| {
+            if (constEvalU256(args[6])) |out_len| {
                 if (bytesToU64(out_len)) |size_bytes| {
                     _ = applyMemoryExpansion(out, out_offset, size_bytes);
                 }
@@ -408,18 +410,18 @@ fn applyDynamicCosts(name: []const u8, args: []const ast.Expression, out: *GasEs
     }
 
     if ((std.mem.eql(u8, name, "delegatecall") or std.mem.eql(u8, name, "staticcall")) and args.len >= 6) {
-        if (literalU256(args[1])) |addr| {
+        if (constEvalU256(args[1])) |addr| {
             applyAccountAccess(addr, out, ctx);
         }
-        if (literalU256(args[2])) |in_offset| {
-            if (literalU256(args[3])) |in_len| {
+        if (constEvalU256(args[2])) |in_offset| {
+            if (constEvalU256(args[3])) |in_len| {
                 if (bytesToU64(in_len)) |size_bytes| {
                     _ = applyMemoryExpansion(out, in_offset, size_bytes);
                 }
             }
         }
-        if (literalU256(args[4])) |out_offset| {
-            if (literalU256(args[5])) |out_len| {
+        if (constEvalU256(args[4])) |out_offset| {
+            if (constEvalU256(args[5])) |out_len| {
                 if (bytesToU64(out_len)) |size_bytes| {
                     _ = applyMemoryExpansion(out, out_offset, size_bytes);
                 }
@@ -431,8 +433,8 @@ fn applyDynamicCosts(name: []const u8, args: []const ast.Expression, out: *GasEs
     if ((std.mem.eql(u8, name, "create") and args.len == 3) or (std.mem.eql(u8, name, "create2") and args.len == 4)) {
         const offset_arg = args[1];
         const size_arg = args[2];
-        if (literalU256(offset_arg)) |offset| {
-            if (literalU256(size_arg)) |len| {
+        if (constEvalU256(offset_arg)) |offset| {
+            if (constEvalU256(size_arg)) |len| {
                 if (bytesToU64(len)) |size_bytes| {
                     _ = applyMemoryExpansion(out, offset, size_bytes);
                     return false;
@@ -459,6 +461,45 @@ fn literalU256(expr: ast.Expression) ?ast.U256 {
             .hex_number => return expr.literal.value.hex_number,
             .boolean => return if (expr.literal.value.boolean) 1 else 0,
             else => return null,
+        }
+    }
+    return null;
+}
+
+fn constEvalU256(expr: ast.Expression) ?ast.U256 {
+    if (literalU256(expr)) |v| return v;
+    if (expr == .builtin_call) {
+        const call = expr.builtin_call;
+        if (call.arguments.len == 1 and std.mem.eql(u8, call.builtin_name.name, "iszero")) {
+            if (constEvalU256(call.arguments[0])) |v| return if (v == 0) 1 else 0;
+        }
+        if (call.arguments.len == 1 and std.mem.eql(u8, call.builtin_name.name, "not")) {
+            if (constEvalU256(call.arguments[0])) |v| return ~v;
+        }
+        if (call.arguments.len == 2) {
+            const a = constEvalU256(call.arguments[0]) orelse return null;
+            const b = constEvalU256(call.arguments[1]) orelse return null;
+            if (std.mem.eql(u8, call.builtin_name.name, "add")) return a +% b;
+            if (std.mem.eql(u8, call.builtin_name.name, "sub")) return a -% b;
+            if (std.mem.eql(u8, call.builtin_name.name, "mul")) return a *% b;
+            if (std.mem.eql(u8, call.builtin_name.name, "div")) return if (b == 0) 0 else a / b;
+            if (std.mem.eql(u8, call.builtin_name.name, "mod")) return if (b == 0) 0 else a % b;
+            if (std.mem.eql(u8, call.builtin_name.name, "and")) return a & b;
+            if (std.mem.eql(u8, call.builtin_name.name, "or")) return a | b;
+            if (std.mem.eql(u8, call.builtin_name.name, "xor")) return a ^ b;
+            if (std.mem.eql(u8, call.builtin_name.name, "lt")) return if (a < b) 1 else 0;
+            if (std.mem.eql(u8, call.builtin_name.name, "gt")) return if (a > b) 1 else 0;
+            if (std.mem.eql(u8, call.builtin_name.name, "eq")) return if (a == b) 1 else 0;
+            if (std.mem.eql(u8, call.builtin_name.name, "shl")) {
+                if (b >= 256) return 0;
+                const sh: u8 = @intCast(b);
+                return a << sh;
+            }
+            if (std.mem.eql(u8, call.builtin_name.name, "shr")) {
+                if (b >= 256) return 0;
+                const sh: u8 = @intCast(b);
+                return a >> sh;
+            }
         }
     }
     return null;
@@ -717,4 +758,22 @@ test "estimate assumed dynamic sizing" {
 
     const result = estimate(root);
     try std.testing.expectEqual(@as(u32, 1), result.assumed_dynamic_ops);
+}
+
+test "estimate const expression sizing" {
+    const code_block = ast.Block.init(&.{
+        ast.Statement.expr(ast.Expression.builtinCall("keccak256", &.{
+            ast.Expression.lit(ast.Literal.number(0)),
+            ast.Expression.builtinCall("add", &.{
+                ast.Expression.lit(ast.Literal.number(32)),
+                ast.Expression.lit(ast.Literal.number(32)),
+            }),
+        })),
+    });
+
+    const obj = ast.Object.init("Gas", code_block, &.{}, &.{});
+    const root = ast.AST.init(obj);
+
+    const result = estimate(root);
+    try std.testing.expectEqual(@as(u32, 0), result.assumed_dynamic_ops);
 }
