@@ -35,31 +35,21 @@ const Template = struct {
         \\    });
         \\    _ = contract_mod;
         \\
-        \\    const compile_step = b.addSystemCommand(&.{
+        \\    const build_step = b.addSystemCommand(&.{
         \\        "zig_to_yul",
-        \\        "compile",
+        \\        "build",
         \\        "--project",
         \\        ".",
         \\        "--abi",
         \\        "out/Contract.abi.json",
         \\        "-o",
-        \\        "out/Contract.yul",
+        \\        "out/Contract.bin",
         \\        "src/Contract.zig",
         \\    });
         \\
-        \\    const solc_step = b.addSystemCommand(&.{
-        \\        "solc",
-        \\        "--strict-assembly",
-        \\        "--bin",
-        \\        "out/Contract.yul",
-        \\        "-o",
-        \\        "out",
-        \\    });
-        \\    solc_step.step.dependOn(&compile_step.step);
-        \\
         \\    const contract_step = b.step("contract", "Build contract bytecode");
-        \\    contract_step.dependOn(&solc_step.step);
-        \\    b.getInstallStep().dependOn(&solc_step.step);
+        \\    contract_step.dependOn(&build_step.step);
+        \\    b.getInstallStep().dependOn(&build_step.step);
         \\}
     ;
 
