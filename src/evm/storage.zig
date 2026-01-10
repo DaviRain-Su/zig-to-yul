@@ -38,34 +38,12 @@ pub const StorageLayout = struct {
         base_slot: u256,
         stmts: *std.ArrayList(ast.Statement),
     ) !ast.Expression {
-        // mstore(0x00, key)
-        const mstore_key = ast.Expression{ .function_call = .{
-            .function_name = "mstore",
-            .arguments = try self.allocator.dupe(ast.Expression, &.{
-                ast.Expression.lit(ast.Literal.number(0x00)),
-                key_expr,
-            }),
-        } };
-        try stmts.append(self.allocator, ast.Statement.expr(mstore_key));
-
-        // mstore(0x20, baseSlot)
-        const mstore_base = ast.Expression{ .function_call = .{
-            .function_name = "mstore",
-            .arguments = try self.allocator.dupe(ast.Expression, &.{
-                ast.Expression.lit(ast.Literal.number(0x20)),
-                ast.Expression.lit(ast.Literal.number(base_slot)),
-            }),
-        } };
-        try stmts.append(self.allocator, ast.Statement.expr(mstore_base));
-
-        // keccak256(0x00, 0x40)
-        return ast.Expression{ .function_call = .{
-            .function_name = "keccak256",
-            .arguments = try self.allocator.dupe(ast.Expression, &.{
-                ast.Expression.lit(ast.Literal.number(0x00)),
-                ast.Expression.lit(ast.Literal.number(0x40)),
-            }),
-        } };
+        return try MemoryOptimizer.genScratchKeccak(
+            self.allocator,
+            key_expr,
+            ast.Expression.lit(ast.Literal.number(base_slot)),
+            stmts,
+        );
     }
 
     /// 生成嵌套 mapping slot 计算
@@ -80,34 +58,12 @@ pub const StorageLayout = struct {
 
         for (keys) |key| {
             // 对于每一层，计算 keccak256(key, current_slot)
-            // mstore(0x00, key)
-            const mstore_key = ast.Expression{ .function_call = .{
-                .function_name = "mstore",
-                .arguments = try self.allocator.dupe(ast.Expression, &.{
-                    ast.Expression.lit(ast.Literal.number(0x00)),
-                    key,
-                }),
-            } };
-            try stmts.append(self.allocator, ast.Statement.expr(mstore_key));
-
-            // mstore(0x20, current_slot)
-            const mstore_slot = ast.Expression{ .function_call = .{
-                .function_name = "mstore",
-                .arguments = try self.allocator.dupe(ast.Expression, &.{
-                    ast.Expression.lit(ast.Literal.number(0x20)),
-                    current_slot,
-                }),
-            } };
-            try stmts.append(self.allocator, ast.Statement.expr(mstore_slot));
-
-            // current_slot = keccak256(0x00, 0x40)
-            current_slot = ast.Expression{ .function_call = .{
-                .function_name = "keccak256",
-                .arguments = try self.allocator.dupe(ast.Expression, &.{
-                    ast.Expression.lit(ast.Literal.number(0x00)),
-                    ast.Expression.lit(ast.Literal.number(0x40)),
-                }),
-            } };
+            current_slot = try MemoryOptimizer.genScratchKeccak(
+                self.allocator,
+                key,
+                current_slot,
+                stmts,
+            );
         }
 
         return current_slot;

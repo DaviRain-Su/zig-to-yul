@@ -2640,6 +2640,24 @@ pub const Transformer = struct {
         var call_args: std.ArrayList(ast.Expression) = .empty;
         defer call_args.deinit(self.allocator);
 
+        var needs_free_ptr = false;
+        for (fi.params, 0..) |_, i| {
+            if (fi.param_struct_lens[i] > 0 or isDynamicAbiType(fi.param_types[i])) {
+                needs_free_ptr = true;
+                break;
+            }
+        }
+
+        var free_name_opt: ?[]const u8 = null;
+        if (needs_free_ptr) {
+            const free_name = try self.makeTemp("free");
+            const free_expr = try self.builder.builtinCall("mload", &.{
+                ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0x40))),
+            });
+            try case_stmts.append(self.allocator, try self.builder.varDecl(&.{free_name}, free_expr));
+            free_name_opt = free_name;
+        }
+
         var head_offset: ast.U256 = 4;
         for (fi.params, 0..) |param_name, i| {
             const offset: evm_types.U256 = head_offset;
@@ -2650,7 +2668,7 @@ pub const Transformer = struct {
                 const struct_name = fi.param_struct_names[i];
                 if (self.struct_defs.get(struct_name)) |fields| {
                     const head_expr = ast.Expression.lit(ast.Literal.number(offset));
-                    const struct_ptr = try self.decodeStructFromHead(fields, head_expr, &case_stmts);
+                    const struct_ptr = try self.decodeStructFromHead(fields, head_expr, &case_stmts, free_name_opt);
                     const var_decl = try self.builder.varDecl(&.{param_name}, struct_ptr);
                     try case_stmts.append(self.allocator, var_decl);
                     try call_args.append(self.allocator, ast.Expression.id(param_name));
@@ -2682,7 +2700,7 @@ pub const Transformer = struct {
                 try case_stmts.append(self.allocator, try self.builder.varDecl(&.{head_name}, head_expr));
 
                 if (fields_opt) |fields| {
-                    const struct_ptr = try self.decodeStructFromHead(fields, ast.Expression.id(head_name), &case_stmts);
+                    const struct_ptr = try self.decodeStructFromHead(fields, ast.Expression.id(head_name), &case_stmts, free_name_opt);
                     const var_decl = try self.builder.varDecl(&.{param_name}, struct_ptr);
                     try case_stmts.append(self.allocator, var_decl);
                     try call_args.append(self.allocator, ast.Expression.id(param_name));
@@ -2717,9 +2735,12 @@ pub const Transformer = struct {
                 const len_expr = try self.builder.builtinCall("calldataload", &.{ast.Expression.id(head_name)});
                 try case_stmts.append(self.allocator, try self.builder.varDecl(&.{len_name}, len_expr));
 
-                const mem_expr = try self.builder.builtinCall("mload", &.{
-                    ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0x40))),
-                });
+                const mem_expr = if (free_name_opt) |free_name|
+                    ast.Expression.id(free_name)
+                else
+                    try self.builder.builtinCall("mload", &.{
+                        ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0x40))),
+                    });
                 try case_stmts.append(self.allocator, try self.builder.varDecl(&.{mem_name}, mem_expr));
 
                 const store_len = try self.builder.builtinCall("mstore", &.{
@@ -2965,21 +2986,31 @@ pub const Transformer = struct {
         fields: []const StructFieldDef,
         head_expr: ast.Expression,
         stmts: *std.ArrayList(ast.Statement),
+        free_name_opt: ?[]const u8,
     ) TransformProcessError!ast.Expression {
         const mem_name = try self.makeTemp("struct_mem");
-        const mem_expr = try self.builder.builtinCall("mload", &.{
-            ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0x40))),
-        });
+        const mem_expr = if (free_name_opt) |free_name|
+            ast.Expression.id(free_name)
+        else
+            try self.builder.builtinCall("mload", &.{
+                ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0x40))),
+            });
         try stmts.append(self.allocator, try self.builder.varDecl(&.{mem_name}, mem_expr));
 
+        const new_free = try self.builder.builtinCall("add", &.{
+            ast.Expression.id(mem_name),
+            ast.Expression.lit(ast.Literal.number(@as(ast.U256, @intCast(fields.len * 32)))),
+        });
         const reserve = try self.builder.builtinCall("mstore", &.{
             ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0x40))),
-            try self.builder.builtinCall("add", &.{
-                ast.Expression.id(mem_name),
-                ast.Expression.lit(ast.Literal.number(@as(ast.U256, @intCast(fields.len * 32)))),
-            }),
+            new_free,
         });
         try stmts.append(self.allocator, ast.Statement.expr(reserve));
+
+        if (free_name_opt) |free_name| {
+            const update_free = try self.builder.assign(&.{free_name}, new_free);
+            try stmts.append(self.allocator, update_free);
+        }
 
         var head_offset: ast.U256 = 0;
         for (fields, 0..) |field, idx| {
@@ -3002,11 +3033,11 @@ pub const Transformer = struct {
                         head_expr,
                         ast.Expression.id(rel_name),
                     });
-                    const nested_ptr = try self.decodeStructFromHead(nested, nested_head, stmts);
+                    const nested_ptr = try self.decodeStructFromHead(nested, nested_head, stmts, free_name_opt);
                     const store_ptr = try self.builder.builtinCall("mstore", &.{ field_slot, nested_ptr });
                     try stmts.append(self.allocator, ast.Statement.expr(store_ptr));
                 } else {
-                    const nested_ptr = try self.decodeStructFromHead(nested, head_slot, stmts);
+                    const nested_ptr = try self.decodeStructFromHead(nested, head_slot, stmts, free_name_opt);
                     const store_ptr = try self.builder.builtinCall("mstore", &.{ field_slot, nested_ptr });
                     try stmts.append(self.allocator, ast.Statement.expr(store_ptr));
                 }

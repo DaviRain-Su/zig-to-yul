@@ -59,7 +59,23 @@ pub const Optimizer = struct {
             }
         }
 
-        var out = ast.Block.init(try self.builder.dupeStatements(stmts.items));
+        var combined = std.ArrayList(ast.Statement).empty;
+        defer combined.deinit(self.allocator);
+
+        var i: usize = 0;
+        while (i < stmts.items.len) {
+            if (i + 1 < stmts.items.len) {
+                if (try self.mergeIfElseAssignment(stmts.items[i], stmts.items[i + 1])) |merged| {
+                    try combined.append(self.allocator, merged);
+                    i += 2;
+                    continue;
+                }
+            }
+            try combined.append(self.allocator, stmts.items[i]);
+            i += 1;
+        }
+
+        var out = ast.Block.init(try self.builder.dupeStatements(combined.items));
         out.location = block.location;
         return out;
     }
@@ -169,6 +185,65 @@ pub const Optimizer = struct {
                 return ast.Expression{ .builtin_call = out };
             },
         }
+    }
+
+    const IfAssignment = struct {
+        cond: ast.Expression,
+        var_name: []const u8,
+        value: ast.Expression,
+    };
+
+    fn mergeIfElseAssignment(self: *Optimizer, first: ast.Statement, second: ast.Statement) Error!?ast.Statement {
+        const first_info = assignmentFromIf(first) orelse return null;
+        const second_info = assignmentFromIf(second) orelse return null;
+
+        if (!std.mem.eql(u8, first_info.var_name, second_info.var_name)) return null;
+        if (first_info.cond != .identifier and first_info.cond != .literal) return null;
+
+        const else_cond = isIsZeroCall(second_info.cond, first_info.cond) orelse return null;
+
+        if (literalU256(second_info.value)) |val| {
+            if (val == 0) {
+                const value = try self.builder.builtinCall("mul", &.{ first_info.cond, first_info.value });
+                return try self.builder.assign(&.{first_info.var_name}, value);
+            }
+        }
+
+        if (literalU256(first_info.value)) |val| {
+            if (val == 0) {
+                const value = try self.builder.builtinCall("mul", &.{ else_cond, second_info.value });
+                return try self.builder.assign(&.{first_info.var_name}, value);
+            }
+        }
+
+        const then_value = try self.builder.builtinCall("mul", &.{ first_info.cond, first_info.value });
+        const else_value = try self.builder.builtinCall("mul", &.{ else_cond, second_info.value });
+        const sum = try self.builder.builtinCall("add", &.{ then_value, else_value });
+        return try self.builder.assign(&.{first_info.var_name}, sum);
+    }
+
+    fn assignmentFromIf(stmt: ast.Statement) ?IfAssignment {
+        if (stmt != .if_statement) return null;
+        const if_stmt = stmt.if_statement;
+        if (if_stmt.body.statements.len != 1) return null;
+        const inner = if_stmt.body.statements[0];
+        if (inner != .assignment) return null;
+        const assign = inner.assignment;
+        if (assign.variable_names.len != 1) return null;
+        return .{
+            .cond = if_stmt.condition,
+            .var_name = assign.variable_names[0].name,
+            .value = assign.value,
+        };
+    }
+
+    fn isIsZeroCall(expr: ast.Expression, target: ast.Expression) ?ast.Expression {
+        if (expr != .builtin_call) return null;
+        const call = expr.builtin_call;
+        if (!std.mem.eql(u8, call.builtin_name.name, "iszero")) return null;
+        if (call.arguments.len != 1) return null;
+        if (!exprEqualsSimple(call.arguments[0], target)) return null;
+        return expr;
     }
 
     fn simplifyBuiltin(name: []const u8, args: []const ast.Expression) ?ast.Expression {
@@ -474,4 +549,40 @@ test "drop for loop with false condition" {
     const optimized = try opt.optimize(root);
     try std.testing.expectEqual(@as(usize, 1), optimized.root.code.statements.len);
     try std.testing.expect(optimized.root.code.statements[0] == .block);
+}
+
+test "merge if/else assignment into branchless select" {
+    const allocator = std.testing.allocator;
+    var builder = ast.AstBuilder.init(allocator);
+    defer builder.deinit();
+
+    const cond = ast.Expression.id("cond");
+    const then_assign = try builder.assign(&.{"x"}, ast.Expression.id("a"));
+    const then_block = try builder.block(&.{then_assign});
+    const then_stmt = ast.Statement.ifStmt(cond, then_block);
+
+    const else_cond = try builder.builtinCall("iszero", &.{cond});
+    const else_assign = try builder.assign(&.{"x"}, ast.Expression.id("b"));
+    const else_block = try builder.block(&.{else_assign});
+    const else_stmt = ast.Statement.ifStmt(else_cond, else_block);
+
+    const code_block = try builder.block(&.{ then_stmt, else_stmt });
+    const obj = ast.Object.init("Opt", code_block, &.{}, &.{});
+    const root = ast.AST.init(obj);
+
+    var opt = Optimizer.init(allocator);
+    defer opt.deinit();
+    const optimized = try opt.optimize(root);
+    try std.testing.expectEqual(@as(usize, 1), optimized.root.code.statements.len);
+
+    const stmt = optimized.root.code.statements[0];
+    try std.testing.expect(stmt == .assignment);
+    const assign = stmt.assignment;
+    try std.testing.expectEqual(@as(usize, 1), assign.variable_names.len);
+    try std.testing.expectEqualStrings("x", assign.variable_names[0].name);
+
+    const value = assign.value;
+    try std.testing.expect(value == .builtin_call);
+    const call = value.builtin_call;
+    try std.testing.expectEqualStrings("add", call.builtin_name.name);
 }
