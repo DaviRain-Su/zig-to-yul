@@ -145,17 +145,15 @@
 
 ## 构建命令
 
-**重要**: 必须使用 `./solana-zig/zig`，不能使用系统 zig！
-
 ```bash
 # 构建项目
-./solana-zig/zig build
+zig build
 
 # 运行所有测试
-./solana-zig/zig build test --summary all
+zig build test --summary all
 
 # SDK 测试
-cd sdk && ../solana-zig/zig build test --summary all
+cd sdk && zig build test --summary all
 
 # 清理构建缓存
 rm -rf .zig-cache zig-out
