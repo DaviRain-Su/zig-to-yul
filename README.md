@@ -369,6 +369,16 @@ curl -s -X POST "$RPC_URL" \
   -d '{"jsonrpc":"2.0","id":1,"method":"net_version","params":[]}'
 ```
 
+You can also run the optional compatibility test with multiple providers:
+
+```bash
+export RPC_URL=http://127.0.0.1:8545
+export RPC_URL_HARDHAT=http://127.0.0.1:8545
+export RPC_URL_ALCHEMY=https://eth-mainnet.g.alchemy.com/v2/<key>
+
+zig build test --summary all
+```
+
 ### Deploy to Local Testnet
 
 Requires [Foundry](https://getfoundry.sh/) (anvil, cast).

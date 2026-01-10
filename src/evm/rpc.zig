@@ -92,7 +92,13 @@ fn rpcRequestString(allocator: std.mem.Allocator, rpc_url: []const u8, payload: 
 test "rpc compatibility (clientVersion/chainId/net_version)" {
     const allocator = std.testing.allocator;
 
-    const rpc_url = std.process.getEnvVarOwned(allocator, "RPC_URL") catch |err| switch (err) {
+    try runRpcCompatEnv(allocator, "RPC_URL");
+    try runRpcCompatEnv(allocator, "RPC_URL_HARDHAT");
+    try runRpcCompatEnv(allocator, "RPC_URL_ALCHEMY");
+}
+
+fn runRpcCompatEnv(allocator: std.mem.Allocator, env_name: []const u8) !void {
+    const rpc_url = std.process.getEnvVarOwned(allocator, env_name) catch |err| switch (err) {
         error.EnvironmentVariableNotFound => return,
         else => return err,
     };
