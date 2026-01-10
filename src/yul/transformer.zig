@@ -695,19 +695,31 @@ pub const Transformer = struct {
             const name = p.getIdentifier(var_decl.name_token);
 
             var value: ?ast.Expression = null;
+            var type_name: ?[]const u8 = null;
             if (var_decl.type_node.unwrap()) |type_node| {
                 const type_src = p.getNodeSource(type_node);
                 if (self.parseArrayElemType(type_src)) |elem_type| {
                     try self.setLocalArrayElemType(name, elem_type);
                 }
+                if (self.struct_defs.get(type_src) != null) {
+                    try self.setLocalStructVar(name, type_src);
+                    type_name = type_src;
+                }
             }
             if (var_decl.init_node.unwrap()) |init_idx| {
-                if (self.isStructInitTag(p.getNodeTag(init_idx))) {
-                    if (try self.structInitTypeName(init_idx)) |type_name| {
-                        try self.setLocalStructVar(name, type_name);
+                const init_tag = p.getNodeTag(init_idx);
+                if (self.isStructInitTag(init_tag) or self.isArrayInitTag(init_tag)) {
+                    if (try self.structInitTypeName(init_idx)) |explicit_type| {
+                        try self.setLocalStructVar(name, explicit_type);
+                        value = try self.translateStructInitWithType(init_idx, explicit_type);
+                    } else if (type_name) |override_type| {
+                        value = try self.translateStructInitWithType(init_idx, override_type);
+                    } else {
+                        value = try self.translateStructInit(init_idx);
                     }
+                } else {
+                    value = try self.translateExpression(init_idx);
                 }
-                value = try self.translateExpression(init_idx);
             }
 
             const stmt = try self.builder.varDecl(&.{name}, value);
@@ -724,9 +736,25 @@ pub const Transformer = struct {
         const target_tag = p.getNodeTag(target_node);
         const value_node = nodes[1];
         const value_tag = p.getNodeTag(value_node);
-        const value = try self.translateExpression(nodes[1]);
+        var value: ast.Expression = undefined;
+        if (self.isStructInitTag(value_tag) or self.isArrayInitTag(value_tag)) {
+            var override_type: ?[]const u8 = null;
+            if (target_tag == .identifier) {
+                const target_name = p.getNodeSource(target_node);
+                override_type = self.local_struct_vars.get(target_name);
+            }
+            if (try self.structInitTypeName(value_node)) |explicit_type| {
+                value = try self.translateStructInitWithType(value_node, explicit_type);
+            } else if (override_type) |type_name| {
+                value = try self.translateStructInitWithType(value_node, type_name);
+            } else {
+                value = try self.translateStructInit(value_node);
+            }
+        } else {
+            value = try self.translateExpression(nodes[1]);
+        }
 
-        if (target_tag == .identifier and self.isStructInitTag(value_tag)) {
+        if (target_tag == .identifier and (self.isStructInitTag(value_tag) or self.isArrayInitTag(value_tag))) {
             const target_name = p.getNodeSource(target_node);
             if (try self.structInitTypeName(value_node)) |type_name| {
                 try self.setLocalStructVar(target_name, type_name);
@@ -1640,6 +1668,15 @@ pub const Transformer = struct {
             .struct_init,
             .struct_init_comma,
             => try self.translateStructInit(index),
+            .array_init_one,
+            .array_init_one_comma,
+            .array_init_dot_two,
+            .array_init_dot_two_comma,
+            .array_init_dot,
+            .array_init_dot_comma,
+            .array_init,
+            .array_init_comma,
+            => try self.translateStructInitWithType(index, null),
             else => blk: {
                 self.reportUnsupportedExpr(index) catch {};
                 break :blk ast.Expression.lit(ast.Literal.number(0));
@@ -1994,16 +2031,88 @@ pub const Transformer = struct {
     }
 
     fn translateStructInit(self: *Self, index: ZigAst.Node.Index) TransformProcessError!ast.Expression {
-        const p = &self.zig_parser.?;
-        var buf: [2]ZigAst.Node.Index = undefined;
-        const struct_init = p.ast.fullStructInit(&buf, index) orelse return ast.Expression.lit(ast.Literal.number(0));
+        return self.translateStructInitWithType(index, null);
+    }
 
-        const type_node = struct_init.ast.type_expr.unwrap() orelse {
+    fn translateStructInitWithType(
+        self: *Self,
+        index: ZigAst.Node.Index,
+        type_override: ?[]const u8,
+    ) TransformProcessError!ast.Expression {
+        const p = &self.zig_parser.?;
+        const tag = p.getNodeTag(index);
+
+        var named_values: std.ArrayList(struct { name: []const u8, expr: ast.Expression }) = .empty;
+        defer named_values.deinit(self.allocator);
+        var positional_values: std.ArrayList(ast.Expression) = .empty;
+        defer positional_values.deinit(self.allocator);
+
+        var type_name: ?[]const u8 = null;
+        if (self.isStructInitTag(tag)) {
+            var buf: [2]ZigAst.Node.Index = undefined;
+            const struct_init = p.ast.fullStructInit(&buf, index) orelse return ast.Expression.lit(ast.Literal.number(0));
+            type_name = if (struct_init.ast.type_expr.unwrap()) |type_node|
+                p.getNodeSource(type_node)
+            else
+                type_override;
+
+            for (struct_init.ast.fields) |field_node| {
+                if (self.structInitFieldName(field_node)) |name| {
+                    var duplicate = false;
+                    for (named_values.items) |entry| {
+                        if (std.mem.eql(u8, entry.name, name)) {
+                            duplicate = true;
+                            break;
+                        }
+                    }
+                    if (duplicate) {
+                        try self.addError("duplicate field in struct literal", self.nodeLocation(field_node), .unsupported_feature);
+                        continue;
+                    }
+                    if (p.getNodeTag(field_node) == .assign) {
+                        const nodes = p.ast.nodeData(field_node).node_and_node;
+                        try named_values.append(self.allocator, .{
+                            .name = name,
+                            .expr = try self.translateExpression(nodes[1]),
+                        });
+                    } else {
+                        try named_values.append(self.allocator, .{
+                            .name = name,
+                            .expr = try self.translateExpression(field_node),
+                        });
+                    }
+                } else {
+                    try positional_values.append(self.allocator, try self.translateExpression(field_node));
+                }
+            }
+        } else if (self.isArrayInitTag(tag)) {
+            var buf1: [1]ZigAst.Node.Index = undefined;
+            var buf2: [2]ZigAst.Node.Index = undefined;
+            const array_init = switch (tag) {
+                .array_init_one, .array_init_one_comma => p.ast.arrayInitOne(&buf1, index),
+                .array_init_dot_two, .array_init_dot_two_comma => p.ast.arrayInitDotTwo(&buf2, index),
+                .array_init_dot, .array_init_dot_comma => p.ast.arrayInitDot(index),
+                .array_init, .array_init_comma => p.ast.arrayInit(index),
+                else => unreachable,
+            };
+            type_name = if (array_init.ast.type_expr.unwrap()) |type_node|
+                p.getNodeSource(type_node)
+            else
+                type_override;
+
+            for (array_init.ast.elements) |elem_node| {
+                try positional_values.append(self.allocator, try self.translateExpression(elem_node));
+            }
+        } else {
+            try self.addError("struct literal requires explicit type", self.nodeLocation(index), .unsupported_feature);
+            return ast.Expression.lit(ast.Literal.number(0));
+        }
+
+        const resolved_type = type_name orelse {
             try self.addError("struct literal requires explicit type", self.nodeLocation(index), .unsupported_feature);
             return ast.Expression.lit(ast.Literal.number(0));
         };
-        const type_name = p.getNodeSource(type_node);
-        const fields = self.struct_defs.get(type_name) orelse {
+        const fields = self.struct_defs.get(resolved_type) orelse {
             try self.addError("unknown struct type in literal", self.nodeLocation(index), .unsupported_feature);
             return ast.Expression.lit(ast.Literal.number(0));
         };
@@ -2011,15 +2120,29 @@ pub const Transformer = struct {
         var values: std.ArrayList(ast.Expression) = .empty;
         defer values.deinit(self.allocator);
 
+        var positional_index: usize = 0;
         for (fields) |field| {
-            if (try self.structInitFieldValue(struct_init, field.name)) |expr| {
+            var found: ?ast.Expression = null;
+            for (named_values.items) |entry| {
+                if (std.mem.eql(u8, entry.name, field.name)) {
+                    found = entry.expr;
+                    break;
+                }
+            }
+            if (found) |expr| {
                 try values.append(self.allocator, expr);
+            } else if (positional_index < positional_values.items.len) {
+                try values.append(self.allocator, positional_values.items[positional_index]);
+                positional_index += 1;
             } else {
                 try values.append(self.allocator, ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0))));
             }
         }
+        if (positional_index < positional_values.items.len) {
+            try self.addError("too many positional fields in struct literal", self.nodeLocation(index), .unsupported_feature);
+        }
 
-        const helper = try self.ensureStructInitHelper(type_name, fields);
+        const helper = try self.ensureStructInitHelper(resolved_type, fields);
         return try self.builder.call(helper, values.items);
     }
 
@@ -2138,6 +2261,22 @@ pub const Transformer = struct {
             .struct_init_dot_comma,
             .struct_init,
             .struct_init_comma,
+            => true,
+            else => false,
+        };
+    }
+
+    fn isArrayInitTag(self: *Self, tag: ZigAst.Node.Tag) bool {
+        _ = self;
+        return switch (tag) {
+            .array_init_one,
+            .array_init_one_comma,
+            .array_init_dot_two,
+            .array_init_dot_two_comma,
+            .array_init_dot,
+            .array_init_dot_comma,
+            .array_init,
+            .array_init_comma,
             => true,
             else => false,
         };
@@ -3279,10 +3418,11 @@ test "transform expression coverage" {
         \\
         \\    pub fn compute(self: *Counter, offset: u256, pairs: []Pair) u256 {
         \\        const p = Pair{ .a = 7 + offset, .b = (1 + 2) * 3 };
+        \\        const q: Pair = .{ 5, 6 };
         \\        var x = (p.a + self.value) * (offset - 1);
         \\        var y = p.b[1];
         \\        var z = pairs[1].a;
-        \\        self.value = x + self.helper(p.a, y);
+        \\        self.value = x + self.helper(p.a, y) + q.a;
         \\        return x + y;
         \\    }
         \\};
