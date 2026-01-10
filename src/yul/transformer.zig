@@ -25,6 +25,7 @@ pub const Transformer = struct {
     local_struct_vars: std.StringHashMap([]const u8),
     local_array_elem_types: std.StringHashMap([]const u8),
     function_param_structs: std.StringHashMap([]const []const u8),
+    precompile_helpers: std.StringHashMap([]const u8),
     extra_functions: std.ArrayList(ast.Statement),
 
     // State tracking
@@ -130,6 +131,7 @@ pub const Transformer = struct {
             .local_struct_vars = std.StringHashMap([]const u8).init(allocator),
             .local_array_elem_types = std.StringHashMap([]const u8).init(allocator),
             .function_param_structs = std.StringHashMap([]const []const u8).init(allocator),
+            .precompile_helpers = std.StringHashMap([]const u8).init(allocator),
             .extra_functions = .empty,
             .current_contract = null,
             .functions = .empty,
@@ -188,6 +190,12 @@ pub const Transformer = struct {
             self.allocator.free(entry.value_ptr.*);
         }
         self.function_param_structs.deinit();
+        var pre_it = self.precompile_helpers.iterator();
+        while (pre_it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            self.allocator.free(entry.value_ptr.*);
+        }
+        self.precompile_helpers.deinit();
 
         // Free function info param arrays
         for (self.function_infos.items) |fi| {
@@ -1900,10 +1908,74 @@ pub const Transformer = struct {
                 }
                 return try self.builder.builtinCall(b.yul_name, args.items);
             }
+            if (self.precompileAddress(builtin_name)) |addr| {
+                if (args.items.len != 4) {
+                    try self.addError("precompile wrapper expects 4 arguments (in_ptr, in_len, out_ptr, out_len)", self.nodeLocation(call_info.ast.fn_expr), .unsupported_feature);
+                }
+                const helper = try self.ensurePrecompileHelper(builtin_name, addr);
+                return try self.builder.call(helper, args.items);
+            }
         }
 
         // Regular function call
         return try self.builder.call(callee_src, args.items);
+    }
+
+    fn precompileAddress(self: *Self, name: []const u8) ?ast.U256 {
+        _ = self;
+        if (std.mem.eql(u8, name, "precompile_ecrecover") or std.mem.eql(u8, name, "precompile.ecrecover")) return 0x01;
+        if (std.mem.eql(u8, name, "precompile_sha256") or std.mem.eql(u8, name, "precompile.sha256")) return 0x02;
+        if (std.mem.eql(u8, name, "precompile_ripemd160") or std.mem.eql(u8, name, "precompile.ripemd160")) return 0x03;
+        if (std.mem.eql(u8, name, "precompile_identity") or std.mem.eql(u8, name, "precompile.identity")) return 0x04;
+        if (std.mem.eql(u8, name, "precompile_modexp") or std.mem.eql(u8, name, "precompile.modexp")) return 0x05;
+        if (std.mem.eql(u8, name, "precompile_ecadd") or std.mem.eql(u8, name, "precompile.ecadd")) return 0x06;
+        if (std.mem.eql(u8, name, "precompile_ecmul") or std.mem.eql(u8, name, "precompile.ecmul")) return 0x07;
+        if (std.mem.eql(u8, name, "precompile_ecpairing") or std.mem.eql(u8, name, "precompile.ecpairing")) return 0x08;
+        if (std.mem.eql(u8, name, "precompile_blake2f") or std.mem.eql(u8, name, "precompile.blake2f")) return 0x09;
+        if (std.mem.eql(u8, name, "precompile_point_evaluation") or std.mem.eql(u8, name, "precompile.point_evaluation")) return 0x0a;
+        return null;
+    }
+
+    fn precompileHelperName(self: *Self, name: []const u8) ![]const u8 {
+        var buf: [128]u8 = undefined;
+        var len: usize = 0;
+        const prefix = "__zig2yul$precompile$";
+        @memcpy(buf[0..prefix.len], prefix);
+        len = prefix.len;
+        for (name) |c| {
+            const out = if (std.ascii.isAlphanumeric(c) or c == '_') c else '$';
+            if (len >= buf.len) break;
+            buf[len] = out;
+            len += 1;
+        }
+        return try std.fmt.allocPrint(self.allocator, "{s}", .{buf[0..len]});
+    }
+
+    fn ensurePrecompileHelper(self: *Self, name: []const u8, addr: ast.U256) ![]const u8 {
+        if (self.precompile_helpers.get(name)) |helper| return helper;
+
+        const helper_name = try self.precompileHelperName(name);
+        const key = try self.allocator.dupe(u8, name);
+        try self.precompile_helpers.put(key, helper_name);
+
+        const gas_call = try self.builder.builtinCall("gas", &.{});
+        const call_expr = try self.builder.builtinCall("staticcall", &.{
+            gas_call,
+            ast.Expression.lit(ast.Literal.number(addr)),
+            ast.Expression.id("in_ptr"),
+            ast.Expression.id("in_len"),
+            ast.Expression.id("out_ptr"),
+            ast.Expression.id("out_len"),
+        });
+        const assign = try self.builder.assign(&.{"success"}, call_expr);
+        var stmts: std.ArrayList(ast.Statement) = .empty;
+        defer stmts.deinit(self.allocator);
+        try stmts.append(self.allocator, assign);
+        const body = try self.builder.block(stmts.items);
+        const func = try self.builder.funcDef(helper_name, &.{ "in_ptr", "in_len", "out_ptr", "out_len" }, &.{"success"}, body);
+        try self.extra_functions.append(self.allocator, func);
+
+        return helper_name;
     }
 
     fn translateFieldAccess(self: *Self, index: ZigAst.Node.Index) TransformProcessError!ast.Expression {
@@ -3562,6 +3634,7 @@ test "transform expression coverage" {
         \\        var z = pairs[1].a;
         \\        pairs[0] = q;
         \\        const r = self.make_pair(.{ 9, 10 });
+        \\        _ = evm.precompile_sha256(0, 64, 0, 32);
         \\        self.value = x + self.helper(p.a, y) + q.a + r.b + z;
         \\        return x + y;
         \\    }
@@ -3597,4 +3670,5 @@ test "transform expression coverage" {
     try std.testing.expect(std.mem.indexOf(u8, output, "__zig2yul$init$Pair") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "mload") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "pairs") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "__zig2yul$precompile$precompile_sha256") != null);
 }

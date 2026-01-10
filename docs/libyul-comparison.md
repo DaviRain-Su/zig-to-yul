@@ -315,16 +315,16 @@ Zig 源代码 → [zig-to-yul] → Yul 代码 → [solc] → EVM 字节码
 
 | 地址 | 功能 | 状态 |
 |------|------|------|
-| `0x01` | ecrecover (ECDSA 恢复) | ⚠️ 需手动调用 |
-| `0x02` | SHA-256 哈希 | ⚠️ 需手动调用 |
-| `0x03` | RIPEMD-160 哈希 | ⚠️ 需手动调用 |
-| `0x04` | identity (数据复制) | ⚠️ 需手动调用 |
-| `0x05` | modexp (模幂运算) | ⚠️ 需手动调用 |
-| `0x06` | ecAdd (BN256 加法) | ⚠️ 需手动调用 |
-| `0x07` | ecMul (BN256 乘法) | ⚠️ 需手动调用 |
-| `0x08` | ecPairing (配对检查) | ⚠️ 需手动调用 |
-| `0x09` | blake2f (BLAKE2b) | ⚠️ 需手动调用 |
-| `0x0a` | point evaluation (KZG) | ⚠️ 需手动调用 |
+| `0x01` | ecrecover (ECDSA 恢复) | ✅ `evm.precompile_ecrecover(in_ptr, in_len, out_ptr, out_len)` |
+| `0x02` | SHA-256 哈希 | ✅ `evm.precompile_sha256(in_ptr, in_len, out_ptr, out_len)` |
+| `0x03` | RIPEMD-160 哈希 | ✅ `evm.precompile_ripemd160(in_ptr, in_len, out_ptr, out_len)` |
+| `0x04` | identity (数据复制) | ✅ `evm.precompile_identity(in_ptr, in_len, out_ptr, out_len)` |
+| `0x05` | modexp (模幂运算) | ✅ `evm.precompile_modexp(in_ptr, in_len, out_ptr, out_len)` |
+| `0x06` | ecAdd (BN256 加法) | ✅ `evm.precompile_ecadd(in_ptr, in_len, out_ptr, out_len)` |
+| `0x07` | ecMul (BN256 乘法) | ✅ `evm.precompile_ecmul(in_ptr, in_len, out_ptr, out_len)` |
+| `0x08` | ecPairing (配对检查) | ✅ `evm.precompile_ecpairing(in_ptr, in_len, out_ptr, out_len)` |
+| `0x09` | blake2f (BLAKE2b) | ✅ `evm.precompile_blake2f(in_ptr, in_len, out_ptr, out_len)` |
+| `0x0a` | point evaluation (KZG) | ✅ `evm.precompile_point_evaluation(in_ptr, in_len, out_ptr, out_len)` |
 
 ### 5.3 开发工具特性
 
