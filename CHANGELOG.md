@@ -15,6 +15,19 @@
 #### Test Results
 - Unit tests: `zig build test --summary all`
 
+### Session 2026-01-10-007
+
+**Date**: 2026-01-10
+**Goal**: Harden RPC provider compatibility
+
+#### Completed Work
+1. Accept numeric `net_version` results by coercing to string
+2. Treat JSON-RPC error responses as request failures
+3. Added Infura/QuickNode envs to compatibility test and README
+
+#### Test Results
+- Unit tests: `zig build test --summary all`
+
 ### Session 2026-01-10-006
 
 **Date**: 2026-01-10

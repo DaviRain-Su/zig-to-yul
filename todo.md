@@ -14,7 +14,7 @@
     - 优化点：映射、scratch 复用、SLOAD/SSTORE 合并
     - 回归测试：确保语义一致与指标提升
 - 生态整合：
-  - JSON-RPC 兼容（待覆盖更多 provider 差异）
+  - JSON-RPC 兼容（已覆盖 Hardhat/Alchemy/Infura/QuickNode 基础差异）
   - ABI JSON 输出（ethers.js/Foundry/Hardhat 兼容）
   - keystore/私钥签名兼容
   - SourceMap 格式对齐 solidity 生态

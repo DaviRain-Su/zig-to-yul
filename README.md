@@ -375,6 +375,8 @@ You can also run the optional compatibility test with multiple providers:
 export RPC_URL=http://127.0.0.1:8545
 export RPC_URL_HARDHAT=http://127.0.0.1:8545
 export RPC_URL_ALCHEMY=https://eth-mainnet.g.alchemy.com/v2/<key>
+export RPC_URL_INFURA=https://mainnet.infura.io/v3/<key>
+export RPC_URL_QUICKNODE=https://<name>.quiknode.pro/<key>
 
 zig build test --summary all
 ```

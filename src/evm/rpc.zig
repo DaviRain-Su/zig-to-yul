@@ -83,10 +83,14 @@ fn rpcRequestString(allocator: std.mem.Allocator, rpc_url: []const u8, payload: 
     defer parsed.deinit();
 
     if (parsed.value != .object) return RpcError.InvalidResponse;
-    const result_value = parsed.value.object.get("result") orelse return RpcError.MissingResult;
-    if (result_value != .string) return RpcError.InvalidResponse;
+    if (parsed.value.object.get("error") != null) return RpcError.RpcRequestFailed;
 
-    return try allocator.dupe(u8, result_value.string);
+    const result_value = parsed.value.object.get("result") orelse return RpcError.MissingResult;
+    return switch (result_value) {
+        .string => |value| try allocator.dupe(u8, value),
+        .integer => |value| try std.fmt.allocPrint(allocator, "{}", .{value}),
+        else => RpcError.InvalidResponse,
+    };
 }
 
 test "rpc compatibility (clientVersion/chainId/net_version)" {
@@ -95,6 +99,8 @@ test "rpc compatibility (clientVersion/chainId/net_version)" {
     try runRpcCompatEnv(allocator, "RPC_URL");
     try runRpcCompatEnv(allocator, "RPC_URL_HARDHAT");
     try runRpcCompatEnv(allocator, "RPC_URL_ALCHEMY");
+    try runRpcCompatEnv(allocator, "RPC_URL_INFURA");
+    try runRpcCompatEnv(allocator, "RPC_URL_QUICKNODE");
 }
 
 fn runRpcCompatEnv(allocator: std.mem.Allocator, env_name: []const u8) !void {
