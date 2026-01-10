@@ -192,6 +192,17 @@ pub const SymbolTable = struct {
         });
     }
 
+    /// Define a storage variable with an explicit slot (packed layout)
+    pub fn defineStorageVarPacked(self: *Self, name: []const u8, type_: *const EvmType, slot: evm_types.U256) !*Symbol {
+        return try self.define(.{
+            .name = name,
+            .kind = .storage_var,
+            .type_ = type_,
+            .scope_id = self.current_scope,
+            .storage_slot = slot,
+        });
+    }
+
     /// Lookup a symbol by name (searches current and parent scopes)
     pub fn lookup(self: *Self, name: []const u8) ?*Symbol {
         var scope_id: ?ScopeId = self.current_scope;

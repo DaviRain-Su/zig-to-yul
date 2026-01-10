@@ -9,15 +9,23 @@ const Error = std.mem.Allocator.Error;
 pub const Optimizer = struct {
     allocator: std.mem.Allocator,
     builder: ast.AstBuilder,
+    temp_counter: u32,
+    temp_strings: std.ArrayList([]const u8),
 
     pub fn init(allocator: std.mem.Allocator) Optimizer {
         return .{
             .allocator = allocator,
             .builder = ast.AstBuilder.init(allocator),
+            .temp_counter = 0,
+            .temp_strings = .empty,
         };
     }
 
     pub fn deinit(self: *Optimizer) void {
+        for (self.temp_strings.items) |s| {
+            self.allocator.free(s);
+        }
+        self.temp_strings.deinit(self.allocator);
         self.builder.deinit();
     }
 
@@ -75,7 +83,19 @@ pub const Optimizer = struct {
             i += 1;
         }
 
-        var out = ast.Block.init(try self.builder.dupeStatements(combined.items));
+        var merged = std.ArrayList(ast.Statement).empty;
+        defer merged.deinit(self.allocator);
+
+        var j: usize = 0;
+        while (j < combined.items.len) {
+            if (try self.mergePackedSstoreSequence(combined.items, &j, &merged)) {
+                continue;
+            }
+            try merged.append(self.allocator, combined.items[j]);
+            j += 1;
+        }
+
+        var out = ast.Block.init(try self.builder.dupeStatements(merged.items));
         out.location = block.location;
         return out;
     }
@@ -244,6 +264,99 @@ pub const Optimizer = struct {
         if (call.arguments.len != 1) return null;
         if (!exprEqualsSimple(call.arguments[0], target)) return null;
         return expr;
+    }
+
+    const PackedWrite = struct {
+        slot: ast.Expression,
+        clear_mask: ast.Expression,
+        value: ast.Expression,
+    };
+
+    fn mergePackedSstoreSequence(
+        self: *Optimizer,
+        stmts: []const ast.Statement,
+        index: *usize,
+        out: *std.ArrayList(ast.Statement),
+    ) Error!bool {
+        const first = parsePackedSstore(stmts[index.*]) orelse return false;
+        var end = index.* + 1;
+        while (end < stmts.len) : (end += 1) {
+            const next = parsePackedSstore(stmts[end]) orelse break;
+            if (!exprEqualsSimple(next.slot, first.slot)) break;
+        }
+
+        if (end - index.* < 2) return false;
+
+        const tmp_old = try self.makeTemp("slot_old");
+        const tmp_val = try self.makeTemp("slot_val");
+
+        const sload_expr = try self.builder.builtinCall("sload", &.{first.slot});
+        try out.append(self.allocator, try self.builder.varDecl(&.{tmp_old}, sload_expr));
+        try out.append(self.allocator, try self.builder.varDecl(&.{tmp_val}, ast.Expression.id(tmp_old)));
+
+        var k = index.*;
+        while (k < end) : (k += 1) {
+            const entry = parsePackedSstore(stmts[k]) orelse unreachable;
+            const cleared = try self.builder.builtinCall("and", &.{ ast.Expression.id(tmp_val), entry.clear_mask });
+            const merged = try self.builder.builtinCall("or", &.{ cleared, entry.value });
+            try out.append(self.allocator, try self.builder.assign(&.{tmp_val}, merged));
+        }
+
+        const sstore_expr = try self.builder.builtinCall("sstore", &.{ first.slot, ast.Expression.id(tmp_val) });
+        try out.append(self.allocator, ast.Statement.expr(sstore_expr));
+
+        index.* = end;
+        return true;
+    }
+
+    fn parsePackedSstore(stmt: ast.Statement) ?PackedWrite {
+        if (stmt != .expression_statement) return null;
+        const expr = stmt.expression_statement.expression;
+        if (expr != .builtin_call) return null;
+        const call = expr.builtin_call;
+        if (!std.mem.eql(u8, call.builtin_name.name, "sstore")) return null;
+        if (call.arguments.len != 2) return null;
+        const slot = call.arguments[0];
+        const value = call.arguments[1];
+
+        if (value != .builtin_call) return null;
+        const or_call = value.builtin_call;
+        if (!std.mem.eql(u8, or_call.builtin_name.name, "or")) return null;
+        if (or_call.arguments.len != 2) return null;
+
+        if (parsePackedClear(or_call.arguments[0], slot)) |clear_mask| {
+            return .{ .slot = slot, .clear_mask = clear_mask, .value = or_call.arguments[1] };
+        }
+        if (parsePackedClear(or_call.arguments[1], slot)) |clear_mask| {
+            return .{ .slot = slot, .clear_mask = clear_mask, .value = or_call.arguments[0] };
+        }
+        return null;
+    }
+
+    fn parsePackedClear(expr: ast.Expression, slot: ast.Expression) ?ast.Expression {
+        if (expr != .builtin_call) return null;
+        const call = expr.builtin_call;
+        if (!std.mem.eql(u8, call.builtin_name.name, "and")) return null;
+        if (call.arguments.len != 2) return null;
+
+        if (isSloadSlot(call.arguments[0], slot)) return call.arguments[1];
+        if (isSloadSlot(call.arguments[1], slot)) return call.arguments[0];
+        return null;
+    }
+
+    fn isSloadSlot(expr: ast.Expression, slot: ast.Expression) bool {
+        if (expr != .builtin_call) return false;
+        const call = expr.builtin_call;
+        if (!std.mem.eql(u8, call.builtin_name.name, "sload")) return false;
+        if (call.arguments.len != 1) return false;
+        return exprEqualsSimple(call.arguments[0], slot);
+    }
+
+    fn makeTemp(self: *Optimizer, label: []const u8) Error![]const u8 {
+        const name = try std.fmt.allocPrint(self.allocator, "$zig2yul${s}${d}", .{ label, self.temp_counter });
+        self.temp_counter += 1;
+        try self.temp_strings.append(self.allocator, name);
+        return name;
     }
 
     fn simplifyBuiltin(name: []const u8, args: []const ast.Expression) ?ast.Expression {
@@ -585,4 +698,38 @@ test "merge if/else assignment into branchless select" {
     try std.testing.expect(value == .builtin_call);
     const call = value.builtin_call;
     try std.testing.expectEqualStrings("add", call.builtin_name.name);
+}
+
+test "merge packed sstore sequence" {
+    const allocator = std.testing.allocator;
+    var builder = ast.AstBuilder.init(allocator);
+    defer builder.deinit();
+
+    const slot = ast.Expression.lit(ast.Literal.number(1));
+    const sload_expr = ast.Expression.builtinCall("sload", &.{slot});
+    const clear1 = ast.Expression.lit(ast.Literal.number(0xffff));
+    const clear2 = ast.Expression.lit(ast.Literal.number(0xff00ff));
+    const val1 = ast.Expression.id("a");
+    const val2 = ast.Expression.id("b");
+
+    const merged1 = ast.Expression.builtinCall("or", &.{
+        ast.Expression.builtinCall("and", &.{ sload_expr, clear1 }),
+        val1,
+    });
+    const merged2 = ast.Expression.builtinCall("or", &.{
+        ast.Expression.builtinCall("and", &.{ sload_expr, clear2 }),
+        val2,
+    });
+
+    const stmt1 = ast.Statement.expr(ast.Expression.builtinCall("sstore", &.{ slot, merged1 }));
+    const stmt2 = ast.Statement.expr(ast.Expression.builtinCall("sstore", &.{ slot, merged2 }));
+
+    const code_block = ast.Block.init(try builder.dupeStatements(&.{ stmt1, stmt2 }));
+    const obj = ast.Object.init("Opt", code_block, &.{}, &.{});
+    const root = ast.AST.init(obj);
+
+    var opt = Optimizer.init(allocator);
+    defer opt.deinit();
+    const optimized = try opt.optimize(root);
+    try std.testing.expect(optimized.root.code.statements.len > 2);
 }

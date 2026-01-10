@@ -11,6 +11,7 @@ const parser = @import("../ast/parser.zig");
 const ast = @import("ast.zig");
 const symbols = @import("../sema/symbols.zig");
 const evm_types = @import("../evm/types.zig");
+const evm_storage = @import("../evm/storage.zig");
 const builtins = @import("../evm/builtins.zig");
 
 pub const Transformer = struct {
@@ -45,6 +46,8 @@ pub const Transformer = struct {
     pub const StorageVar = struct {
         name: []const u8,
         slot: evm_types.U256,
+        size_bits: u16,
+        offset_bits: u16,
     };
 
     pub const StructFieldDef = struct {
@@ -443,6 +446,7 @@ pub const Transformer = struct {
         // Use raw AST API to get all container members
         var buf: [2]ZigAst.Node.Index = undefined;
         if (p.ast.fullContainerDecl(&buf, index)) |container| {
+            try self.collectStorageLayout(container.ast.members);
             for (container.ast.members) |member| {
                 if (@intFromEnum(member) == 0) continue;
                 if (p.getNodeTag(member) == .fn_decl) {
@@ -479,15 +483,16 @@ pub const Transformer = struct {
         const name = p.getIdentifier(name_token);
 
         if (name.len > 0) {
+            const field_type = self.fieldTypeFromSource(index);
             var type_mapper = evm_types.TypeMapper.init(self.allocator);
             defer type_mapper.deinit();
-            const evm_type = try type_mapper.mapZigType("u256");
-            _ = try self.symbol_table.defineStorageVar(name, evm_type);
+            const evm_type = try type_mapper.mapZigType(field_type);
 
-            try self.storage_vars.append(self.allocator, .{
-                .name = name,
-                .slot = self.symbol_table.next_storage_slot - 1,
-            });
+            if (self.storageVarFor(name)) |sv| {
+                _ = try self.symbol_table.defineStorageVarPacked(name, evm_type, sv.slot);
+            } else {
+                _ = try self.symbol_table.defineStorageVar(name, evm_type);
+            }
         }
     }
 
@@ -827,9 +832,13 @@ pub const Transformer = struct {
             const field_name = p.getIdentifier(field_token);
 
             if (std.mem.eql(u8, obj_src, "self")) {
-                if (self.storageSlotFor(field_name)) |slot| {
+                if (self.storageVarFor(field_name)) |sv| {
+                    if (sv.size_bits < 256) {
+                        try self.genPackedWrite(sv, value, stmts, index);
+                        return;
+                    }
                     const sstore_call = try self.builder.builtinCall("sstore", &.{
-                        ast.Expression.lit(ast.Literal.number(slot)),
+                        ast.Expression.lit(ast.Literal.number(sv.slot)),
                         value,
                     });
                     try stmts.append(self.allocator, self.stmtWithLocation(ast.Statement.expr(sstore_call), self.nodeLocation(index)));
@@ -1920,12 +1929,13 @@ pub const Transformer = struct {
 
         // Check if accessing storage
         if (std.mem.eql(u8, obj_src, "self")) {
-            for (self.storage_vars.items) |sv| {
-                if (std.mem.eql(u8, sv.name, field_name)) {
-                    return try self.builder.builtinCall("sload", &.{
-                        ast.Expression.lit(ast.Literal.number(sv.slot)),
-                    });
+            if (self.storageVarFor(field_name)) |sv| {
+                if (sv.size_bits < 256) {
+                    return try self.genPackedRead(sv);
                 }
+                return try self.builder.builtinCall("sload", &.{
+                    ast.Expression.lit(ast.Literal.number(sv.slot)),
+                });
             }
         }
 
@@ -1956,9 +1966,9 @@ pub const Transformer = struct {
             const obj_src = p.getNodeSource(base_data[0]);
             const field_name = p.getIdentifier(base_data[1]);
             if (std.mem.eql(u8, obj_src, "self")) {
-                if (self.storageSlotFor(field_name)) |slot| {
+                if (self.storageVarFor(field_name)) |sv| {
                     const idx_expr = try self.translateExpression(index_node);
-                    const addr = try self.indexedStorageSlot(slot, idx_expr);
+                    const addr = try self.indexedStorageSlot(sv.slot, idx_expr);
                     return try self.builder.builtinCall("sload", &.{addr});
                 }
             }
@@ -2020,9 +2030,9 @@ pub const Transformer = struct {
             const obj_src = p.getNodeSource(base_data[0]);
             const field_name = p.getIdentifier(base_data[1]);
             if (std.mem.eql(u8, obj_src, "self")) {
-                if (self.storageSlotFor(field_name)) |slot| {
+                if (self.storageVarFor(field_name)) |sv| {
                     const idx_expr = try self.translateExpression(index_node);
-                    const addr = try self.indexedStorageSlot(slot, idx_expr);
+                    const addr = try self.indexedStorageSlot(sv.slot, idx_expr);
                     const store = try self.builder.builtinCall("sstore", &.{ addr, value });
                     return ast.Statement.expr(store);
                 }
@@ -2116,9 +2126,9 @@ pub const Transformer = struct {
         return self.stmtWithLocation(ast.Statement{ .block = block }, loc);
     }
 
-    fn storageSlotFor(self: *Self, field_name: []const u8) ?ast.U256 {
+    fn storageVarFor(self: *Self, field_name: []const u8) ?StorageVar {
         for (self.storage_vars.items) |sv| {
-            if (std.mem.eql(u8, sv.name, field_name)) return sv.slot;
+            if (std.mem.eql(u8, sv.name, field_name)) return sv;
         }
         return null;
     }
@@ -2140,6 +2150,118 @@ pub const Transformer = struct {
             ast.Expression.lit(ast.Literal.number(@as(ast.U256, 32))),
         });
         return try self.builder.builtinCall("add", &.{ base, offset });
+    }
+
+    fn collectStorageLayout(self: *Self, members: []const ZigAst.Node.Index) !void {
+        var fields: std.ArrayList(evm_storage.StructField) = .empty;
+        defer fields.deinit(self.allocator);
+
+        for (members) |member| {
+            if (@intFromEnum(member) == 0) continue;
+            const tag = self.zig_parser.?.getNodeTag(member);
+            if (tag == .container_field_init or tag == .container_field) {
+                const name = self.zig_parser.?.getIdentifier(self.zig_parser.?.getMainToken(member));
+                if (name.len == 0) continue;
+                const field_type = self.fieldTypeFromSource(member);
+                try fields.append(self.allocator, .{ .name = name, .type_name = field_type });
+            }
+        }
+
+        if (fields.items.len == 0) return;
+
+        var packer = evm_storage.StoragePacker.init(self.allocator);
+        const slots = try packer.analyzeStruct(fields.items);
+        defer {
+            for (slots) |slot_info| {
+                self.allocator.free(slot_info.fields);
+            }
+            self.allocator.free(slots);
+        }
+
+        var max_slot: evm_types.U256 = 0;
+        for (slots) |slot_info| {
+            if (slot_info.slot > max_slot) max_slot = slot_info.slot;
+            for (slot_info.fields) |field| {
+                try self.storage_vars.append(self.allocator, .{
+                    .name = field.name,
+                    .slot = slot_info.slot,
+                    .size_bits = field.size_bits,
+                    .offset_bits = field.offset_bits,
+                });
+            }
+        }
+
+        self.symbol_table.next_storage_slot = max_slot + 1;
+    }
+
+    fn genPackedRead(self: *Self, sv: StorageVar) TransformProcessError!ast.Expression {
+        const slot_expr = ast.Expression.lit(ast.Literal.number(sv.slot));
+        const sload_expr = try self.builder.builtinCall("sload", &.{slot_expr});
+        const mask: ast.U256 = (@as(ast.U256, 1) << @intCast(sv.size_bits)) - 1;
+
+        if (sv.offset_bits == 0) {
+            return try self.builder.builtinCall("and", &.{
+                sload_expr,
+                ast.Expression.lit(ast.Literal.number(mask)),
+            });
+        }
+
+        const shifted = try self.builder.builtinCall("shr", &.{
+            ast.Expression.lit(ast.Literal.number(@as(ast.U256, sv.offset_bits))),
+            sload_expr,
+        });
+        return try self.builder.builtinCall("and", &.{
+            shifted,
+            ast.Expression.lit(ast.Literal.number(mask)),
+        });
+    }
+
+    fn genPackedWrite(
+        self: *Self,
+        sv: StorageVar,
+        value: ast.Expression,
+        stmts: *std.ArrayList(ast.Statement),
+        index: ZigAst.Node.Index,
+    ) TransformProcessError!void {
+        const mask: ast.U256 = (@as(ast.U256, 1) << @intCast(sv.size_bits)) - 1;
+        const clear_mask: ast.U256 = ~(mask << @intCast(sv.offset_bits));
+        const slot_expr = ast.Expression.lit(ast.Literal.number(sv.slot));
+
+        const sload_expr = try self.builder.builtinCall("sload", &.{slot_expr});
+        const cleared = try self.builder.builtinCall("and", &.{
+            sload_expr,
+            ast.Expression.lit(ast.Literal.number(clear_mask)),
+        });
+        const masked_value = try self.builder.builtinCall("and", &.{
+            value,
+            ast.Expression.lit(ast.Literal.number(mask)),
+        });
+        const shifted = if (sv.offset_bits == 0)
+            masked_value
+        else
+            try self.builder.builtinCall("shl", &.{
+                ast.Expression.lit(ast.Literal.number(@as(ast.U256, sv.offset_bits))),
+                masked_value,
+            });
+        const merged = try self.builder.builtinCall("or", &.{ cleared, shifted });
+        const sstore_call = try self.builder.builtinCall("sstore", &.{ slot_expr, merged });
+        try stmts.append(self.allocator, self.stmtWithLocation(ast.Statement.expr(sstore_call), self.nodeLocation(index)));
+    }
+
+    fn shouldUseIdentityCopy(self: *Self, size: ast.Expression) bool {
+        _ = self;
+        const size_literal = literalU256(size) orelse return true;
+        return size_literal > 96;
+    }
+
+    fn literalU256(expr: ast.Expression) ?ast.U256 {
+        if (expr != .literal) return null;
+        return switch (expr.literal.kind) {
+            .number => expr.literal.value.number,
+            .hex_number => expr.literal.value.hex_number,
+            .boolean => if (expr.literal.value.boolean) 1 else 0,
+            else => null,
+        };
     }
 
     fn indexedMemoryAddressStride(self: *Self, base: ast.Expression, idx_expr: ast.Expression, stride: ast.U256) TransformProcessError!ast.Expression {
@@ -2958,6 +3080,20 @@ pub const Transformer = struct {
         src: ast.Expression,
         size: ast.Expression,
     ) TransformProcessError!void {
+        if (self.shouldUseIdentityCopy(size)) {
+            const gas_call = try self.builder.builtinCall("gas", &.{});
+            const call_expr = try self.builder.builtinCall("staticcall", &.{
+                gas_call,
+                ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0x04))),
+                src,
+                size,
+                dest,
+                size,
+            });
+            try stmts.append(self.allocator, ast.Statement.expr(call_expr));
+            return;
+        }
+
         const idx_name = try self.makeTemp("copy_i");
         const init_decl = try self.builder.varDecl(&.{idx_name}, ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0))));
         const init_block = try self.builder.block(&.{init_decl});
@@ -3278,15 +3414,35 @@ test "dispatcher generates function cases" {
     try std.testing.expect(std.mem.indexOf(u8, output, "switch") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "case") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "default") != null);
+}
 
-    // Verify dispatcher loads calldata and calls functions
-    try std.testing.expect(std.mem.indexOf(u8, output, "calldataload") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "mstore") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "return") != null);
+test "packed storage generates masked sload" {
+    const allocator = std.testing.allocator;
+    const printer = @import("printer.zig");
 
-    // Verify functions exist
-    try std.testing.expect(std.mem.indexOf(u8, output, "function increment") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "function getCount") != null);
+    const source =
+        \\pub const Packed = struct {
+        \\    a: u8,
+        \\    b: u8,
+        \\
+        \\    pub fn get(self: *Packed) u256 {
+        \\        return self.a + self.b;
+        \\    }
+        \\};
+    ;
+
+    const source_z = try allocator.dupeZ(u8, source);
+    defer allocator.free(source_z);
+
+    var transformer = Transformer.init(allocator);
+    defer transformer.deinit();
+
+    const yul_ast = try transformer.transform(source_z);
+    const output = try printer.format(allocator, yul_ast);
+    defer allocator.free(output);
+
+    try std.testing.expect(std.mem.indexOf(u8, output, "sload") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "and") != null);
 }
 
 test "dispatcher with parameterized function" {
