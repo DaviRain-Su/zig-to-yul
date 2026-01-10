@@ -12,6 +12,8 @@ Zig Source Code → [zig-to-yul] → Yul Code → [solc] → EVM Bytecode
 - **Direct Bytecode Generation**: Compile directly to EVM bytecode using solc
 - **Struct-based Contracts**: Define contracts as Zig structs with storage variables and methods
 - **EVM Built-ins**: Access EVM opcodes through the `evm` namespace
+- **Gas Estimation**: Estimate gas usage with optional profile overrides
+- **Profiling (Yul)**: Generate instrumented Yul and aggregate counts
 - **Cross-platform**: Runs on Linux, macOS, and Windows
 
 ## Installation
@@ -67,8 +69,32 @@ zig-to-yul build -O contract.zig -o contract.bin
 |---------|-------------|
 | `compile` | Compile Zig to Yul intermediate language |
 | `build` | Compile Zig to EVM bytecode (requires solc) |
+| `estimate` | Estimate gas usage (supports profile overrides) |
+| `profile` | Instrument Yul and aggregate profile counts |
 | `version` | Print version information |
 | `help` | Print help message |
+
+### Gas Estimation
+
+```bash
+# Estimate gas
+zig-to-yul estimate contract.zig
+
+# Estimate with profile overrides
+zig-to-yul estimate contract.zig --profile profile.json
+```
+
+### Profiling (Yul)
+
+```bash
+# Emit instrumented Yul and map
+zig-to-yul profile contract.zig -o contract.profile.yul --map profile.map.json
+
+# Aggregate raw counter runs into profile.json
+zig-to-yul profile contract.zig --map profile.map.json \
+  --counts run1.counts.json --counts run2.counts.json \
+  --profile-out profile.json
+```
 
 ### Options
 
@@ -76,6 +102,8 @@ zig-to-yul build -O contract.zig -o contract.bin
 |--------|-------------|
 | `-o, --output <file>` | Write output to file |
 | `-O, --optimize` | Enable solc optimizer (build only) |
+| `--profile <file>` | Profile counts JSON (estimate only) |
+| `--evm-version <name>` | EVM version (estimate only) |
 | `-h, --help` | Print help |
 | `-v, --version` | Print version |
 

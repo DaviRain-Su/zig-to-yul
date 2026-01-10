@@ -4,6 +4,326 @@ const std = @import("std");
 const gas_estimator = @import("yul/gas_estimator.zig");
 const ast = @import("yul/ast.zig");
 
+pub const BranchSite = struct {
+    location: ast.SourceLocation,
+    true_index: u32,
+    false_index: u32,
+};
+
+pub const SwitchSite = struct {
+    location: ast.SourceLocation,
+    case_count: u32,
+    base_index: u32,
+};
+
+pub const LoopSite = struct {
+    location: ast.SourceLocation,
+    index: u32,
+};
+
+pub const ProfileMap = struct {
+    branches: []BranchSite = &.{},
+    switches: []SwitchSite = &.{},
+    loops: []LoopSite = &.{},
+    counter_count: u32 = 0,
+
+    pub fn deinit(self: *ProfileMap, allocator: std.mem.Allocator) void {
+        allocator.free(self.branches);
+        allocator.free(self.switches);
+        allocator.free(self.loops);
+    }
+};
+
+pub const ProfileCounts = struct {
+    counts: []const u64,
+};
+
+pub const ProfileData = struct {
+    runs: u64 = 0,
+    branches: []BranchCounts = &.{},
+    switches: []SwitchCounts = &.{},
+    loops: []LoopCounts = &.{},
+
+    pub const BranchCounts = struct {
+        start: u32,
+        end: u32,
+        source_index: ?u32 = null,
+        hits_true: u64,
+        hits_false: u64,
+    };
+
+    pub const SwitchCounts = struct {
+        start: u32,
+        end: u32,
+        source_index: ?u32 = null,
+        case_hits: []u64,
+    };
+
+    pub const LoopCounts = struct {
+        start: u32,
+        end: u32,
+        source_index: ?u32 = null,
+        hits: u64,
+        max_iter: ?u64 = null,
+    };
+
+    pub fn deinit(self: *ProfileData, allocator: std.mem.Allocator) void {
+        for (self.switches) |sw| allocator.free(sw.case_hits);
+        allocator.free(self.branches);
+        allocator.free(self.switches);
+        allocator.free(self.loops);
+    }
+};
+
+pub fn parseProfileMap(allocator: std.mem.Allocator, json_bytes: []const u8) !ProfileMap {
+    const MapJson = struct {
+        branches: ?[]const BranchJson = null,
+        switches: ?[]const SwitchJson = null,
+        loops: ?[]const LoopJson = null,
+        counter_count: u32,
+
+        const BranchJson = struct {
+            start: u32,
+            end: u32,
+            source_index: ?u32 = null,
+            true_index: u32,
+            false_index: u32,
+        };
+
+        const SwitchJson = struct {
+            start: u32,
+            end: u32,
+            source_index: ?u32 = null,
+            case_count: u32,
+            base_index: u32,
+        };
+
+        const LoopJson = struct {
+            start: u32,
+            end: u32,
+            source_index: ?u32 = null,
+            index: u32,
+        };
+    };
+
+    const parsed = try std.json.parseFromSlice(MapJson, allocator, json_bytes, .{});
+    defer parsed.deinit();
+
+    var branch_list = std.ArrayList(BranchSite).empty;
+    defer branch_list.deinit(allocator);
+    var switch_list = std.ArrayList(SwitchSite).empty;
+    defer switch_list.deinit(allocator);
+    var loop_list = std.ArrayList(LoopSite).empty;
+    defer loop_list.deinit(allocator);
+
+    if (parsed.value.branches) |branches| {
+        for (branches) |b| {
+            try branch_list.append(allocator, .{
+                .location = .{ .start = b.start, .end = b.end, .source_index = b.source_index },
+                .true_index = b.true_index,
+                .false_index = b.false_index,
+            });
+        }
+    }
+
+    if (parsed.value.switches) |switches| {
+        for (switches) |s| {
+            try switch_list.append(allocator, .{
+                .location = .{ .start = s.start, .end = s.end, .source_index = s.source_index },
+                .case_count = s.case_count,
+                .base_index = s.base_index,
+            });
+        }
+    }
+
+    if (parsed.value.loops) |loops| {
+        for (loops) |l| {
+            try loop_list.append(allocator, .{
+                .location = .{ .start = l.start, .end = l.end, .source_index = l.source_index },
+                .index = l.index,
+            });
+        }
+    }
+
+    return .{
+        .branches = try branch_list.toOwnedSlice(allocator),
+        .switches = try switch_list.toOwnedSlice(allocator),
+        .loops = try loop_list.toOwnedSlice(allocator),
+        .counter_count = parsed.value.counter_count,
+    };
+}
+
+pub fn profileMapToJson(allocator: std.mem.Allocator, map: ProfileMap) ![]const u8 {
+    const MapJson = struct {
+        branches: []const BranchJson,
+        switches: []const SwitchJson,
+        loops: []const LoopJson,
+        counter_count: u32,
+
+        const BranchJson = struct {
+            start: u32,
+            end: u32,
+            source_index: ?u32 = null,
+            true_index: u32,
+            false_index: u32,
+        };
+
+        const SwitchJson = struct {
+            start: u32,
+            end: u32,
+            source_index: ?u32 = null,
+            case_count: u32,
+            base_index: u32,
+        };
+
+        const LoopJson = struct {
+            start: u32,
+            end: u32,
+            source_index: ?u32 = null,
+            index: u32,
+        };
+    };
+
+    var branches = std.ArrayList(MapJson.BranchJson).empty;
+    defer branches.deinit(allocator);
+    var switches = std.ArrayList(MapJson.SwitchJson).empty;
+    defer switches.deinit(allocator);
+    var loops = std.ArrayList(MapJson.LoopJson).empty;
+    defer loops.deinit(allocator);
+
+    for (map.branches) |b| {
+        try branches.append(allocator, .{
+            .start = b.location.start,
+            .end = b.location.end,
+            .source_index = b.location.source_index,
+            .true_index = b.true_index,
+            .false_index = b.false_index,
+        });
+    }
+
+    for (map.switches) |s| {
+        try switches.append(allocator, .{
+            .start = s.location.start,
+            .end = s.location.end,
+            .source_index = s.location.source_index,
+            .case_count = s.case_count,
+            .base_index = s.base_index,
+        });
+    }
+
+    for (map.loops) |l| {
+        try loops.append(allocator, .{
+            .start = l.location.start,
+            .end = l.location.end,
+            .source_index = l.location.source_index,
+            .index = l.index,
+        });
+    }
+
+    const map_json: MapJson = .{
+        .branches = branches.items,
+        .switches = switches.items,
+        .loops = loops.items,
+        .counter_count = map.counter_count,
+    };
+
+    return std.json.stringifyAlloc(allocator, map_json, .{});
+}
+
+pub fn parseProfileCounts(allocator: std.mem.Allocator, json_bytes: []const u8) !ProfileCounts {
+    const parsed = try std.json.parseFromSlice(ProfileCounts, allocator, json_bytes, .{});
+    defer parsed.deinit();
+    return .{ .counts = try allocator.dupe(u64, parsed.value.counts) };
+}
+
+pub fn profileFromCounts(allocator: std.mem.Allocator, map: ProfileMap, counts: []const u64) !ProfileData {
+    if (counts.len < map.counter_count) return error.InvalidCounts;
+
+    var branches = std.ArrayList(ProfileData.BranchCounts).empty;
+    defer branches.deinit(allocator);
+    var switches = std.ArrayList(ProfileData.SwitchCounts).empty;
+    defer switches.deinit(allocator);
+    var loops = std.ArrayList(ProfileData.LoopCounts).empty;
+    defer loops.deinit(allocator);
+
+    for (map.branches) |b| {
+        try branches.append(allocator, .{
+            .start = b.location.start,
+            .end = b.location.end,
+            .source_index = b.location.source_index,
+            .hits_true = counts[b.true_index],
+            .hits_false = counts[b.false_index],
+        });
+    }
+
+    for (map.switches) |s| {
+        const case_hits = try allocator.alloc(u64, s.case_count);
+        for (case_hits, 0..) |*slot, idx| {
+            slot.* = counts[s.base_index + @as(u32, @intCast(idx))];
+        }
+        try switches.append(allocator, .{
+            .start = s.location.start,
+            .end = s.location.end,
+            .source_index = s.location.source_index,
+            .case_hits = case_hits,
+        });
+    }
+
+    for (map.loops) |l| {
+        try loops.append(allocator, .{
+            .start = l.location.start,
+            .end = l.location.end,
+            .source_index = l.location.source_index,
+            .hits = counts[l.index],
+            .max_iter = null,
+        });
+    }
+
+    return .{
+        .runs = 1,
+        .branches = try branches.toOwnedSlice(allocator),
+        .switches = try switches.toOwnedSlice(allocator),
+        .loops = try loops.toOwnedSlice(allocator),
+    };
+}
+
+pub fn mergeProfileData(base: *ProfileData, next: ProfileData) !void {
+    if (base.branches.len != next.branches.len or base.switches.len != next.switches.len or base.loops.len != next.loops.len) {
+        return error.ProfileMapMismatch;
+    }
+
+    for (base.branches, 0..) |*b, idx| {
+        const n = next.branches[idx];
+        if (b.start != n.start or b.end != n.end or b.source_index != n.source_index) return error.ProfileMapMismatch;
+        b.hits_true += n.hits_true;
+        b.hits_false += n.hits_false;
+    }
+
+    for (base.switches, 0..) |*s, idx| {
+        const n = next.switches[idx];
+        if (s.start != n.start or s.end != n.end or s.source_index != n.source_index) return error.ProfileMapMismatch;
+        if (s.case_hits.len != n.case_hits.len) return error.ProfileMapMismatch;
+        for (s.case_hits, 0..) |*slot, case_idx| {
+            slot.* += n.case_hits[case_idx];
+        }
+    }
+
+    for (base.loops, 0..) |*l, idx| {
+        const n = next.loops[idx];
+        if (l.start != n.start or l.end != n.end or l.source_index != n.source_index) return error.ProfileMapMismatch;
+        l.hits += n.hits;
+        if (n.max_iter) |max_iter| {
+            if (l.max_iter) |current| {
+                if (max_iter > current) l.max_iter = max_iter;
+            } else {
+                l.max_iter = max_iter;
+            }
+        }
+    }
+
+    base.runs += next.runs;
+}
+
 pub const ProfileOverrides = struct {
     branch_overrides: []gas_estimator.BranchOverride = &.{},
     switch_overrides: []gas_estimator.SwitchOverride = &.{},
@@ -157,4 +477,28 @@ test "parseProfileOverrides converts branches" {
 
     try std.testing.expectEqual(@as(usize, 1), prof.loop_overrides.len);
     try std.testing.expectEqual(@as(u64, 15), prof.loop_overrides[0].iterations);
+}
+
+test "profileFromCounts builds profile data" {
+    var branches = [_]BranchSite{.{ .location = .{ .start = 1, .end = 2 }, .true_index = 0, .false_index = 1 }};
+    var switches = [_]SwitchSite{.{ .location = .{ .start = 3, .end = 4 }, .case_count = 2, .base_index = 2 }};
+    var loops = [_]LoopSite{.{ .location = .{ .start = 5, .end = 6 }, .index = 4 }};
+
+    const map = ProfileMap{
+        .branches = branches[0..],
+        .switches = switches[0..],
+        .loops = loops[0..],
+        .counter_count = 5,
+    };
+
+    const counts = [_]u64{ 7, 3, 5, 2, 9 };
+    var data = try profileFromCounts(std.testing.allocator, map, &counts);
+    defer data.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u64, 1), data.runs);
+    try std.testing.expectEqual(@as(u64, 7), data.branches[0].hits_true);
+    try std.testing.expectEqual(@as(u64, 3), data.branches[0].hits_false);
+    try std.testing.expectEqual(@as(u64, 5), data.switches[0].case_hits[0]);
+    try std.testing.expectEqual(@as(u64, 2), data.switches[0].case_hits[1]);
+    try std.testing.expectEqual(@as(u64, 9), data.loops[0].hits);
 }

@@ -9,6 +9,7 @@ const optimizer = @import("yul/optimizer.zig");
 const gas_estimator = @import("yul/gas_estimator.zig");
 const profile = @import("profile.zig");
 const yul_ast = @import("yul/ast.zig");
+const profile_instrumenter = @import("yul/profile_instrumenter.zig");
 
 const version = "0.1.0";
 
@@ -37,6 +38,8 @@ pub fn main() !void {
         try runDecodeAbi(allocator, args[2..]);
     } else if (std.mem.eql(u8, command, "estimate")) {
         try runEstimate(allocator, args[2..]);
+    } else if (std.mem.eql(u8, command, "profile")) {
+        try runProfile(allocator, args[2..]);
     } else if (std.mem.eql(u8, command, "version") or std.mem.eql(u8, command, "--version") or std.mem.eql(u8, command, "-v")) {
         printVersionStdout();
     } else if (std.mem.eql(u8, command, "help") or std.mem.eql(u8, command, "--help") or std.mem.eql(u8, command, "-h")) {
@@ -221,6 +224,86 @@ fn runEstimate(allocator: std.mem.Allocator, args: []const []const u8) !void {
         const stdout = std.fs.File.stdout();
         stdout.writeAll(json_out) catch {};
         stdout.writeAll("\n") catch {};
+    }
+}
+
+fn runProfile(allocator: std.mem.Allocator, args: []const []const u8) !void {
+    var opts = try parseProfileOptions(allocator, args);
+    defer opts.deinit(allocator);
+
+    if (opts.input_file == null) {
+        std.debug.print("Error: No input file specified\n", .{});
+        printProfileUsageStderr();
+        std.process.exit(1);
+    }
+
+    const source = try readFile(allocator, opts.input_file.?);
+    defer allocator.free(source);
+
+    var trans = Transformer.init(allocator);
+    defer trans.deinit();
+
+    const yul_ast_root = trans.transform(source) catch |err| {
+        printTransformErrorsStderr(&trans, opts.input_file.?);
+        std.debug.print("Compilation failed: {}\n", .{err});
+        std.process.exit(1);
+    };
+
+    var instrumenter = profile_instrumenter.Instrumenter.init(allocator);
+    defer instrumenter.deinit();
+
+    const instrumented = try instrumenter.instrument(yul_ast_root);
+    defer instrumented.map.deinit(allocator);
+
+    const yul_code = printer.format(allocator, instrumented.ast) catch |err| {
+        std.debug.print("Code generation error: {}\n", .{err});
+        std.process.exit(1);
+    };
+    defer allocator.free(yul_code);
+
+    if (opts.output_file) |path| {
+        try writeOutput(yul_code, path);
+    } else {
+        const stdout = std.fs.File.stdout();
+        stdout.writeAll(yul_code) catch {};
+        stdout.writeAll("\n") catch {};
+    }
+
+    if (opts.map_file) |path| {
+        const map_json = try profile.profileMapToJson(allocator, instrumented.map);
+        defer allocator.free(map_json);
+        try writeOutput(map_json, path);
+    }
+
+    if (opts.counts_files.items.len > 0) {
+        var aggregate: ?profile.ProfileData = null;
+        defer if (aggregate) |*agg| agg.deinit(allocator);
+
+        for (opts.counts_files.items) |counts_path| {
+            const counts_json = try readFile(allocator, counts_path);
+            defer allocator.free(counts_json);
+            const counts = try profile.parseProfileCounts(allocator, counts_json);
+            defer allocator.free(counts.counts);
+            var run = try profile.profileFromCounts(allocator, instrumented.map, counts.counts);
+            if (aggregate) |*agg| {
+                try profile.mergeProfileData(agg, run);
+                run.deinit(allocator);
+            } else {
+                aggregate = run;
+            }
+        }
+
+        if (aggregate) |agg| {
+            const profile_json = try std.json.stringifyAlloc(allocator, agg, .{});
+            defer allocator.free(profile_json);
+            if (opts.profile_out) |path| {
+                try writeOutput(profile_json, path);
+            } else {
+                const stdout = std.fs.File.stdout();
+                stdout.writeAll(profile_json) catch {};
+                stdout.writeAll("\n") catch {};
+            }
+        }
     }
 }
 
@@ -454,6 +537,18 @@ const EstimateCliOptions = struct {
     evm_version: yul_ast.EvmVersion = .cancun,
 };
 
+const ProfileCliOptions = struct {
+    input_file: ?[]const u8 = null,
+    output_file: ?[]const u8 = null,
+    map_file: ?[]const u8 = null,
+    profile_out: ?[]const u8 = null,
+    counts_files: std.ArrayList([]const u8) = .empty,
+
+    pub fn deinit(self: *ProfileCliOptions, allocator: std.mem.Allocator) void {
+        self.counts_files.deinit(allocator);
+    }
+};
+
 fn parseEstimateOptions(args: []const []const u8) !EstimateCliOptions {
     var opts = EstimateCliOptions{};
     var i: usize = 0;
@@ -489,6 +584,58 @@ fn parseEstimateOptions(args: []const []const u8) !EstimateCliOptions {
             }
         } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
             printEstimateUsageStderr();
+            std.process.exit(0);
+        } else if (arg.len > 0 and arg[0] != '-') {
+            opts.input_file = arg;
+        } else {
+            std.debug.print("Unknown option: {s}\n", .{arg});
+            std.process.exit(1);
+        }
+    }
+
+    return opts;
+}
+
+fn parseProfileOptions(allocator: std.mem.Allocator, args: []const []const u8) !ProfileCliOptions {
+    var opts = ProfileCliOptions{};
+    var i: usize = 0;
+
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "-o") or std.mem.eql(u8, arg, "--output")) {
+            i += 1;
+            if (i < args.len) {
+                opts.output_file = args[i];
+            } else {
+                std.debug.print("Error: -o requires an argument\n", .{});
+                std.process.exit(1);
+            }
+        } else if (std.mem.eql(u8, arg, "--map")) {
+            i += 1;
+            if (i < args.len) {
+                opts.map_file = args[i];
+            } else {
+                std.debug.print("Error: --map requires a file\n", .{});
+                std.process.exit(1);
+            }
+        } else if (std.mem.eql(u8, arg, "--profile-out")) {
+            i += 1;
+            if (i < args.len) {
+                opts.profile_out = args[i];
+            } else {
+                std.debug.print("Error: --profile-out requires a file\n", .{});
+                std.process.exit(1);
+            }
+        } else if (std.mem.eql(u8, arg, "--counts")) {
+            i += 1;
+            if (i < args.len) {
+                try opts.counts_files.append(allocator, args[i]);
+            } else {
+                std.debug.print("Error: --counts requires a file\n", .{});
+                std.process.exit(1);
+            }
+        } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
+            printProfileUsageStderr();
             std.process.exit(0);
         } else if (arg.len > 0 and arg[0] != '-') {
             opts.input_file = arg;
@@ -729,6 +876,7 @@ fn printUsageStderr() void {
         \\    compile     Compile Zig to Yul intermediate language
         \\    build       Compile Zig to EVM bytecode (requires solc)
         \\    estimate    Estimate gas; supports profile overrides
+        \\    profile     Instrument Yul and aggregate profile counts
         \\    decode-event Decode EVM event logs
         \\    decode-abi  Decode ABI-encoded data
         \\    version     Print version information
@@ -742,6 +890,25 @@ fn printUsageStderr() void {
         \\    --profile <file>       Profile counts JSON (estimate only)
         \\    --evm-version <name>   EVM version (estimate only)
         \\    -h, --help             Print help message
+        \\
+        \\EXAMPLES:
+        \\    # Compile to Yul
+        \\    zig-to-yul compile token.zig -o token.yul
+        \\
+        \\    # Build to EVM bytecode (deploy-ready)
+        \\    zig-to-yul build token.zig -o token.bin
+        \\
+        \\    # Build with optimization
+        \\    zig-to-yul build -O token.zig
+        \\
+        \\    # Decode an event log
+        \\    zig-to-yul decode-event --event Transfer --param from:address:indexed \\
+        \\      --param to:address:indexed --param value:uint256 --topic 0x... --data 0x...
+        \\
+        \\    # Decode ABI data
+        \\    zig-to-yul decode-abi --type uint256 --type string --data 0x...
+        \\
+        \\For more information, visit: https://github.com/example/zig-to-yul
         \\
     , .{version});
 }
@@ -827,6 +994,20 @@ fn printEstimateUsageStderr() void {
     , .{});
 }
 
+fn printProfileUsageStderr() void {
+    std.debug.print(
+        \\USAGE: zig-to-yul profile [options] <input.zig>
+        \\
+        \\OPTIONS:
+        \\    -o, --output <file>      Write instrumented Yul to <file>
+        \\    --map <file>            Write profile map JSON to <file>
+        \\    --counts <file>         Raw counter JSON (repeatable)
+        \\    --profile-out <file>    Write aggregated profile.json
+        \\    -h, --help              Print help
+        \\
+    , .{});
+}
+
 fn printVersionStdout() void {
     std.debug.print("zig-to-yul {s}\n", .{version});
 }
@@ -842,6 +1023,7 @@ fn printUsageTo(writer: anytype) !void {
         \\    compile     Compile Zig to Yul intermediate language
         \\    build       Compile Zig to EVM bytecode (requires solc)
         \\    estimate    Estimate gas; supports profile overrides
+        \\    profile     Instrument Yul and aggregate profile counts
         \\    decode-event Decode EVM event logs
         \\    decode-abi  Decode ABI-encoded data
         \\    version     Print version information
