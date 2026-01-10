@@ -117,6 +117,7 @@ pub fn parseBranchOverridesJson(allocator: std.mem.Allocator, json: []const u8) 
             start: u32,
             end: u32,
             mode: []const u8,
+            prob: ?f64 = null,
             weight_num: ?u64 = null,
             weight_den: ?u64 = null,
         };
@@ -127,12 +128,20 @@ pub fn parseBranchOverridesJson(allocator: std.mem.Allocator, json: []const u8) 
 
     var out = try allocator.alloc(BranchOverride, parsed.value.items.len);
     for (parsed.value.items, 0..) |item, i| {
+        var weight_num: u64 = item.weight_num orelse 1;
+        var weight_den: u64 = item.weight_den orelse 2;
+        if (item.prob) |prob| {
+            const scaled = @as(u64, @intFromFloat(std.math.clamp(prob, 0.0, 1.0) * 1000.0));
+            weight_num = scaled;
+            weight_den = 1000;
+        }
         out[i] = .{
             .start = item.start,
             .end = item.end,
             .mode = try parseBranchMode(item.mode),
-            .weight_num = item.weight_num orelse 1,
-            .weight_den = item.weight_den orelse 2,
+            .prob = item.prob,
+            .weight_num = weight_num,
+            .weight_den = weight_den,
         };
     }
     return out;
@@ -146,6 +155,7 @@ pub fn parseSwitchOverridesJson(allocator: std.mem.Allocator, json: []const u8) 
             start: u32,
             end: u32,
             mode: []const u8,
+            prob: ?f64 = null,
             weight_num: ?u64 = null,
             weight_den: ?u64 = null,
         };
@@ -156,12 +166,20 @@ pub fn parseSwitchOverridesJson(allocator: std.mem.Allocator, json: []const u8) 
 
     var out = try allocator.alloc(SwitchOverride, parsed.value.items.len);
     for (parsed.value.items, 0..) |item, i| {
+        var weight_num: u64 = item.weight_num orelse 1;
+        var weight_den: u64 = item.weight_den orelse 2;
+        if (item.prob) |prob| {
+            const scaled = @as(u64, @intFromFloat(std.math.clamp(prob, 0.0, 1.0) * 1000.0));
+            weight_num = scaled;
+            weight_den = 1000;
+        }
         out[i] = .{
             .start = item.start,
             .end = item.end,
             .mode = try parseSwitchMode(item.mode),
-            .weight_num = item.weight_num orelse 1,
-            .weight_den = item.weight_den orelse 2,
+            .prob = item.prob,
+            .weight_num = weight_num,
+            .weight_den = weight_den,
         };
     }
     return out;
@@ -206,6 +224,7 @@ pub const BranchOverride = struct {
     start: u32,
     end: u32,
     mode: BranchMode,
+    prob: ?f64 = null,
     weight_num: u64 = 1,
     weight_den: u64 = 2,
 };
@@ -214,19 +233,33 @@ pub const SwitchOverride = struct {
     start: u32,
     end: u32,
     mode: SwitchMode,
+    prob: ?f64 = null,
     weight_num: u64 = 1,
     weight_den: u64 = 2,
 };
 
 pub fn optionsForVersion(version: ast.EvmVersion) EstimateOptions {
     return switch (version) {
-        .homestead, .tangerine_whistle, .spurious_dragon, .byzantium, .constantinople, .petersburg, .istanbul => .{
+        .homestead,
+        .tangerine_whistle,
+        .spurious_dragon,
+        .byzantium,
+        .constantinople,
+        .petersburg,
+        .istanbul,
+        => .{
             .refund_sstore_clear = 15000,
             .refund_selfdestruct = 24000,
             .max_refund_divisor = 2,
             .base_access_list_costs = false,
         },
-        .berlin, .london, .paris, .shanghai, .cancun, .prague => .{
+        .berlin => .{
+            .refund_sstore_clear = 15000,
+            .refund_selfdestruct = 24000,
+            .max_refund_divisor = 2,
+            .base_access_list_costs = true,
+        },
+        .london, .paris, .shanghai, .cancun, .prague => .{
             .refund_sstore_clear = 4800,
             .refund_selfdestruct = 0,
             .max_refund_divisor = 5,
@@ -1347,7 +1380,7 @@ test "parse branch overrides json" {
     const allocator = std.testing.allocator;
     const input =
         \\{ "items": [
-        \\  { "start": 1, "end": 2, "mode": "assume_false", "weight_num": 1, "weight_den": 4 }
+        \\  { "start": 1, "end": 2, "mode": "assume_false", "prob": 0.25 }
         \\] }
     ;
 
@@ -1358,8 +1391,8 @@ test "parse branch overrides json" {
     try std.testing.expectEqual(@as(u32, 1), overrides[0].start);
     try std.testing.expectEqual(@as(u32, 2), overrides[0].end);
     try std.testing.expect(overrides[0].mode == .assume_false);
-    try std.testing.expectEqual(@as(u64, 1), overrides[0].weight_num);
-    try std.testing.expectEqual(@as(u64, 4), overrides[0].weight_den);
+    try std.testing.expectEqual(@as(u64, 250), overrides[0].weight_num);
+    try std.testing.expectEqual(@as(u64, 1000), overrides[0].weight_den);
 }
 
 test "estimate branch override" {
