@@ -91,6 +91,9 @@ pub const Optimizer = struct {
             if (try self.mergePackedSstoreSequence(combined.items, &j, &merged)) {
                 continue;
             }
+            if (try self.mergeCalldataKeccakSequence(combined.items, &j, &merged)) {
+                continue;
+            }
             try merged.append(self.allocator, combined.items[j]);
             j += 1;
         }
@@ -325,6 +328,129 @@ pub const Optimizer = struct {
 
         index.* = end;
         return true;
+    }
+
+    const CalldataMstore = struct {
+        dest_base: ast.Expression,
+        src_base: ast.Expression,
+        dest_offset: ast.U256,
+        src_offset: ast.U256,
+    };
+
+    const KeccakStmt = struct {
+        stmt: ast.Statement,
+        ptr: ast.Expression,
+        len: ast.Expression,
+    };
+
+    fn mergeCalldataKeccakSequence(
+        self: *Optimizer,
+        stmts: []const ast.Statement,
+        index: *usize,
+        out: *std.ArrayList(ast.Statement),
+    ) Error!bool {
+        const first = parseCalldataMstore(stmts[index.*]) orelse return false;
+
+        var end = index.*;
+        var count: ast.U256 = 0;
+        var expected_offset: ast.U256 = first.dest_offset;
+        var expected_src_offset: ast.U256 = first.src_offset;
+
+        while (end < stmts.len) : (end += 1) {
+            const entry = parseCalldataMstore(stmts[end]) orelse break;
+            if (!exprEqualsSimple(entry.dest_base, first.dest_base)) break;
+            if (!exprEqualsSimple(entry.src_base, first.src_base)) break;
+            if (entry.dest_offset != expected_offset) break;
+            if (entry.src_offset != expected_src_offset) break;
+            count += 1;
+            expected_offset += 32;
+            expected_src_offset += 32;
+        }
+
+        if (count < 2) return false;
+        if (end >= stmts.len) return false;
+
+        const keccak = parseKeccakStatement(stmts[end]) orelse return false;
+        const len_literal = literalU256(keccak.len) orelse return false;
+        if (len_literal != count * 32) return false;
+        if (!exprEqualsSimple(keccak.ptr, first.dest_base)) return false;
+
+        const copy_call = try self.builder.builtinCall("calldatacopy", &.{
+            first.dest_base,
+            first.src_base,
+            keccak.len,
+        });
+        try out.append(self.allocator, ast.Statement.expr(copy_call));
+        try out.append(self.allocator, keccak.stmt);
+
+        index.* = end + 1;
+        return true;
+    }
+
+    fn parseCalldataMstore(stmt: ast.Statement) ?CalldataMstore {
+        if (stmt != .expression_statement) return null;
+        const expr = stmt.expression_statement.expression;
+        if (expr != .builtin_call) return null;
+        const call = expr.builtin_call;
+        if (!std.mem.eql(u8, call.builtin_name.name, "mstore")) return null;
+        if (call.arguments.len != 2) return null;
+
+        const dest_info = splitBaseOffset(call.arguments[0]) orelse return null;
+        if (call.arguments[1] != .builtin_call) return null;
+        const load_call = call.arguments[1].builtin_call;
+        if (!std.mem.eql(u8, load_call.builtin_name.name, "calldataload")) return null;
+        if (load_call.arguments.len != 1) return null;
+        const src_info = splitBaseOffset(load_call.arguments[0]) orelse return null;
+
+        return .{
+            .dest_base = dest_info.base,
+            .src_base = src_info.base,
+            .dest_offset = dest_info.offset,
+            .src_offset = src_info.offset,
+        };
+    }
+
+    fn parseKeccakStatement(stmt: ast.Statement) ?KeccakStmt {
+        return switch (stmt) {
+            .expression_statement => |s| parseKeccakExpression(stmt, s.expression),
+            .assignment => |s| parseKeccakExpression(stmt, s.value),
+            .variable_declaration => |s| blk: {
+                if (s.value) |val| break :blk parseKeccakExpression(stmt, val);
+                break :blk null;
+            },
+            else => null,
+        };
+    }
+
+    fn parseKeccakExpression(stmt: ast.Statement, expr: ast.Expression) ?KeccakStmt {
+        if (expr != .builtin_call) return null;
+        const call = expr.builtin_call;
+        if (!std.mem.eql(u8, call.builtin_name.name, "keccak256")) return null;
+        if (call.arguments.len != 2) return null;
+        return .{ .stmt = stmt, .ptr = call.arguments[0], .len = call.arguments[1] };
+    }
+
+    const BaseOffset = struct {
+        base: ast.Expression,
+        offset: ast.U256,
+    };
+
+    fn splitBaseOffset(expr: ast.Expression) ?BaseOffset {
+        if (literalU256(expr)) |value| {
+            return .{ .base = ast.Expression.lit(ast.Literal.number(0)), .offset = value };
+        }
+        if (expr != .builtin_call) return null;
+        const call = expr.builtin_call;
+        if (!std.mem.eql(u8, call.builtin_name.name, "add")) return null;
+        if (call.arguments.len != 2) return null;
+
+        if (literalU256(call.arguments[0])) |offset| {
+            return .{ .base = call.arguments[1], .offset = offset };
+        }
+        if (literalU256(call.arguments[1])) |offset| {
+            return .{ .base = call.arguments[0], .offset = offset };
+        }
+        return null;
     }
 
     fn parsePackedSstore(stmt: ast.Statement) ?PackedWrite {
@@ -784,6 +910,41 @@ test "normalize condition to boolean" {
     try std.testing.expect(call.arguments.len == 1);
     try std.testing.expect(call.arguments[0] == .builtin_call);
     try std.testing.expectEqualStrings("iszero", call.arguments[0].builtin_call.builtin_name.name);
+}
+
+test "optimize calldata hash copy" {
+    const allocator = std.testing.allocator;
+    var builder = ast.AstBuilder.init(allocator);
+    defer builder.deinit();
+
+    const mstore0 = ast.Statement.expr(ast.Expression.builtinCall("mstore", &.{
+        ast.Expression.lit(ast.Literal.number(0)),
+        ast.Expression.builtinCall("calldataload", &.{ast.Expression.lit(ast.Literal.number(4))}),
+    }));
+    const mstore1 = ast.Statement.expr(ast.Expression.builtinCall("mstore", &.{
+        ast.Expression.lit(ast.Literal.number(32)),
+        ast.Expression.builtinCall("calldataload", &.{ast.Expression.lit(ast.Literal.number(36))}),
+    }));
+    const hash_expr = ast.Expression.builtinCall("keccak256", &.{
+        ast.Expression.lit(ast.Literal.number(0)),
+        ast.Expression.lit(ast.Literal.number(64)),
+    });
+    const hash_decl = try builder.varDecl(&.{"h"}, hash_expr);
+
+    const code_block = ast.Block.init(try builder.dupeStatements(&.{ mstore0, mstore1, hash_decl }));
+    const obj = ast.Object.init("Opt", code_block, &.{}, &.{});
+    const root = ast.AST.init(obj);
+
+    var opt = Optimizer.init(allocator);
+    defer opt.deinit();
+    const optimized = try opt.optimize(root);
+    try std.testing.expectEqual(@as(usize, 2), optimized.root.code.statements.len);
+
+    const stmt = optimized.root.code.statements[0];
+    try std.testing.expect(stmt == .expression_statement);
+    const expr = stmt.expression_statement.expression;
+    try std.testing.expect(expr == .builtin_call);
+    try std.testing.expectEqualStrings("calldatacopy", expr.builtin_call.builtin_name.name);
 }
 
 test "merge packed sstore sequence" {
