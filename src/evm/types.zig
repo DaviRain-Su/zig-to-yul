@@ -328,6 +328,61 @@ pub fn Mapping(comptime Key: type, comptime Value: type) type {
     };
 }
 
+/// Defines a Solidity-style dynamic array type for contracts.
+pub fn Array(comptime Element: type) type {
+    return struct {
+        pub const ElementType = Element;
+        const Self = @This();
+
+        pub fn len(self: *Self) U256 {
+            _ = self;
+            return 0;
+        }
+
+        pub fn isEmpty(self: *Self) bool {
+            _ = self;
+            return true;
+        }
+
+        pub fn count(self: *Self) U256 {
+            _ = self;
+            return 0;
+        }
+
+        pub fn get(self: *Self, index: U256) Element {
+            _ = self;
+            _ = index;
+            return undefined;
+        }
+
+        pub fn set(self: *Self, index: U256, value: Element) void {
+            _ = self;
+            _ = index;
+            _ = value;
+        }
+
+        pub fn push(self: *Self, value: Element) void {
+            _ = self;
+            _ = value;
+        }
+
+        pub fn pop(self: *Self) Element {
+            _ = self;
+            return undefined;
+        }
+
+        pub fn remove(self: *Self, index: U256) Element {
+            _ = self;
+            _ = index;
+            return undefined;
+        }
+
+        pub fn clear(self: *Self) void {
+            _ = self;
+        }
+    };
+}
+
 /// Alias for convenience
 pub const Word = U256;
 
@@ -503,28 +558,50 @@ pub const TypeMapper = struct {
 
         const evm_type = try self.allocator.create(EvmType);
 
-        // Primitive type mappings
-        if (std.mem.eql(u8, zig_type, "u256") or std.mem.eql(u8, zig_type, "evm.u256")) {
-            evm_type.* = .uint256;
-        } else if (std.mem.eql(u8, zig_type, "i256") or std.mem.eql(u8, zig_type, "evm.i256")) {
-            evm_type.* = .int256;
-        } else if (std.mem.eql(u8, zig_type, "bool")) {
-            evm_type.* = .bool_;
-        } else if (std.mem.eql(u8, zig_type, "Address") or std.mem.eql(u8, zig_type, "evm.Address")) {
-            evm_type.* = .address;
-        } else if (std.mem.startsWith(u8, zig_type, "u")) {
-            // Handle smaller uint types - they get promoted to u256
-            evm_type.* = .uint256;
-        } else if (std.mem.startsWith(u8, zig_type, "i")) {
-            // Handle smaller int types - they get promoted to i256
-            evm_type.* = .int256;
+        if (parseArrayTypeName(zig_type)) |elem_type| {
+            const elem = try self.mapZigType(elem_type);
+            evm_type.* = .{ .dynamic_array = elem };
         } else {
-            // Unknown type - default to uint256 for now
-            evm_type.* = .uint256;
+            // Primitive type mappings
+            if (std.mem.eql(u8, zig_type, "u256") or std.mem.eql(u8, zig_type, "evm.u256")) {
+                evm_type.* = .uint256;
+            } else if (std.mem.eql(u8, zig_type, "i256") or std.mem.eql(u8, zig_type, "evm.i256")) {
+                evm_type.* = .int256;
+            } else if (std.mem.eql(u8, zig_type, "bool")) {
+                evm_type.* = .bool_;
+            } else if (std.mem.eql(u8, zig_type, "Address") or std.mem.eql(u8, zig_type, "evm.Address")) {
+                evm_type.* = .address;
+            } else if (std.mem.startsWith(u8, zig_type, "u")) {
+                // Handle smaller uint types - they get promoted to u256
+                evm_type.* = .uint256;
+            } else if (std.mem.startsWith(u8, zig_type, "i")) {
+                // Handle smaller int types - they get promoted to i256
+                evm_type.* = .int256;
+            } else {
+                // Unknown type - default to uint256 for now
+                evm_type.* = .uint256;
+            }
         }
 
         try self.type_cache.put(try self.allocator.dupe(u8, zig_type), evm_type);
         return evm_type;
+    }
+
+    fn parseArrayTypeName(type_name: []const u8) ?[]const u8 {
+        const trimmed = std.mem.trim(u8, type_name, " \t\r\n");
+        const prefix: []const u8 = blk: {
+            if (std.mem.startsWith(u8, trimmed, "evm.Array(")) {
+                break :blk "evm.Array(";
+            } else if (std.mem.startsWith(u8, trimmed, "Array(")) {
+                break :blk "Array(";
+            } else if (std.mem.startsWith(u8, trimmed, "evm.types.Array(")) {
+                break :blk "evm.types.Array(";
+            }
+            return null;
+        };
+        const end = if (std.mem.endsWith(u8, trimmed, ")")) trimmed.len - 1 else return null;
+        const inner = std.mem.trim(u8, trimmed[prefix.len..end], " \t\r\n");
+        return if (inner.len > 0) inner else null;
     }
 };
 
@@ -672,4 +749,19 @@ test "mapping iterator api" {
     const remove_info = mapping.removeOrNullInfo(0);
     _ = remove_info.removed();
     _ = remove_info.getValue();
+}
+
+test "array api" {
+    const Arr = Array(U256);
+    var arr: Arr = .{};
+
+    _ = arr.len();
+    _ = arr.isEmpty();
+    _ = arr.count();
+    _ = arr.get(0);
+    arr.set(0, 1);
+    arr.push(1);
+    _ = arr.pop();
+    _ = arr.remove(0);
+    arr.clear();
 }
