@@ -13,6 +13,8 @@ const symbols = @import("../sema/symbols.zig");
 const evm_types = @import("../evm/types.zig");
 const evm_storage = @import("../evm/storage.zig");
 const builtins = @import("../evm/builtins.zig");
+const transformer_types = @import("transformer/types.zig");
+const transformer_storage = @import("transformer/storage.zig");
 
 const MappingRefTypeInfo = struct {
     key_type: []const u8,
@@ -1158,24 +1160,7 @@ pub const Transformer = struct {
 
     /// Map Zig types to Solidity ABI types
     fn mapZigTypeToAbi(zig_type: []const u8) []const u8 {
-        if (std.mem.eql(u8, zig_type, "u256")) return "uint256";
-        if (std.mem.eql(u8, zig_type, "u128")) return "uint128";
-        if (std.mem.eql(u8, zig_type, "u64")) return "uint64";
-        if (std.mem.eql(u8, zig_type, "u32")) return "uint32";
-        if (std.mem.eql(u8, zig_type, "u8")) return "uint8";
-        if (std.mem.eql(u8, zig_type, "bool")) return "bool";
-        if (std.mem.eql(u8, zig_type, "Address") or std.mem.eql(u8, zig_type, "evm.Address")) return "address";
-        if (std.mem.eql(u8, zig_type, "[20]u8")) return "address";
-        if (std.mem.eql(u8, zig_type, "[32]u8")) return "bytes32";
-        if (std.mem.eql(u8, zig_type, "[]u8")) return "bytes";
-        if (std.mem.eql(u8, zig_type, "[]const u8")) return "string";
-        if (std.mem.eql(u8, zig_type, "BytesBuilder") or std.mem.eql(u8, zig_type, "evm.BytesBuilder") or std.mem.eql(u8, zig_type, "evm.types.BytesBuilder")) return "bytes";
-        if (std.mem.eql(u8, zig_type, "StringBuilder") or std.mem.eql(u8, zig_type, "evm.StringBuilder") or std.mem.eql(u8, zig_type, "evm.types.StringBuilder")) return "string";
-        if (std.mem.startsWith(u8, zig_type, "[]")) {
-            return "uint256[]";
-        }
-        // Default to uint256 for unknown types
-        return "uint256";
+        return transformer_types.mapZigTypeToAbi(zig_type);
     }
 
     fn yulTypeNameForZig(self: *Self, zig_type: []const u8) []const u8 {
@@ -1186,11 +1171,11 @@ pub const Transformer = struct {
     }
 
     fn isDynamicAbiType(abi: []const u8) bool {
-        return std.mem.eql(u8, abi, "bytes") or std.mem.eql(u8, abi, "string") or std.mem.endsWith(u8, abi, "[]");
+        return transformer_types.isDynamicAbiType(abi);
     }
 
     fn isDynamicArrayAbiType(abi: []const u8) bool {
-        return std.mem.endsWith(u8, abi, "[]");
+        return transformer_types.isDynamicArrayAbiType(abi);
     }
 
     fn generateFunction(
@@ -9523,26 +9508,7 @@ pub const Transformer = struct {
     }
 
     fn storageTypeSizeBits(type_name: []const u8) u16 {
-        const trimmed = std.mem.trim(u8, type_name, " \t\r\n");
-        if (std.mem.startsWith(u8, trimmed, "evm.Array(") or std.mem.startsWith(u8, trimmed, "Array(") or std.mem.startsWith(u8, trimmed, "evm.types.Array(")) return 256;
-        if (std.mem.startsWith(u8, trimmed, "evm.Mapping(") or std.mem.startsWith(u8, trimmed, "Mapping(") or std.mem.startsWith(u8, trimmed, "evm.types.Mapping(")) return 256;
-        if (std.mem.startsWith(u8, trimmed, "evm.Set(") or std.mem.startsWith(u8, trimmed, "Set(") or std.mem.startsWith(u8, trimmed, "evm.types.Set(")) return 256;
-        if (std.mem.startsWith(u8, trimmed, "evm.Deque(") or std.mem.startsWith(u8, trimmed, "Deque(") or std.mem.startsWith(u8, trimmed, "evm.types.Deque(") or std.mem.startsWith(u8, trimmed, "evm.Queue(") or std.mem.startsWith(u8, trimmed, "Queue(") or std.mem.startsWith(u8, trimmed, "evm.types.Queue(")) return 256;
-        if (std.mem.startsWith(u8, trimmed, "evm.Stack(") or std.mem.startsWith(u8, trimmed, "Stack(") or std.mem.startsWith(u8, trimmed, "evm.types.Stack(")) return 256;
-        if (std.mem.startsWith(u8, trimmed, "evm.Option(") or std.mem.startsWith(u8, trimmed, "Option(") or std.mem.startsWith(u8, trimmed, "evm.types.Option(")) return 256;
-        if (std.mem.startsWith(u8, trimmed, "evm.EnumMap(") or std.mem.startsWith(u8, trimmed, "EnumMap(") or std.mem.startsWith(u8, trimmed, "evm.types.EnumMap(")) return 256;
-        if (std.mem.startsWith(u8, trimmed, "evm.PackedStruct(") or std.mem.startsWith(u8, trimmed, "PackedStruct(") or std.mem.startsWith(u8, trimmed, "evm.types.PackedStruct(")) return 256;
-        if (std.mem.eql(u8, trimmed, "evm.BytesBuilder") or std.mem.eql(u8, trimmed, "BytesBuilder") or std.mem.eql(u8, trimmed, "evm.types.BytesBuilder")) return 256;
-        if (std.mem.eql(u8, trimmed, "evm.StringBuilder") or std.mem.eql(u8, trimmed, "StringBuilder") or std.mem.eql(u8, trimmed, "evm.types.StringBuilder")) return 256;
-        if (std.mem.eql(u8, type_name, "bool")) return 8;
-        if (std.mem.eql(u8, type_name, "u8")) return 8;
-        if (std.mem.eql(u8, type_name, "u16")) return 16;
-        if (std.mem.eql(u8, type_name, "u32")) return 32;
-        if (std.mem.eql(u8, type_name, "u64")) return 64;
-        if (std.mem.eql(u8, type_name, "u128")) return 128;
-        if (std.mem.eql(u8, type_name, "u256") or std.mem.eql(u8, type_name, "U256") or std.mem.eql(u8, type_name, "evm.U256") or std.mem.eql(u8, type_name, "evm.u256")) return 256;
-        if (std.mem.eql(u8, type_name, "Address") or std.mem.eql(u8, type_name, "evm.Address") or std.mem.eql(u8, type_name, "[20]u8")) return 160;
-        return 256;
+        return transformer_storage.storageTypeSizeBits(type_name);
     }
 
     fn appendStructStorageVars(self: *Self, base_name: []const u8, struct_name: []const u8, base_slot: evm_types.U256) !evm_types.U256 {
