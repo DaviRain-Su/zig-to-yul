@@ -567,6 +567,28 @@ pub fn EnumMap(comptime Key: type, comptime Value: type) type {
     };
 }
 
+/// Defines a packed struct wrapper for compact storage.
+pub fn PackedStruct(comptime StructType: type) type {
+    return struct {
+        pub const ElementType = StructType;
+        const Self = @This();
+
+        pub fn get(self: *Self) StructType {
+            _ = self;
+            return undefined;
+        }
+
+        pub fn set(self: *Self, value: StructType) void {
+            _ = self;
+            _ = value;
+        }
+
+        pub fn clear(self: *Self) void {
+            _ = self;
+        }
+    };
+}
+
 /// Defines a storage-backed bytes builder for incremental appends.
 pub const BytesBuilder = struct {
     const Self = @This();
@@ -1346,6 +1368,16 @@ test "enum map api" {
     _ = map.len();
     _ = map.isEmpty();
     map.clear();
+}
+
+test "packed struct api" {
+    const Point = struct { x: u8, y: u16 };
+    const Packed = PackedStruct(Point);
+    var packed_value: Packed = .{};
+
+    _ = packed_value.get();
+    packed_value.set(.{ .x = 1, .y = 2 });
+    packed_value.clear();
 }
 
 test "bytes builder api" {

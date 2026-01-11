@@ -89,6 +89,8 @@ pub const Transformer = struct {
         enum_value_type: ?[]const u8,
         enum_key_limit: ?evm_types.U256,
         enum_variant_count: ?evm_types.U256,
+        is_packed_struct: bool,
+        packed_struct_name: ?[]const u8,
     };
 
     pub const StructFieldDef = struct {
@@ -825,6 +827,32 @@ pub const Transformer = struct {
         return info.value;
     }
 
+    fn parsePackedStructType(self: *Self, type_name: []const u8) ?[]const u8 {
+        _ = self;
+        const trimmed = std.mem.trim(u8, type_name, " \t\r\n");
+        const prefix: []const u8 = blk: {
+            if (std.mem.startsWith(u8, trimmed, "evm.PackedStruct(")) {
+                break :blk "evm.PackedStruct(";
+            } else if (std.mem.startsWith(u8, trimmed, "PackedStruct(")) {
+                break :blk "PackedStruct(";
+            } else if (std.mem.startsWith(u8, trimmed, "evm.types.PackedStruct(")) {
+                break :blk "evm.types.PackedStruct(";
+            }
+            return null;
+        };
+        const end = if (std.mem.endsWith(u8, trimmed, ")")) trimmed.len - 1 else return null;
+        const inner = std.mem.trim(u8, trimmed[prefix.len..end], " \t\r\n");
+        return if (inner.len > 0) inner else null;
+    }
+
+    fn isPackedStructTypeName(self: *Self, type_name: []const u8) bool {
+        return self.parsePackedStructType(type_name) != null;
+    }
+
+    fn packedStructTypeName(self: *Self, type_name: []const u8) ?[]const u8 {
+        return self.parsePackedStructType(type_name);
+    }
+
     fn isBytesBuilderTypeName(self: *Self, type_name: []const u8) bool {
         _ = self;
         const trimmed = std.mem.trim(u8, type_name, " \t\r\n");
@@ -888,6 +916,12 @@ pub const Transformer = struct {
     fn abiTypeForZig(self: *Self, zig_type: []const u8) Allocator.Error![]const u8 {
         if (self.struct_defs.get(zig_type)) |fields| {
             return try self.buildTupleAbi(fields);
+        }
+        if (self.parsePackedStructType(zig_type)) |inner| {
+            if (self.struct_defs.get(inner)) |fields| {
+                return try self.buildTupleAbi(fields);
+            }
+            return mapZigTypeToAbi(inner);
         }
         return mapZigTypeToAbi(zig_type);
     }
@@ -3380,6 +3414,9 @@ pub const Transformer = struct {
         if (try self.translateEnumMapMethod(call_info.ast.fn_expr, args.items, self.nodeLocation(index))) |expr| {
             return expr;
         }
+        if (try self.translatePackedStructMethod(call_info.ast.fn_expr, args.items, self.nodeLocation(index))) |expr| {
+            return expr;
+        }
         if (try self.translateArrayMethod(call_info.ast.fn_expr, args.items, self.nodeLocation(index))) |expr| {
             return expr;
         }
@@ -4733,6 +4770,66 @@ pub const Transformer = struct {
         return null;
     }
 
+    fn translatePackedStructMethod(
+        self: *Self,
+        fn_expr: ZigAst.Node.Index,
+        args: []const ast.Expression,
+        loc: ast.SourceLocation,
+    ) TransformProcessError!?ast.Expression {
+        const p = &self.zig_parser.?;
+        if (p.getNodeTag(fn_expr) != .field_access) return null;
+
+        const data = p.ast.nodeData(fn_expr).node_and_token;
+        const obj_node = data[0];
+        const method_name = p.getIdentifier(data[1]);
+
+        const is_get = std.mem.eql(u8, method_name, "get");
+        const is_set = std.mem.eql(u8, method_name, "set");
+        const is_clear = std.mem.eql(u8, method_name, "clear");
+        if (!is_get and !is_set and !is_clear) return null;
+
+        const sv = self.packedStructStorageVarForNode(obj_node) orelse return null;
+        const struct_name = sv.packed_struct_name orelse {
+            try self.addError("packed struct type missing; declare evm.PackedStruct(Struct)", loc, .unsupported_feature);
+            return null;
+        };
+        const fields = self.struct_defs.get(struct_name) orelse {
+            try self.addError("unknown packed struct type", loc, .unsupported_feature);
+            return null;
+        };
+
+        const base_slot_expr = ast.Expression.lit(ast.Literal.number(sv.slot));
+
+        if (is_get) {
+            if (args.len != 0) {
+                try self.addError("packed struct get expects no arguments", loc, .unsupported_feature);
+                return null;
+            }
+            const helper = try self.ensureMappingStructGetHelper(struct_name, fields);
+            return try self.builder.call(helper, &.{base_slot_expr});
+        }
+
+        if (is_set) {
+            if (args.len != 1) {
+                try self.addError("packed struct set expects value", loc, .unsupported_feature);
+                return null;
+            }
+            const helper = try self.ensureMappingStructSetHelper(struct_name, fields);
+            return try self.builder.call(helper, &.{ base_slot_expr, args[0] });
+        }
+
+        if (is_clear) {
+            if (args.len != 0) {
+                try self.addError("packed struct clear expects no arguments", loc, .unsupported_feature);
+                return null;
+            }
+            const helper = try self.ensureMappingStructClearHelper(struct_name, fields);
+            return try self.builder.call(helper, &.{base_slot_expr});
+        }
+
+        return null;
+    }
+
     fn translateArrayAccess(self: *Self, index: ZigAst.Node.Index) TransformProcessError!ast.Expression {
         const p = &self.zig_parser.?;
         const data = p.ast.nodeData(index).node_and_node;
@@ -5510,6 +5607,36 @@ pub const Transformer = struct {
                     const base_name = obj_src["self.".len..];
                     if (self.storageVarForNested(base_name, field_name)) |sv| {
                         if (sv.is_enum_map) return sv;
+                    }
+                }
+            },
+            else => {},
+        }
+        return null;
+    }
+
+    fn packedStructStorageVarForNode(self: *Self, node: ZigAst.Node.Index) ?StorageVar {
+        const p = &self.zig_parser.?;
+        const tag = p.getNodeTag(node);
+        switch (tag) {
+            .identifier => {
+                const name = p.getNodeSource(node);
+                if (self.storageVarByName(name)) |sv| {
+                    if (sv.is_packed_struct) return sv;
+                }
+            },
+            .field_access => {
+                const data = p.ast.nodeData(node).node_and_token;
+                const obj_src = p.getNodeSource(data[0]);
+                const field_name = p.getIdentifier(data[1]);
+                if (std.mem.eql(u8, obj_src, "self")) {
+                    if (self.storageVarByName(field_name)) |sv| {
+                        if (sv.is_packed_struct) return sv;
+                    }
+                } else if (std.mem.startsWith(u8, obj_src, "self.")) {
+                    const base_name = obj_src["self.".len..];
+                    if (self.storageVarForNested(base_name, field_name)) |sv| {
+                        if (sv.is_packed_struct) return sv;
                     }
                 }
             },
@@ -9404,6 +9531,7 @@ pub const Transformer = struct {
         if (std.mem.startsWith(u8, trimmed, "evm.Stack(") or std.mem.startsWith(u8, trimmed, "Stack(") or std.mem.startsWith(u8, trimmed, "evm.types.Stack(")) return 256;
         if (std.mem.startsWith(u8, trimmed, "evm.Option(") or std.mem.startsWith(u8, trimmed, "Option(") or std.mem.startsWith(u8, trimmed, "evm.types.Option(")) return 256;
         if (std.mem.startsWith(u8, trimmed, "evm.EnumMap(") or std.mem.startsWith(u8, trimmed, "EnumMap(") or std.mem.startsWith(u8, trimmed, "evm.types.EnumMap(")) return 256;
+        if (std.mem.startsWith(u8, trimmed, "evm.PackedStruct(") or std.mem.startsWith(u8, trimmed, "PackedStruct(") or std.mem.startsWith(u8, trimmed, "evm.types.PackedStruct(")) return 256;
         if (std.mem.eql(u8, trimmed, "evm.BytesBuilder") or std.mem.eql(u8, trimmed, "BytesBuilder") or std.mem.eql(u8, trimmed, "evm.types.BytesBuilder")) return 256;
         if (std.mem.eql(u8, trimmed, "evm.StringBuilder") or std.mem.eql(u8, trimmed, "StringBuilder") or std.mem.eql(u8, trimmed, "evm.types.StringBuilder")) return 256;
         if (std.mem.eql(u8, type_name, "bool")) return 8;
@@ -9465,6 +9593,8 @@ pub const Transformer = struct {
                     try self.enumMapCounts(enum_key_type.?, .none)
                 else
                     EnumCounts{ .key_limit = 1, .variant_count = 0 };
+                const is_packed_struct = self.isPackedStructTypeName(field_type);
+                const packed_struct_name = if (is_packed_struct) self.packedStructTypeName(field_type) else null;
                 const is_bytes_builder = self.isBytesBuilderTypeName(field_type);
                 const is_string_builder = self.isStringBuilderTypeName(field_type);
                 try self.storage_vars.append(self.allocator, .{
@@ -9492,6 +9622,8 @@ pub const Transformer = struct {
                     .enum_value_type = enum_value_type,
                     .enum_key_limit = if (is_enum_map) enum_counts.key_limit else null,
                     .enum_variant_count = if (is_enum_map) enum_counts.variant_count else null,
+                    .is_packed_struct = is_packed_struct,
+                    .packed_struct_name = packed_struct_name,
                 });
                 if (is_set) {
                     slot_shift += 1;
@@ -9515,6 +9647,14 @@ pub const Transformer = struct {
                     if (enum_slots > 1) {
                         slot_shift += enum_slots - 1;
                         const final_slot = base_slot_index + enum_slots - 1;
+                        if (final_slot > max_slot) max_slot = final_slot;
+                    }
+                }
+                if (is_packed_struct) {
+                    const struct_slots = self.structStorageSlots(packed_struct_name orelse "") orelse 1;
+                    if (struct_slots > 1) {
+                        slot_shift += struct_slots - 1;
+                        const final_slot = base_slot_index + struct_slots - 1;
                         if (final_slot > max_slot) max_slot = final_slot;
                     }
                 }
@@ -9571,10 +9711,16 @@ pub const Transformer = struct {
                 try self.enumMapCounts(enum_key_type.?, .none)
             else
                 EnumCounts{ .key_limit = 1, .variant_count = 0 };
+            const is_packed_struct = self.isPackedStructTypeName(field.type_name);
+            const packed_struct_name = if (is_packed_struct) self.packedStructTypeName(field.type_name) else null;
+            const packed_struct_slots = if (is_packed_struct)
+                (self.structStorageSlots(packed_struct_name orelse "") orelse 1)
+            else
+                @as(evm_types.U256, 1);
             const is_bytes_builder = self.isBytesBuilderTypeName(field.type_name);
             const is_string_builder = self.isStringBuilderTypeName(field.type_name);
 
-            if (is_set or is_deque or is_stack or is_option or is_enum_map or is_bytes_builder or is_string_builder) {
+            if (is_set or is_deque or is_stack or is_option or is_enum_map or is_packed_struct or is_bytes_builder or is_string_builder) {
                 if (current_offset != 0) {
                     current_slot += 1;
                     current_offset = 0;
@@ -9604,6 +9750,8 @@ pub const Transformer = struct {
                     .enum_value_type = enum_value_type,
                     .enum_key_limit = if (is_enum_map) enum_counts.key_limit else null,
                     .enum_variant_count = if (is_enum_map) enum_counts.variant_count else null,
+                    .is_packed_struct = is_packed_struct,
+                    .packed_struct_name = packed_struct_name,
                 });
                 if (is_deque) {
                     current_slot += 3;
@@ -9613,6 +9761,8 @@ pub const Transformer = struct {
                     const elem_slots = self.arrayElementSlots(enum_value_type orelse "u256");
                     const enum_slots = self.enumMapSlotCount(enum_counts.key_limit, elem_slots);
                     current_slot += enum_slots;
+                } else if (is_packed_struct) {
+                    current_slot += packed_struct_slots;
                 } else {
                     current_slot += 1;
                 }
@@ -9656,6 +9806,8 @@ pub const Transformer = struct {
                 .enum_value_type = null,
                 .enum_key_limit = null,
                 .enum_variant_count = null,
+                .is_packed_struct = false,
+                .packed_struct_name = null,
             });
 
             current_offset += field_bits;

@@ -273,6 +273,7 @@ pub const StoragePacker = struct {
         if (std.mem.startsWith(u8, type_name, "evm.Stack(") or std.mem.startsWith(u8, type_name, "Stack(") or std.mem.startsWith(u8, type_name, "evm.types.Stack(")) return 256;
         if (std.mem.startsWith(u8, type_name, "evm.Option(") or std.mem.startsWith(u8, type_name, "Option(") or std.mem.startsWith(u8, type_name, "evm.types.Option(")) return 256;
         if (std.mem.startsWith(u8, type_name, "evm.EnumMap(") or std.mem.startsWith(u8, type_name, "EnumMap(") or std.mem.startsWith(u8, type_name, "evm.types.EnumMap(")) return 256;
+        if (std.mem.startsWith(u8, type_name, "evm.PackedStruct(") or std.mem.startsWith(u8, type_name, "PackedStruct(") or std.mem.startsWith(u8, type_name, "evm.types.PackedStruct(")) return 256;
         if (std.mem.eql(u8, type_name, "evm.BytesBuilder") or std.mem.eql(u8, type_name, "BytesBuilder") or std.mem.eql(u8, type_name, "evm.types.BytesBuilder")) return 256;
         if (std.mem.eql(u8, type_name, "evm.StringBuilder") or std.mem.eql(u8, type_name, "StringBuilder") or std.mem.eql(u8, type_name, "evm.types.StringBuilder")) return 256;
         return 256; // 默认

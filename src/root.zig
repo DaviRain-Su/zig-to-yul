@@ -28,6 +28,7 @@ pub const evm = struct {
     pub const Stack = types.Stack;
     pub const Option = types.Option;
     pub const EnumMap = types.EnumMap;
+    pub const PackedStruct = types.PackedStruct;
     pub const BytesBuilder = types.BytesBuilder;
     pub const StringBuilder = types.StringBuilder;
     pub const Array = types.Array;
