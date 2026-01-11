@@ -2358,7 +2358,7 @@ pub const Transformer = struct {
                 const helper = try self.ensureMappingDynamicSetHelper(info.key_type, info.value_type, true);
                 return try self.builder.call(helper, &.{ slot_expr, base_expr, key_expr, value_expr });
             }
-            const helper = try self.ensureMappingSetHelper(info.key_type, info.value_type, true);
+            const helper = try self.ensureMappingSetHelper(info.key_type, info.value_type, true, loc);
             return try self.builder.call(helper, &.{ slot_expr, base_expr, key_expr, value_expr });
         }
 
@@ -2603,7 +2603,7 @@ pub const Transformer = struct {
                 try self.addError("mapping key type missing", loc, .unsupported_feature);
                 return null;
             };
-            const helper = try self.ensureMappingClearHelper(key_ty, base_value_type);
+            const helper = try self.ensureMappingClearHelper(key_ty, base_value_type, loc);
             return try self.builder.call(helper, &.{base_slot_expr});
         }
 
@@ -2636,7 +2636,7 @@ pub const Transformer = struct {
                     try self.addError("getOrPutPtrDefault expects key", loc, .unsupported_feature);
                     return null;
                 }
-                const helper = try self.ensureMappingGetOrPutPtrHelper(key_ty, base_value_type);
+                const helper = try self.ensureMappingGetOrPutPtrHelper(key_ty, base_value_type, loc);
                 return try self.builder.call(helper, &.{ slot_expr, base_slot_expr, key_expr, ast.Expression.lit(ast.Literal.number(0)) });
             }
             if (is_get_or_put_ptr) {
@@ -2644,7 +2644,7 @@ pub const Transformer = struct {
                     try self.addError("getOrPutPtr expects key and default", loc, .unsupported_feature);
                     return null;
                 }
-                const helper = try self.ensureMappingGetOrPutPtrHelper(key_ty, base_value_type);
+                const helper = try self.ensureMappingGetOrPutPtrHelper(key_ty, base_value_type, loc);
                 return try self.builder.call(helper, &.{ slot_expr, base_slot_expr, key_expr, args[1] });
             }
             if (is_put_no_clobber_ptr) {
@@ -2652,7 +2652,7 @@ pub const Transformer = struct {
                     try self.addError("putNoClobberPtr expects key and value", loc, .unsupported_feature);
                     return null;
                 }
-                const helper = try self.ensureMappingPutNoClobberPtrHelper(key_ty, base_value_type);
+                const helper = try self.ensureMappingPutNoClobberPtrHelper(key_ty, base_value_type, loc);
                 return try self.builder.call(helper, &.{ slot_expr, base_slot_expr, key_expr, args[1] });
             }
             if (is_fetch_put_ptr) {
@@ -2660,7 +2660,7 @@ pub const Transformer = struct {
                     try self.addError("fetchPutPtr expects key and value", loc, .unsupported_feature);
                     return null;
                 }
-                const helper = try self.ensureMappingFetchPutPtrHelper(key_ty, base_value_type);
+                const helper = try self.ensureMappingFetchPutPtrHelper(key_ty, base_value_type, loc);
                 return try self.builder.call(helper, &.{ slot_expr, base_slot_expr, key_expr, args[1] });
             }
             if (is_remove_or_null) {
@@ -2668,7 +2668,7 @@ pub const Transformer = struct {
                     try self.addError("removeOrNull expects key", loc, .unsupported_feature);
                     return null;
                 }
-                const helper = try self.ensureMappingRemoveOrNullHelper(key_ty, base_value_type);
+                const helper = try self.ensureMappingRemoveOrNullHelper(key_ty, base_value_type, loc);
                 return try self.builder.call(helper, &.{ slot_expr, base_slot_expr, key_expr });
             }
             if (is_remove_or_null_info) {
@@ -2676,7 +2676,7 @@ pub const Transformer = struct {
                     try self.addError("removeOrNullInfo expects key", loc, .unsupported_feature);
                     return null;
                 }
-                const helper = try self.ensureMappingRemoveOrNullInfoHelper(key_ty, base_value_type);
+                const helper = try self.ensureMappingRemoveOrNullInfoHelper(key_ty, base_value_type, loc);
                 return try self.builder.call(helper, &.{ slot_expr, base_slot_expr, key_expr });
             }
         }
@@ -2702,35 +2702,35 @@ pub const Transformer = struct {
                     try self.addError("getOrPutDefault expects key", loc, .unsupported_feature);
                     return null;
                 }
-                return try self.mappingGetOrPutExpr(slot_expr, base_slot_expr, key_expr, key_ty, base_value_type, ast.Expression.lit(ast.Literal.number(0)));
+                return try self.mappingGetOrPutExpr(slot_expr, base_slot_expr, key_expr, key_ty, base_value_type, ast.Expression.lit(ast.Literal.number(0)), loc);
             }
             if (is_get_or_put) {
                 if (args.len != 2) {
                     try self.addError("getOrPut expects key and default", loc, .unsupported_feature);
                     return null;
                 }
-                return try self.mappingGetOrPutExpr(slot_expr, base_slot_expr, key_expr, key_ty, base_value_type, args[1]);
+                return try self.mappingGetOrPutExpr(slot_expr, base_slot_expr, key_expr, key_ty, base_value_type, args[1], loc);
             }
             if (is_put_no_clobber) {
                 if (args.len != 2) {
                     try self.addError("putNoClobber expects key and value", loc, .unsupported_feature);
                     return null;
                 }
-                return try self.mappingPutNoClobberExpr(slot_expr, base_slot_expr, key_expr, key_ty, base_value_type, args[1]);
+                return try self.mappingPutNoClobberExpr(slot_expr, base_slot_expr, key_expr, key_ty, base_value_type, args[1], loc);
             }
             if (is_fetch_put) {
                 if (args.len != 2) {
                     try self.addError("fetchPut expects key and value", loc, .unsupported_feature);
                     return null;
                 }
-                return try self.mappingFetchPutExpr(slot_expr, base_slot_expr, key_expr, key_ty, base_value_type, args[1]);
+                return try self.mappingFetchPutExpr(slot_expr, base_slot_expr, key_expr, key_ty, base_value_type, args[1], loc);
             }
             if (is_remove_value) {
                 if (args.len != 1) {
                     try self.addError("removeValue expects key", loc, .unsupported_feature);
                     return null;
                 }
-                return try self.mappingRemoveValueExpr(slot_expr, base_slot_expr, key_expr, key_ty, base_value_type);
+                return try self.mappingRemoveValueExpr(slot_expr, base_slot_expr, key_expr, key_ty, base_value_type, loc);
             }
         }
 
@@ -2756,10 +2756,10 @@ pub const Transformer = struct {
                 return try self.builder.call(helper, &.{base_slot_expr});
             }
             if (self.isBytesKeyType(key_ty)) {
-                const helper = try self.ensureMappingValuesDynamicHelper(key_ty, base_value_type);
+                const helper = try self.ensureMappingValuesDynamicHelper(key_ty, base_value_type, loc);
                 return try self.builder.call(helper, &.{base_slot_expr});
             }
-            const helper = try self.ensureMappingValuesHelper(key_ty, base_value_type);
+            const helper = try self.ensureMappingValuesHelper(key_ty, base_value_type, loc);
             return try self.builder.call(helper, &.{base_slot_expr});
         }
 
@@ -2873,7 +2873,7 @@ pub const Transformer = struct {
                 try self.addError("mapping key type missing", loc, .unsupported_feature);
                 return null;
             };
-            const helper = try self.ensureMappingRemoveHelper(key_ty, final_type, true);
+            const helper = try self.ensureMappingRemoveHelper(key_ty, final_type, true, loc);
             return try self.builder.call(helper, &.{ access.slot_expr, access.base_slot_expr, args[key_count - 1] });
         }
 
@@ -2896,7 +2896,7 @@ pub const Transformer = struct {
                 const helper = try self.ensureMappingDynamicSetHelper(key_ty, final_type, true);
                 return try self.builder.call(helper, &.{ access.slot_expr, access.base_slot_expr, args[key_count - 1], value_expr });
             }
-            const helper = try self.ensureMappingSetHelper(key_ty, final_type, true);
+            const helper = try self.ensureMappingSetHelper(key_ty, final_type, true, loc);
             return try self.builder.call(helper, &.{ access.slot_expr, access.base_slot_expr, args[key_count - 1], value_expr });
         }
 
@@ -2912,7 +2912,8 @@ pub const Transformer = struct {
             const helper = try self.ensureMappingDynamicSetHelper(key_ty, final_type, true);
             return try self.builder.call(helper, &.{ access.slot_expr, access.base_slot_expr, args[0], value_expr });
         }
-        const helper = try self.ensureMappingSetHelper(key_ty, final_type, true);
+        const helper = try self.ensureMappingSetHelper(key_ty, final_type, true, loc);
+
         return try self.builder.call(helper, &.{ access.slot_expr, access.base_slot_expr, args[0], value_expr });
     }
 
@@ -3448,7 +3449,7 @@ pub const Transformer = struct {
                 const call_expr = try self.builder.call(helper, &.{ access.slot_expr, access.base_slot_expr, key_expr, value });
                 return ast.Statement.expr(call_expr);
             }
-            const helper = try self.ensureMappingSetHelper(key_ty, value_type, true);
+            const helper = try self.ensureMappingSetHelper(key_ty, value_type, true, loc);
             const call_expr = try self.builder.call(helper, &.{ access.slot_expr, access.base_slot_expr, key_expr, value });
             return ast.Statement.expr(call_expr);
         }
@@ -4075,7 +4076,7 @@ pub const Transformer = struct {
         return helper_name;
     }
 
-    fn ensureMappingValuesHelper(self: *Self, key_type: []const u8, value_type: []const u8) ![]const u8 {
+    fn ensureMappingValuesHelper(self: *Self, key_type: []const u8, value_type: []const u8, loc: ast.SourceLocation) ![]const u8 {
         const key_name = try std.fmt.allocPrint(self.allocator, "mapping_values:{s}:{s}", .{ key_type, value_type });
         defer self.allocator.free(key_name);
         if (self.math_helpers.get(key_name)) |helper| return helper;
@@ -4138,7 +4139,7 @@ pub const Transformer = struct {
             }
             if (self.isStructTypeName(value_type)) {
                 const fields = self.struct_defs.get(value_type) orelse {
-                    try self.addError("unknown struct type in mapping", .{ .start = 0, .end = 0 }, .unsupported_feature);
+                    try self.addError("unknown struct type in mapping", loc, .unsupported_feature);
                     break :blk ast.Expression.lit(ast.Literal.number(0));
                 };
                 const helper = try self.ensureMappingStructGetHelper(value_type, fields);
@@ -4259,7 +4260,7 @@ pub const Transformer = struct {
         return helper_name;
     }
 
-    fn ensureMappingValuesDynamicHelper(self: *Self, key_type: []const u8, value_type: []const u8) ![]const u8 {
+    fn ensureMappingValuesDynamicHelper(self: *Self, key_type: []const u8, value_type: []const u8, loc: ast.SourceLocation) ![]const u8 {
         const key_name = try std.fmt.allocPrint(self.allocator, "mapping_vals_dyn:{s}:{s}", .{ key_type, value_type });
         defer self.allocator.free(key_name);
         if (self.math_helpers.get(key_name)) |helper| return helper;
@@ -4323,7 +4324,7 @@ pub const Transformer = struct {
             }
             if (self.isStructTypeName(value_type)) {
                 const fields = self.struct_defs.get(value_type) orelse {
-                    try self.addError("unknown struct type in mapping", .{ .start = 0, .end = 0 }, .unsupported_feature);
+                    try self.addError("unknown struct type in mapping", loc, .unsupported_feature);
                     break :blk ast.Expression.lit(ast.Literal.number(0));
                 };
                 const helper = try self.ensureMappingStructGetHelper(value_type, fields);
@@ -4784,7 +4785,7 @@ pub const Transformer = struct {
         return helper_name;
     }
 
-    fn ensureMappingSetHelper(self: *Self, key_type: []const u8, value_type: []const u8, track_index: bool) ![]const u8 {
+    fn ensureMappingSetHelper(self: *Self, key_type: []const u8, value_type: []const u8, track_index: bool, loc: ast.SourceLocation) ![]const u8 {
         const key_name = try std.fmt.allocPrint(self.allocator, "mapping_set_value:{s}:{s}:{d}", .{ key_type, value_type, @intFromBool(track_index) });
         defer self.allocator.free(key_name);
         if (self.math_helpers.get(key_name)) |helper| return helper;
@@ -4847,7 +4848,7 @@ pub const Transformer = struct {
 
         if (self.isStructTypeName(value_type)) {
             const fields = self.struct_defs.get(value_type) orelse {
-                try self.addError("unknown struct type in mapping", .{ .start = 0, .end = 0 }, .unsupported_feature);
+                try self.addError("unknown struct type in mapping", loc, .unsupported_feature);
                 return helper_name;
             };
             const helper = try self.ensureMappingStructSetHelper(value_type, fields);
@@ -4891,6 +4892,7 @@ pub const Transformer = struct {
             const helper = try self.ensureMappingStructGetHelper(value_type, fields);
             return try self.builder.call(helper, &.{slot_expr});
         }
+
         if (storageTypeSizeBits(value_type) < 256) {
             return try self.genPackedReadDynamic(slot_expr, storageTypeSizeBits(value_type), 0);
         }
@@ -4905,6 +4907,7 @@ pub const Transformer = struct {
         key_type: []const u8,
         value_type: []const u8,
         value_expr: ast.Expression,
+        loc: ast.SourceLocation,
         track_index: bool,
     ) TransformProcessError!ast.Statement {
         if (self.isDynamicValueType(value_type)) {
@@ -4914,14 +4917,14 @@ pub const Transformer = struct {
         }
         if (self.isStructTypeName(value_type)) {
             const fields = self.struct_defs.get(value_type) orelse {
-                try self.addError("unknown struct type in mapping", .{ .start = 0, .end = 0 }, .unsupported_feature);
+                try self.addError("unknown struct type in mapping", loc, .unsupported_feature);
                 return ast.Statement.expr(ast.Expression.lit(ast.Literal.number(0)));
             };
             const helper = try self.ensureMappingStructSetHelper(value_type, fields);
             const call_expr = try self.builder.call(helper, &.{ slot_expr, value_expr });
             return ast.Statement.expr(call_expr);
         }
-        const helper = try self.ensureMappingSetHelper(key_type, value_type, track_index);
+        const helper = try self.ensureMappingSetHelper(key_type, value_type, track_index, loc);
         const call_expr = try self.builder.call(helper, &.{ slot_expr, base_slot_expr, key_expr, value_expr });
         return ast.Statement.expr(call_expr);
     }
@@ -4933,8 +4936,9 @@ pub const Transformer = struct {
         key_expr: ast.Expression,
         key_type: []const u8,
         value_type: []const u8,
+        loc: ast.SourceLocation,
     ) TransformProcessError!ast.Expression {
-        const helper = try self.ensureMappingRemoveValueHelper(key_type, value_type);
+        const helper = try self.ensureMappingRemoveValueHelper(key_type, value_type, loc);
         return try self.builder.call(helper, &.{ slot_expr, base_slot_expr, key_expr });
     }
 
@@ -4946,8 +4950,9 @@ pub const Transformer = struct {
         key_type: []const u8,
         value_type: []const u8,
         default_value: ast.Expression,
+        loc: ast.SourceLocation,
     ) TransformProcessError!ast.Expression {
-        const helper = try self.ensureMappingGetOrPutHelper(key_type, value_type);
+        const helper = try self.ensureMappingGetOrPutHelper(key_type, value_type, loc);
         return try self.builder.call(helper, &.{ slot_expr, base_slot_expr, key_expr, default_value });
     }
 
@@ -4959,8 +4964,9 @@ pub const Transformer = struct {
         key_type: []const u8,
         value_type: []const u8,
         value_expr: ast.Expression,
+        loc: ast.SourceLocation,
     ) TransformProcessError!ast.Expression {
-        const helper = try self.ensureMappingPutNoClobberHelper(key_type, value_type);
+        const helper = try self.ensureMappingPutNoClobberHelper(key_type, value_type, loc);
         return try self.builder.call(helper, &.{ slot_expr, base_slot_expr, key_expr, value_expr });
     }
 
@@ -4972,12 +4978,13 @@ pub const Transformer = struct {
         key_type: []const u8,
         value_type: []const u8,
         value_expr: ast.Expression,
+        loc: ast.SourceLocation,
     ) TransformProcessError!ast.Expression {
-        const helper = try self.ensureMappingFetchPutHelper(key_type, value_type);
+        const helper = try self.ensureMappingFetchPutHelper(key_type, value_type, loc);
         return try self.builder.call(helper, &.{ slot_expr, base_slot_expr, key_expr, value_expr });
     }
 
-    fn ensureMappingGetOrPutHelper(self: *Self, key_type: []const u8, value_type: []const u8) ![]const u8 {
+    fn ensureMappingGetOrPutHelper(self: *Self, key_type: []const u8, value_type: []const u8, loc: ast.SourceLocation) ![]const u8 {
         const key_name = try std.fmt.allocPrint(self.allocator, "mapping_get_or_put:{s}:{s}", .{ key_type, value_type });
         defer self.allocator.free(key_name);
         if (self.math_helpers.get(key_name)) |helper| return helper;
@@ -5002,13 +5009,14 @@ pub const Transformer = struct {
             key_type,
             value_type,
             ast.Expression.id("default"),
+            loc,
             true,
         );
         const if_block = try self.builder.block(&.{store_stmt});
         const if_stmt = self.builder.ifStmt(cond, if_block);
         try stmts.append(self.allocator, if_stmt);
 
-        const value_expr = try self.mappingValueExpr(ast.Expression.id("slot"), value_type, .{ .start = 0, .end = 0 });
+        const value_expr = try self.mappingValueExpr(ast.Expression.id("slot"), value_type, loc);
         const assign = try self.builder.assign(&.{"result"}, value_expr);
         try stmts.append(self.allocator, assign);
 
@@ -5019,7 +5027,7 @@ pub const Transformer = struct {
         return helper_name;
     }
 
-    fn ensureMappingPutNoClobberHelper(self: *Self, key_type: []const u8, value_type: []const u8) ![]const u8 {
+    fn ensureMappingPutNoClobberHelper(self: *Self, key_type: []const u8, value_type: []const u8, loc: ast.SourceLocation) ![]const u8 {
         const key_name = try std.fmt.allocPrint(self.allocator, "mapping_put_no_clobber:{s}:{s}", .{ key_type, value_type });
         defer self.allocator.free(key_name);
         if (self.math_helpers.get(key_name)) |helper| return helper;
@@ -5044,6 +5052,7 @@ pub const Transformer = struct {
             key_type,
             value_type,
             ast.Expression.id("value"),
+            loc,
             true,
         );
         const if_block = try self.builder.block(&.{store_stmt});
@@ -5061,7 +5070,7 @@ pub const Transformer = struct {
         return helper_name;
     }
 
-    fn ensureMappingFetchPutHelper(self: *Self, key_type: []const u8, value_type: []const u8) ![]const u8 {
+    fn ensureMappingFetchPutHelper(self: *Self, key_type: []const u8, value_type: []const u8, loc: ast.SourceLocation) ![]const u8 {
         const key_name = try std.fmt.allocPrint(self.allocator, "mapping_fetch_put:{s}:{s}", .{ key_type, value_type });
         defer self.allocator.free(key_name);
         if (self.math_helpers.get(key_name)) |helper| return helper;
@@ -5075,7 +5084,7 @@ pub const Transformer = struct {
         var stmts: std.ArrayList(ast.Statement) = .empty;
         defer stmts.deinit(self.allocator);
 
-        const prev_expr = try self.mappingValueExpr(ast.Expression.id("slot"), value_type, .{ .start = 0, .end = 0 });
+        const prev_expr = try self.mappingValueExpr(ast.Expression.id("slot"), value_type, loc);
         const assign_prev = try self.builder.assign(&.{"result"}, prev_expr);
         try stmts.append(self.allocator, assign_prev);
 
@@ -5086,6 +5095,7 @@ pub const Transformer = struct {
             key_type,
             value_type,
             ast.Expression.id("value"),
+            loc,
             true,
         );
         try stmts.append(self.allocator, store_stmt);
@@ -5097,7 +5107,7 @@ pub const Transformer = struct {
         return helper_name;
     }
 
-    fn ensureMappingRemoveValueHelper(self: *Self, key_type: []const u8, value_type: []const u8) ![]const u8 {
+    fn ensureMappingRemoveValueHelper(self: *Self, key_type: []const u8, value_type: []const u8, loc: ast.SourceLocation) ![]const u8 {
         const key_name = try std.fmt.allocPrint(self.allocator, "mapping_remove_value_ret:{s}:{s}", .{ key_type, value_type });
         defer self.allocator.free(key_name);
         if (self.math_helpers.get(key_name)) |helper| return helper;
@@ -5111,11 +5121,11 @@ pub const Transformer = struct {
         var stmts: std.ArrayList(ast.Statement) = .empty;
         defer stmts.deinit(self.allocator);
 
-        const prev_expr = try self.mappingValueExpr(ast.Expression.id("slot"), value_type, .{ .start = 0, .end = 0 });
+        const prev_expr = try self.mappingValueExpr(ast.Expression.id("slot"), value_type, loc);
         const assign_prev = try self.builder.assign(&.{"result"}, prev_expr);
         try stmts.append(self.allocator, assign_prev);
 
-        const helper = try self.ensureMappingRemoveHelper(key_type, value_type, true);
+        const helper = try self.ensureMappingRemoveHelper(key_type, value_type, true, loc);
         const call_expr = try self.builder.call(helper, &.{ ast.Expression.id("slot"), ast.Expression.id("base"), ast.Expression.id("key") });
         try stmts.append(self.allocator, ast.Statement.expr(call_expr));
 
@@ -5170,7 +5180,7 @@ pub const Transformer = struct {
         return helper_name;
     }
 
-    fn ensureMappingGetOrPutPtrHelper(self: *Self, key_type: []const u8, value_type: []const u8) ![]const u8 {
+    fn ensureMappingGetOrPutPtrHelper(self: *Self, key_type: []const u8, value_type: []const u8, loc: ast.SourceLocation) ![]const u8 {
         const key_name = try std.fmt.allocPrint(self.allocator, "mapping_get_or_put_ptr:{s}:{s}", .{ key_type, value_type });
         defer self.allocator.free(key_name);
         if (self.math_helpers.get(key_name)) |helper| return helper;
@@ -5191,7 +5201,7 @@ pub const Transformer = struct {
         const inserted_expr = try self.builder.builtinCall("iszero", &.{ast.Expression.id("exists")});
         try stmts.append(self.allocator, try self.builder.varDecl(&.{"inserted"}, inserted_expr));
 
-        const get_or_put = try self.ensureMappingGetOrPutHelper(key_type, value_type);
+        const get_or_put = try self.ensureMappingGetOrPutHelper(key_type, value_type, loc);
         const call_expr = try self.builder.call(get_or_put, &.{ ast.Expression.id("slot"), ast.Expression.id("base"), ast.Expression.id("key"), ast.Expression.id("value") });
         try stmts.append(self.allocator, ast.Statement.expr(call_expr));
 
@@ -5207,7 +5217,7 @@ pub const Transformer = struct {
         return helper_name;
     }
 
-    fn ensureMappingPutNoClobberPtrHelper(self: *Self, key_type: []const u8, value_type: []const u8) ![]const u8 {
+    fn ensureMappingPutNoClobberPtrHelper(self: *Self, key_type: []const u8, value_type: []const u8, loc: ast.SourceLocation) ![]const u8 {
         const key_name = try std.fmt.allocPrint(self.allocator, "mapping_put_no_clobber_ptr:{s}:{s}", .{ key_type, value_type });
         defer self.allocator.free(key_name);
         if (self.math_helpers.get(key_name)) |helper| return helper;
@@ -5228,7 +5238,7 @@ pub const Transformer = struct {
         const inserted_expr = try self.builder.builtinCall("iszero", &.{ast.Expression.id("exists")});
         try stmts.append(self.allocator, try self.builder.varDecl(&.{"inserted"}, inserted_expr));
 
-        const put_no_clobber = try self.ensureMappingPutNoClobberHelper(key_type, value_type);
+        const put_no_clobber = try self.ensureMappingPutNoClobberHelper(key_type, value_type, loc);
         const call_expr = try self.builder.call(put_no_clobber, &.{ ast.Expression.id("slot"), ast.Expression.id("base"), ast.Expression.id("key"), ast.Expression.id("value") });
         try stmts.append(self.allocator, ast.Statement.expr(call_expr));
 
@@ -5244,7 +5254,7 @@ pub const Transformer = struct {
         return helper_name;
     }
 
-    fn ensureMappingFetchPutPtrHelper(self: *Self, key_type: []const u8, value_type: []const u8) ![]const u8 {
+    fn ensureMappingFetchPutPtrHelper(self: *Self, key_type: []const u8, value_type: []const u8, loc: ast.SourceLocation) ![]const u8 {
         const key_name = try std.fmt.allocPrint(self.allocator, "mapping_fetch_put_ptr:{s}:{s}", .{ key_type, value_type });
         defer self.allocator.free(key_name);
         if (self.math_helpers.get(key_name)) |helper| return helper;
@@ -5265,7 +5275,7 @@ pub const Transformer = struct {
         const inserted_expr = try self.builder.builtinCall("iszero", &.{ast.Expression.id("exists")});
         try stmts.append(self.allocator, try self.builder.varDecl(&.{"inserted"}, inserted_expr));
 
-        const fetch_put = try self.ensureMappingFetchPutHelper(key_type, value_type);
+        const fetch_put = try self.ensureMappingFetchPutHelper(key_type, value_type, loc);
         const call_expr = try self.builder.call(fetch_put, &.{ ast.Expression.id("slot"), ast.Expression.id("base"), ast.Expression.id("key"), ast.Expression.id("value") });
         try stmts.append(self.allocator, ast.Statement.expr(call_expr));
 
@@ -5281,7 +5291,7 @@ pub const Transformer = struct {
         return helper_name;
     }
 
-    fn ensureMappingRemoveOrNullHelper(self: *Self, key_type: []const u8, value_type: []const u8) ![]const u8 {
+    fn ensureMappingRemoveOrNullHelper(self: *Self, key_type: []const u8, value_type: []const u8, loc: ast.SourceLocation) ![]const u8 {
         const key_name = try std.fmt.allocPrint(self.allocator, "mapping_remove_or_null:{s}:{s}", .{ key_type, value_type });
         defer self.allocator.free(key_name);
         if (self.math_helpers.get(key_name)) |helper| return helper;
@@ -5306,7 +5316,7 @@ pub const Transformer = struct {
             try self.builder.builtinCall("iszero", &.{ast.Expression.id("exists")}),
         });
 
-        const remove_helper = try self.ensureMappingRemoveValueHelper(key_type, value_type);
+        const remove_helper = try self.ensureMappingRemoveValueHelper(key_type, value_type, loc);
         const remove_expr = try self.builder.call(remove_helper, &.{ ast.Expression.id("slot"), ast.Expression.id("base"), ast.Expression.id("key") });
         const assign_result = try self.builder.assign(&.{"result"}, remove_expr);
         const if_block = try self.builder.block(&.{assign_result});
@@ -5319,7 +5329,7 @@ pub const Transformer = struct {
         return helper_name;
     }
 
-    fn ensureMappingRemoveOrNullInfoHelper(self: *Self, key_type: []const u8, value_type: []const u8) ![]const u8 {
+    fn ensureMappingRemoveOrNullInfoHelper(self: *Self, key_type: []const u8, value_type: []const u8, loc: ast.SourceLocation) ![]const u8 {
         const key_name = try std.fmt.allocPrint(self.allocator, "mapping_remove_or_null_info:{s}:{s}", .{ key_type, value_type });
         defer self.allocator.free(key_name);
         if (self.math_helpers.get(key_name)) |helper| return helper;
@@ -5355,9 +5365,9 @@ pub const Transformer = struct {
             try self.builder.builtinCall("iszero", &.{ast.Expression.id("exists")}),
         });
 
-        const value_expr = try self.mappingValueExpr(ast.Expression.id("slot"), value_type, .{ .start = 0, .end = 0 });
+        const value_expr = try self.mappingValueExpr(ast.Expression.id("slot"), value_type, loc);
         const store_value_if = try self.builder.builtinCall("mstore", &.{ ast.Expression.id("value_ptr"), value_expr });
-        const remove_helper = try self.ensureMappingRemoveHelper(key_type, value_type, true);
+        const remove_helper = try self.ensureMappingRemoveHelper(key_type, value_type, true, loc);
         const remove_expr = try self.builder.call(remove_helper, &.{ ast.Expression.id("slot"), ast.Expression.id("base"), ast.Expression.id("key") });
         const store_removed_if = try self.builder.builtinCall("mstore", &.{ ast.Expression.id("ptr"), ast.Expression.lit(ast.Literal.number(1)) });
         const if_block = try self.builder.block(&.{ ast.Statement.expr(store_value_if), ast.Statement.expr(remove_expr), ast.Statement.expr(store_removed_if) });
@@ -5379,7 +5389,7 @@ pub const Transformer = struct {
         return helper_name;
     }
 
-    fn ensureMappingClearHelper(self: *Self, key_type: []const u8, value_type: []const u8) ![]const u8 {
+    fn ensureMappingClearHelper(self: *Self, key_type: []const u8, value_type: []const u8, loc: ast.SourceLocation) ![]const u8 {
         const key_name = try std.fmt.allocPrint(self.allocator, "mapping_clear:{s}:{s}", .{ key_type, value_type });
         defer self.allocator.free(key_name);
         if (self.math_helpers.get(key_name)) |helper| return helper;
@@ -5421,7 +5431,7 @@ pub const Transformer = struct {
             break :blk try self.builder.builtinCall("sload", &.{key_slot});
         };
         const slot_expr = try self.mappingSlotExprForKey(ast.Expression.id("base"), key_expr, key_type);
-        const remove_helper = try self.ensureMappingRemoveHelper(key_type, value_type, true);
+        const remove_helper = try self.ensureMappingRemoveHelper(key_type, value_type, true, loc);
         const remove_call = try self.builder.call(remove_helper, &.{ slot_expr, ast.Expression.id("base"), key_expr });
         try body_stmts.append(self.allocator, ast.Statement.expr(remove_call));
         const body_block = try self.builder.block(body_stmts.items);
@@ -5437,7 +5447,7 @@ pub const Transformer = struct {
         return helper_name;
     }
 
-    fn ensureMappingRemoveHelper(self: *Self, key_type: []const u8, value_type: []const u8, track_index: bool) ![]const u8 {
+    fn ensureMappingRemoveHelper(self: *Self, key_type: []const u8, value_type: []const u8, track_index: bool, loc: ast.SourceLocation) ![]const u8 {
         const key_name = try std.fmt.allocPrint(self.allocator, "mapping_remove_value:{s}:{s}:{d}", .{ key_type, value_type, @intFromBool(track_index) });
         defer self.allocator.free(key_name);
         if (self.math_helpers.get(key_name)) |helper| return helper;
@@ -5619,7 +5629,7 @@ pub const Transformer = struct {
             try stmts.append(self.allocator, clear_if);
         } else if (self.isStructTypeName(value_type)) {
             const fields = self.struct_defs.get(value_type) orelse {
-                try self.addError("unknown struct type in mapping", .{ .start = 0, .end = 0 }, .unsupported_feature);
+                try self.addError("unknown struct type in mapping", loc, .unsupported_feature);
                 return helper_name;
             };
             const helper = try self.ensureMappingStructClearHelper(value_type, fields);
