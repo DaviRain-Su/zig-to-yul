@@ -3869,6 +3869,11 @@ pub const Transformer = struct {
         const len_expr = try self.builder.builtinCall("mload", &.{ast.Expression.id("key")});
         try stmts.append(self.allocator, try self.builder.varDecl(&.{"len"}, len_expr));
 
+        const old_len_expr = try self.builder.builtinCall("sload", &.{ast.Expression.id("slot")});
+        try stmts.append(self.allocator, try self.builder.varDecl(&.{"old_len"}, old_len_expr));
+        const old_words_expr = try self.dynamicWordCountExpr(key_type, ast.Expression.id("old_len"));
+        try stmts.append(self.allocator, try self.builder.varDecl(&.{"old_words"}, old_words_expr));
+
         const store_len = try self.builder.builtinCall("sstore", &.{ ast.Expression.id("slot"), ast.Expression.id("len") });
         try stmts.append(self.allocator, ast.Statement.expr(store_len));
 
