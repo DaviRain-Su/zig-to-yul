@@ -328,6 +328,62 @@ pub fn Mapping(comptime Key: type, comptime Value: type) type {
     };
 }
 
+/// Defines a Solidity-style enumerable set type for contracts.
+pub fn Set(comptime Element: type) type {
+    return struct {
+        pub const ElementType = Element;
+        const Self = @This();
+
+        pub fn add(self: *Self, value: Element) bool {
+            _ = self;
+            _ = value;
+            return false;
+        }
+
+        pub fn remove(self: *Self, value: Element) bool {
+            _ = self;
+            _ = value;
+            return false;
+        }
+
+        pub fn contains(self: *Self, value: Element) bool {
+            _ = self;
+            _ = value;
+            return false;
+        }
+
+        pub fn len(self: *Self) U256 {
+            _ = self;
+            return 0;
+        }
+
+        pub fn isEmpty(self: *Self) bool {
+            _ = self;
+            return true;
+        }
+
+        pub fn count(self: *Self) U256 {
+            _ = self;
+            return 0;
+        }
+
+        pub fn valueAt(self: *Self, index: U256) Element {
+            _ = self;
+            _ = index;
+            return undefined;
+        }
+
+        pub fn values(self: *Self) []Element {
+            _ = self;
+            return &[_]Element{};
+        }
+
+        pub fn clear(self: *Self) void {
+            _ = self;
+        }
+    };
+}
+
 /// Defines a Solidity-style dynamic array type for contracts.
 pub fn Array(comptime Element: type) type {
     return struct {
@@ -963,6 +1019,21 @@ test "mapping iterator api" {
     const remove_info = mapping.removeOrNullInfo(0);
     _ = remove_info.removed();
     _ = remove_info.getValue();
+}
+
+test "set api" {
+    const SetType = Set(U256);
+    var set: SetType = .{};
+
+    _ = set.len();
+    _ = set.isEmpty();
+    _ = set.count();
+    _ = set.contains(1);
+    _ = set.add(1);
+    _ = set.remove(1);
+    _ = set.valueAt(0);
+    _ = set.values();
+    set.clear();
 }
 
 test "array api" {

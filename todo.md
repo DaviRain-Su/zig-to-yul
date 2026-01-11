@@ -9,16 +9,12 @@
     - 测试：对齐上游向量与单元测试
     
 
-- 优化研究：对比 https://github.com/Vectorized/solady
-
-
-目前还未完成的（已把已完成项剔除）：
-阶段 2
-- evm.Array(T) storage 动态数组
-阶段 3
-- 更精确错误定位提示
-文档同步
-- docs/ROADMAP.md
-- docs/stories/v0.1.0-runtime-profile.md
-并行补齐三项已经完成：Iterator.forEach、valuePtrAt 语义说明、transformer 输出测试。
-已完成：ABI 自动序列化/反序列化封装、debug/trace 辅助（Yul 注释 / SourceMap）、约束报告（如 mapping value 动态类型提示）。
+可以考虑这些“链上友好”的数据结构，能显著提升开发体验（不一定全部要实现）：
+- Set：基于 Mapping<T,bool> + Array<T> 的可枚举集合（含 add/remove/contains/values）。
+- Queue/Deque：环形队列（push/pop、pushFront/popFront），适合任务队列。
+- Stack：LIFO，语义简单，gas 可控。
+- Optional：Option<T> 类型，明确“存在/不存在”语义。
+- BytesBuilder/StringBuilder：可扩展字节数组（append/slice），用于拼装 calldata/日志。
+- EnumMap：以 enum 作为 key 的紧凑映射（避免 hash/slot 开销）。
+- PackedStruct：自动打包/解包小字段，减少 storage 槽位。
+如果要优先做，我建议顺序：Set → Queue → BytesBuilder。你想先从哪一个开始？
