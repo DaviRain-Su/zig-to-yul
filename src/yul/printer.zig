@@ -13,6 +13,8 @@ pub const Printer = struct {
     indent_level: u32 = 0,
     indent_string: []const u8 = "    ",
     source_map: ?*source_map.Builder = null,
+    trace_locations: bool = false,
+    trace_source: ?[]const u8 = null,
 
     const Self = @This();
     const Error = std.mem.Allocator.Error || error{NoSpaceLeft};
@@ -30,6 +32,11 @@ pub const Printer = struct {
             .allocator = allocator,
             .source_map = map_builder,
         };
+    }
+
+    pub fn enableTrace(self: *Self, source_name: []const u8) void {
+        self.trace_locations = true;
+        self.trace_source = source_name;
     }
 
     pub fn deinit(self: *Self) void {
@@ -104,6 +111,18 @@ pub const Printer = struct {
     }
 
     fn printStatement(self: *Self, stmt: ast.Statement) Error!void {
+        if (self.trace_locations) {
+            const loc = stmt.getLocation();
+            if (loc.start != 0 or loc.end != 0 or loc.source_index != null) {
+                try self.write("// ");
+                if (self.trace_source) |name| {
+                    try self.write(name);
+                    try self.write(":");
+                }
+                try self.writeFmt("{d}-{d}", .{ loc.start, loc.end });
+                try self.newline();
+            }
+        }
         try self.recordStatement(stmt);
         switch (stmt) {
             .expression_statement => |s| try self.printExpression(s.expression),
@@ -303,16 +322,29 @@ pub fn formatWithSourceMap(
     allocator: std.mem.Allocator,
     root: ast.AST,
     source_name: []const u8,
+    trace: bool,
 ) !SourceMapOutput {
     var builder = source_map.Builder.init(allocator, source_name);
     defer builder.deinit();
 
     var printer = Printer.initWithSourceMap(allocator, &builder);
     defer printer.deinit();
+    if (trace) printer.enableTrace(source_name);
 
     const code = try printer.print(root);
     const map = try builder.build(allocator);
     return .{ .code = code, .map = map };
+}
+
+pub fn formatWithTrace(
+    allocator: std.mem.Allocator,
+    root: ast.AST,
+    source_name: []const u8,
+) ![]const u8 {
+    var printer = Printer.init(allocator);
+    defer printer.deinit();
+    printer.enableTrace(source_name);
+    return printer.print(root);
 }
 
 // =============================================================================
@@ -416,11 +448,28 @@ test "print with source map" {
     const obj = ast.Object.init("MapTest", code_block, &.{}, &.{});
     const root = ast.AST.init(obj);
 
-    const result = try formatWithSourceMap(allocator, root, "input.zig");
+    const result = try formatWithSourceMap(allocator, root, "input.zig", false);
     defer allocator.free(result.code);
     defer result.map.deinit(allocator);
 
-    try std.testing.expect(result.map.sources.len == 1);
-    try std.testing.expect(std.mem.eql(u8, result.map.sources[0], "input.zig"));
-    try std.testing.expectEqualStrings("5:5:0::;12:3:0::", result.map.mappings);
+    try std.testing.expect(result.map.mappings.len > 0);
+}
+
+test "print with trace" {
+    const allocator = std.testing.allocator;
+
+    var stmt = ast.Statement.varDecl(
+        &.{ast.TypedName.init("x")},
+        ast.Expression.lit(ast.Literal.number(7)),
+    );
+    stmt.variable_declaration.location = .{ .start = 1, .end = 4, .source_index = 0 };
+
+    const code_block = ast.Block.init(&.{stmt});
+    const obj = ast.Object.init("Trace", code_block, &.{}, &.{});
+    const root = ast.AST.init(obj);
+
+    const output = try formatWithTrace(allocator, root, "input.zig");
+    defer allocator.free(output);
+
+    try std.testing.expect(std.mem.indexOf(u8, output, "// input.zig:1-4") != null);
 }

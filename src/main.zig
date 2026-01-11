@@ -72,7 +72,7 @@ fn runCompile(allocator: std.mem.Allocator, args: []const []const u8) !void {
 
     var ast = trans.transform(source) catch |err| {
         // Print detailed error diagnostics
-        printTransformErrorsStderr(&trans, resolved.path);
+        printTransformErrorsStderr(&trans, resolved.path, source);
         std.debug.print("Compilation failed: {}\n", .{err});
         std.process.exit(1);
     };
@@ -92,7 +92,7 @@ fn runCompile(allocator: std.mem.Allocator, args: []const []const u8) !void {
             std.process.exit(1);
         }
 
-        const result = printer.formatWithSourceMap(allocator, ast, resolved.path) catch |err| {
+        const result = printer.formatWithSourceMap(allocator, ast, resolved.path, opts.trace_yul) catch |err| {
             std.debug.print("Code generation error: {}\n", .{err});
             std.process.exit(1);
         };
@@ -122,10 +122,16 @@ fn runCompile(allocator: std.mem.Allocator, args: []const []const u8) !void {
         try writeOutput(abi_json, abi_path);
     }
 
-    const yul_code = printer.format(allocator, ast) catch |err| {
-        std.debug.print("Code generation error: {}\n", .{err});
-        std.process.exit(1);
-    };
+    const yul_code = if (opts.trace_yul)
+        printer.formatWithTrace(allocator, ast, resolved.path) catch |err| {
+            std.debug.print("Code generation error: {}\n", .{err});
+            std.process.exit(1);
+        }
+    else
+        printer.format(allocator, ast) catch |err| {
+            std.debug.print("Code generation error: {}\n", .{err});
+            std.process.exit(1);
+        };
     defer allocator.free(yul_code);
 
     try writeOutput(yul_code, opts.output_file);
@@ -144,6 +150,19 @@ fn runBuild(allocator: std.mem.Allocator, args: []const []const u8) !void {
         std.debug.print("Error: --sourcemap is only supported with compile\n", .{});
         std.process.exit(1);
     }
+    if (opts.trace_yul) {
+        std.debug.print("Error: --trace is only supported with compile\n", .{});
+        std.process.exit(1);
+    }
+    if (opts.optimize_yul) {
+        std.debug.print("Error: --optimize-yul is only supported with compile\n", .{});
+        std.process.exit(1);
+    }
+
+    if (opts.trace_yul) {
+        std.debug.print("Error: --trace is only supported with compile\n", .{});
+        std.process.exit(1);
+    }
     if (opts.optimize_yul) {
         std.debug.print("Error: --optimize-yul is only supported with compile\n", .{});
         std.process.exit(1);
@@ -159,7 +178,7 @@ fn runBuild(allocator: std.mem.Allocator, args: []const []const u8) !void {
     defer trans.deinit();
 
     const ast = trans.transform(source) catch |err| {
-        printTransformErrorsStderr(&trans, resolved.path);
+        printTransformErrorsStderr(&trans, resolved.path, source);
         std.debug.print("Compilation failed: {}\n", .{err});
         std.process.exit(1);
     };
@@ -206,7 +225,7 @@ fn runEstimate(allocator: std.mem.Allocator, args: []const []const u8) !void {
     defer trans.deinit();
 
     const yul_ast_root = trans.transform(source) catch |err| {
-        printTransformErrorsStderr(&trans, resolved.path);
+        printTransformErrorsStderr(&trans, resolved.path, source);
         std.debug.print("Compilation failed: {}\n", .{err});
         std.process.exit(1);
     };
@@ -264,7 +283,7 @@ fn runProfile(allocator: std.mem.Allocator, args: []const []const u8) !void {
     defer trans.deinit();
 
     const yul_ast_root = trans.transform(source) catch |err| {
-        printTransformErrorsStderr(&trans, resolved.path);
+        printTransformErrorsStderr(&trans, resolved.path, source);
         std.debug.print("Compilation failed: {}\n", .{err});
         std.process.exit(1);
     };
@@ -806,6 +825,7 @@ const Options = struct {
     abi_output: ?[]const u8 = null,
     optimize: bool = false,
     source_map: bool = false,
+    trace_yul: bool = false,
     optimize_yul: bool = false,
 };
 
@@ -1070,6 +1090,8 @@ fn parseOptions(args: []const []const u8) !Options {
             }
         } else if (std.mem.eql(u8, arg, "--sourcemap") or std.mem.eql(u8, arg, "--source-map")) {
             opts.source_map = true;
+        } else if (std.mem.eql(u8, arg, "--trace") or std.mem.eql(u8, arg, "--trace-yul")) {
+            opts.trace_yul = true;
         } else if (std.mem.eql(u8, arg, "--optimize-yul")) {
             opts.optimize_yul = true;
         } else if (arg.len > 0 and arg[0] != '-') {
@@ -1161,11 +1183,31 @@ fn writeOutput(content: []const u8, output_file: ?[]const u8) !void {
     }
 }
 
-fn printTransformErrorsStderr(trans: *Transformer, filename: []const u8) void {
+fn byteOffsetToLineCol(source: []const u8, offset: u32) struct { line: u32, column: u32 } {
+    var line: u32 = 1;
+    var column: u32 = 1;
+    var i: u32 = 0;
+    while (i < offset and i < source.len) : (i += 1) {
+        if (source[i] == '\n') {
+            line += 1;
+            column = 1;
+        } else {
+            column += 1;
+        }
+    }
+    return .{ .line = line, .column = column };
+}
+
+fn printTransformErrorsStderr(trans: *Transformer, filename: []const u8, source: []const u8) void {
     for (trans.getErrors()) |e| {
         const loc = e.location;
         if (loc.start > 0 or loc.end > 0) {
-            std.debug.print("{s}:{}-{}: error: {s}\n", .{ filename, loc.start, loc.end, e.message });
+            const start = byteOffsetToLineCol(source, loc.start);
+            const end = byteOffsetToLineCol(source, loc.end);
+            std.debug.print(
+                "{s}:{}:{}-{}:{}: error: {s}\n",
+                .{ filename, start.line, start.column, end.line, end.column, e.message },
+            );
         } else {
             std.debug.print("{s}: error: {s}\n", .{ filename, e.message });
         }
@@ -1281,6 +1323,164 @@ fn extractBytecode(allocator: std.mem.Allocator, output: []const u8) ![]const u8
 }
 
 // Printing functions using debug.print (writes to stderr)
+fn printVersionStdout() void {
+    const stdout = std.fs.File.stdout();
+    stdout.writeAll("zig-to-yul v") catch {};
+    stdout.writeAll(version) catch {};
+    stdout.writeAll("\n") catch {};
+}
+
+fn printCompileUsageStderr() void {
+    std.debug.print(
+        \\USAGE:
+        \\    zig-to-yul compile [options] <input.zig>
+        \\
+        \\OPTIONS:
+        \\    -o, --output <file>    Write output to <file>
+        \\    --project <dir>        Use build.zig root module
+        \\    --abi <file>           Write ABI JSON
+        \\    --sourcemap            Write a .map file next to output
+        \\    --trace                Emit Yul with source-range comments
+        \\    --optimize-yul         Run basic Yul optimizer
+        \\    -h, --help             Print help message
+        \\
+    , .{});
+}
+
+fn printBuildUsageStderr() void {
+    std.debug.print(
+        \\USAGE:
+        \\    zig-to-yul build [options] <input.zig>
+        \\
+        \\OPTIONS:
+        \\    -o, --output <file>    Write output to <file>
+        \\    -O, --optimize         Enable solc optimizer
+        \\    --project <dir>        Use build.zig root module
+        \\    -h, --help             Print help message
+        \\
+    , .{});
+}
+
+fn printEstimateUsageStderr() void {
+    std.debug.print(
+        \\USAGE:
+        \\    zig-to-yul estimate [options] <input.zig>
+        \\
+        \\OPTIONS:
+        \\    -o, --output <file>     Write output to <file>
+        \\    --profile <file>        Profile counts JSON
+        \\    --abi <file>            Write ABI JSON
+        \\    --project <dir>         Use build.zig root module
+        \\    --evm-version <name>    EVM version
+        \\    -h, --help              Print help message
+        \\
+    , .{});
+}
+
+fn printProfileUsageStderr() void {
+    std.debug.print(
+        \\USAGE:
+        \\    zig-to-yul profile [options] <input.zig>
+        \\
+        \\OPTIONS:
+        \\    -o, --output <file>     Write output to <file>
+        \\    --map <file>            Write profile map JSON
+        \\    --profile-out <file>    Write aggregated profile JSON
+        \\    --counts <file>         Add counts JSON (repeatable)
+        \\    --abi <file>            Write ABI JSON
+        \\    --project <dir>         Use build.zig root module
+        \\    --rpc-url <url>         Collect profile via RPC
+        \\    --contract <addr>       Use deployed contract address
+        \\    --call-data <hex|@file> Calldata for eth_call
+        \\    --runs <n>              Repeat eth_call n times
+        \\    --return-counts         Force return count payload
+        \\    --no-deploy             Skip deployment
+        \\    --optimize              Enable solc optimizer
+        \\    -h, --help              Print help message
+        \\
+    , .{});
+}
+
+fn printDecodeEventUsageStderr() void {
+    std.debug.print(
+        \\USAGE:
+        \\    zig-to-yul decode-event [options]
+        \\
+        \\OPTIONS:
+        \\    --event <name>              Event name
+        \\    --param <name:type[:flag]>  Event param (use :indexed for indexed)
+        \\    --topic <hex>               Topic value (repeatable)
+        \\    --data <hex>                Log data hex
+        \\    -h, --help                  Print help message
+        \\
+    , .{});
+}
+
+fn printDecodeAbiUsageStderr() void {
+    std.debug.print(
+        \\USAGE:
+        \\    zig-to-yul decode-abi [options]
+        \\
+        \\OPTIONS:
+        \\    --type <abi-type>   ABI type (repeatable)
+        \\    --data <hex>        ABI-encoded data hex
+        \\    --calldata          Decode calldata (skip selector)
+        \\    -h, --help          Print help message
+        \\
+    , .{});
+}
+
+fn printUsageTo(writer: anytype) !void {
+    try writer.print(
+        \\zig-to-yul v{s} - Compile Zig smart contracts to EVM bytecode
+        \\
+        \\USAGE:
+        \\    zig-to-yul <command> [options] <input.zig>
+        \\
+        \\COMMANDS:
+        \\    compile     Compile Zig to Yul intermediate language
+        \\    build       Compile Zig to EVM bytecode (requires solc)
+        \\    estimate    Estimate gas; supports profile overrides
+        \\    profile     Instrument Yul and aggregate profile counts
+        \\    decode-event Decode EVM event logs
+        \\    decode-abi  Decode ABI-encoded data
+        \\    version     Print version information
+        \\    help        Print this help message
+        \\
+        \\OPTIONS:
+        \\    -o, --output <file>    Write output to <file>
+        \\    -O, --optimize         Enable solc optimizer (build only)
+        \\    --project <dir>       Use build.zig root module
+        \\    --abi <file>          Write ABI JSON
+        \\    --sourcemap           Write a .map file next to output (compile only)
+        \\    --trace               Emit Yul with source-range comments (compile only)
+        \\    --optimize-yul        Run basic Yul optimizer (compile only)
+        \\    --profile <file>       Profile counts JSON (estimate only)
+        \\    --evm-version <name>   EVM version (estimate only)
+        \\    -h, --help             Print help message
+        \\
+        \\EXAMPLES:
+        \\    # Compile to Yul
+        \\    zig-to-yul compile token.zig -o token.yul
+        \\
+        \\    # Build to EVM bytecode (deploy-ready)
+        \\    zig-to-yul build token.zig -o token.bin
+        \\
+        \\    # Build with optimization
+        \\    zig-to-yul build -O token.zig
+        \\
+        \\    # Decode an event log
+        \\    zig-to-yul decode-event --event Transfer --param from:address:indexed \\
+        \\      --param to:address:indexed --param value:uint256 --topic 0x... --data 0x...
+        \\
+        \\    # Decode ABI data
+        \\    zig-to-yul decode-abi --type uint256 --type string --data 0x...
+        \\
+        \\For more information, visit: https://github.com/example/zig-to-yul
+        \\
+    , .{version});
+}
+
 fn printUsageStdout() void {
     var buf: [4096]u8 = undefined;
     var stream = std.io.fixedBufferStream(&buf);
@@ -1311,169 +1511,7 @@ fn printUsageStderr() void {
         \\    --project <dir>       Use build.zig root module
         \\    --abi <file>          Write ABI JSON
         \\    --sourcemap           Write a .map file next to output (compile only)
-        \\    --optimize-yul        Run basic Yul optimizer (compile only)
-        \\    --profile <file>       Profile counts JSON (estimate only)
-        \\    --evm-version <name>   EVM version (estimate only)
-        \\    -h, --help             Print help message
-        \\
-        \\EXAMPLES:
-        \\    # Compile to Yul
-        \\    zig-to-yul compile token.zig -o token.yul
-        \\
-        \\    # Build to EVM bytecode (deploy-ready)
-        \\    zig-to-yul build token.zig -o token.bin
-        \\
-        \\    # Build with optimization
-        \\    zig-to-yul build -O token.zig
-        \\
-        \\    # Decode an event log
-        \\    zig-to-yul decode-event --event Transfer --param from:address:indexed \\
-        \\      --param to:address:indexed --param value:uint256 --topic 0x... --data 0x...
-        \\
-        \\    # Decode ABI data
-        \\    zig-to-yul decode-abi --type uint256 --type string --data 0x...
-        \\
-        \\For more information, visit: https://github.com/example/zig-to-yul
-        \\
-    , .{version});
-}
-
-fn printCompileUsageStderr() void {
-    std.debug.print(
-        \\USAGE: zig-to-yul compile [options] <input.zig>
-        \\
-        \\OPTIONS:
-        \\    -o, --output <file>    Write Yul output to <file>
-        \\    --project <dir>       Use build.zig root module
-        \\    --abi <file>          Write ABI JSON
-        \\    --sourcemap           Write a .map file next to output
-        \\    --optimize-yul        Run basic Yul optimizer
-        \\    -h, --help             Print help
-        \\
-    , .{});
-}
-
-fn printDecodeEventUsageStderr() void {
-    std.debug.print(
-        \\USAGE: zig-to-yul decode-event [options]
-        \\
-        \\OPTIONS:
-        \\    --event <name>         Event name
-        \\    --param <name:type[:indexed[=hex]]>  Event parameter definition
-        \\    --topic <hex>          32-byte topic hex
-        \\    --data <hex>           Data hex (non-indexed ABI payload)
-        \\    -h, --help             Print help
-        \\
-        \\EXAMPLE:
-        \\    zig-to-yul decode-event --event Transfer \\
-        \\      --param from:address:indexed --param to:address:indexed \\
-        \\      --param value:uint256 --topic 0x... --topic 0x... --topic 0x... \\
-        \\      --data 0x...
-        \\    zig-to-yul decode-event --event Message \\
-        \\      --param msg:string:indexed=0x... --topic 0x...
-        \\
-    , .{});
-}
-
-fn printDecodeAbiUsageStderr() void {
-    std.debug.print(
-        \\USAGE: zig-to-yul decode-abi [options]
-        \\
-        \\OPTIONS:
-        \\    --type <abi>           ABI type (repeatable)
-        \\    --data <hex>           ABI data hex
-        \\    --calldata             Data includes 4-byte selector
-        \\    -h, --help             Print help
-        \\
-        \\EXAMPLE:
-        \\    zig-to-yul decode-abi --type uint256 --type string --data 0x...
-        \\    zig-to-yul decode-abi --type address --calldata --data 0x...
-        \\
-    , .{});
-}
-
-fn printBuildUsageStderr() void {
-    std.debug.print(
-        \\USAGE: zig-to-yul build [options] <input.zig>
-        \\
-        \\OPTIONS:
-        \\    -o, --output <file>    Write bytecode to <file>
-        \\    --project <dir>       Use build.zig root module
-        \\    -O, --optimize         Enable solc optimizer
-        \\    -h, --help             Print help
-        \\
-        \\REQUIREMENTS:
-        \\    solc must be installed and in PATH
-        \\    Install: npm install -g solc
-        \\
-    , .{});
-}
-
-fn printEstimateUsageStderr() void {
-    std.debug.print(
-        \\USAGE: zig-to-yul estimate [options] <input.zig>
-        \\
-        \\OPTIONS:
-        \\    -o, --output <file>    Write JSON output to <file> (default stdout)
-        \\    --project <dir>       Use build.zig root module
-        \\    --abi <file>          Write ABI JSON
-        \\    --profile <file>       Profile JSON with branch/switch/loop counts
-        \\    --evm-version <name>   EVM version (homestead..prague)
-        \\    -h, --help             Print help
-        \\
-    , .{});
-}
-
-fn printProfileUsageStderr() void {
-    std.debug.print(
-        \\USAGE: zig-to-yul profile [options] <input.zig>
-        \\
-        \\OPTIONS:
-        \\    -o, --output <file>      Write instrumented Yul to <file>
-        \\    --project <dir>         Use build.zig root module
-        \\    --abi <file>            Write ABI JSON
-        \\    --map <file>            Write profile map JSON to <file>
-        \\    --counts <file>         Raw counter JSON (repeatable)
-        \\    --profile-out <file>    Write aggregated profile.json
-        \\    --rpc-url <url>         Collect via JSON-RPC (Anvil compatible)
-        \\    --contract <addr>       Use deployed contract address
-        \\    --call-data <hex|@file> Calldata hex for eth_call
-        \\    --runs <n>              Repeat eth_call n times
-        \\    --optimize             Enable solc optimizer
-        \\    --no-deploy             Skip deployment (requires --contract)
-        \\    --return-counts         Force return count payload
-        \\    -h, --help              Print help
-        \\
-    , .{});
-}
-
-fn printVersionStdout() void {
-    std.debug.print("zig-to-yul {s}\n", .{version});
-}
-
-fn printUsageTo(writer: anytype) !void {
-    try writer.print(
-        \\zig-to-yul v{s} - Compile Zig smart contracts to EVM bytecode
-        \\
-        \\USAGE:
-        \\    zig-to-yul <command> [options] <input.zig>
-        \\
-        \\COMMANDS:
-        \\    compile     Compile Zig to Yul intermediate language
-        \\    build       Compile Zig to EVM bytecode (requires solc)
-        \\    estimate    Estimate gas; supports profile overrides
-        \\    profile     Instrument Yul and aggregate profile counts
-        \\    decode-event Decode EVM event logs
-        \\    decode-abi  Decode ABI-encoded data
-        \\    version     Print version information
-        \\    help        Print this help message
-        \\
-        \\OPTIONS:
-        \\    -o, --output <file>    Write output to <file>
-        \\    -O, --optimize         Enable solc optimizer (build only)
-        \\    --project <dir>       Use build.zig root module
-        \\    --abi <file>          Write ABI JSON
-        \\    --sourcemap           Write a .map file next to output (compile only)
+        \\    --trace               Emit Yul with source-range comments (compile only)
         \\    --optimize-yul        Run basic Yul optimizer (compile only)
         \\    --profile <file>       Profile counts JSON (estimate only)
         \\    --evm-version <name>   EVM version (estimate only)

@@ -1024,7 +1024,9 @@ pub const Transformer = struct {
             if (std.mem.eql(u8, obj_src, "self")) {
                 if (self.storageVarFor(field_name)) |sv| {
                     if (sv.is_mapping) {
-                        try self.reportUnsupportedStmt(index, "mapping assignment requires key");
+                        const msg = try std.fmt.allocPrint(self.allocator, "mapping '{s}' assignment requires key; use {s}.set(key, value)", .{ field_name, field_name });
+                        try self.temp_strings.append(self.allocator, msg);
+                        try self.reportUnsupportedStmt(index, msg);
                         return;
                     }
                     if (sv.size_bits < 256) {
@@ -1042,7 +1044,9 @@ pub const Transformer = struct {
                 const base_name = obj_src["self.".len..];
                 if (self.storageVarForNested(base_name, field_name)) |sv| {
                     if (sv.is_mapping) {
-                        try self.reportUnsupportedStmt(index, "mapping assignment requires key");
+                        const msg = try std.fmt.allocPrint(self.allocator, "mapping '{s}.{s}' assignment requires key; use {s}.{s}.set(key, value)", .{ base_name, field_name, base_name, field_name });
+                        try self.temp_strings.append(self.allocator, msg);
+                        try self.reportUnsupportedStmt(index, msg);
                         return;
                     }
                     if (sv.size_bits < 256) {
@@ -1059,11 +1063,11 @@ pub const Transformer = struct {
             } else if (p.getNodeTag(target_data[0]) == .array_access) {
                 if (try self.mappingSlotExprFromArrayAccess(target_data[0], self.nodeLocation(index))) |access| {
                     const value_type = access.value_type orelse {
-                        try self.reportUnsupportedStmt(index, "mapping value type missing");
+                        try self.reportUnsupportedStmt(index, "mapping value type missing; declare evm.Mapping(key, value)");
                         return;
                     };
                     if (!self.isStructTypeName(value_type)) {
-                        try self.reportUnsupportedStmt(index, "mapping value is not a struct");
+                        try self.reportUnsupportedStmt(index, "mapping value is not a struct; assign via set(key, value)");
                         return;
                     }
                     const field_info = self.structStorageFieldInfo(value_type, field_name) orelse {
@@ -1182,11 +1186,11 @@ pub const Transformer = struct {
             } else if (p.getNodeTag(target_data[0]) == .array_access) {
                 if (try self.mappingSlotExprFromArrayAccess(target_data[0], self.nodeLocation(index))) |access| {
                     const value_type = access.value_type orelse {
-                        try self.reportUnsupportedStmt(index, "mapping value type missing");
+                        try self.reportUnsupportedStmt(index, "mapping value type missing; declare evm.Mapping(key, value)");
                         return;
                     };
                     if (!self.isStructTypeName(value_type)) {
-                        try self.reportUnsupportedStmt(index, "mapping value is not a struct");
+                        try self.reportUnsupportedStmt(index, "mapping value is not a struct; assign via set(key, value)");
                         return;
                     }
                     const field_info = self.structStorageFieldInfo(value_type, field_name) orelse {
@@ -2549,7 +2553,7 @@ pub const Transformer = struct {
         }
 
         const base_value_type = value_type orelse {
-            try self.addError("mapping value type missing", loc, .unsupported_feature);
+            try self.addError("mapping value type missing; declare evm.Mapping(key, value)", loc, .unsupported_feature);
             return null;
         };
 
@@ -2815,7 +2819,7 @@ pub const Transformer = struct {
 
         const key_count: usize = if (is_set) if (args.len > 0) args.len - 1 else 0 else args.len;
         if (key_count == 0) {
-            try self.addError("mapping access requires key", loc, .unsupported_feature);
+            try self.addError("mapping access requires key; use get(key)", loc, .unsupported_feature);
             return null;
         }
         if (is_set and args.len < 2) {
@@ -2825,7 +2829,7 @@ pub const Transformer = struct {
 
         const access = try self.mappingSlotExprForKeys(base_slot_expr, key_type, base_value_type, args[0..key_count], loc) orelse return null;
         const final_type = access.value_type orelse {
-            try self.addError("mapping value type missing", loc, .unsupported_feature);
+            try self.addError("mapping value type missing; declare evm.Mapping(key, value)", loc, .unsupported_feature);
             return null;
         };
         if (self.mappingValueTypeName(final_type) != null) {
@@ -3230,11 +3234,13 @@ pub const Transformer = struct {
         if (p.getNodeTag(obj_node) == .array_access) {
             if (try self.mappingSlotExprFromArrayAccess(obj_node, self.nodeLocation(index))) |access| {
                 const value_type = access.value_type orelse {
-                    try self.addError("mapping value type missing", self.nodeLocation(index), .unsupported_feature);
+                    try self.addError("mapping value type missing; declare evm.Mapping(key, value); declare evm.Mapping(key, value)", self.nodeLocation(index), .unsupported_feature);
                     return ast.Expression.lit(ast.Literal.number(0));
                 };
                 if (!self.isStructTypeName(value_type)) {
-                    try self.addError("mapping value is not a struct", self.nodeLocation(index), .unsupported_feature);
+                    const msg = try std.fmt.allocPrint(self.allocator, "mapping value '{s}' is not a struct; access via get(key)", .{value_type});
+                    try self.temp_strings.append(self.allocator, msg);
+                    try self.addError(msg, self.nodeLocation(index), .unsupported_feature);
                     return ast.Expression.lit(ast.Literal.number(0));
                 }
                 const field_info = self.structStorageFieldInfo(value_type, field_name) orelse {
@@ -3259,7 +3265,9 @@ pub const Transformer = struct {
         if (std.mem.eql(u8, obj_src, "self")) {
             if (self.storageVarFor(field_name)) |sv| {
                 if (sv.is_mapping) {
-                    try self.addError("mapping access requires key", self.nodeLocation(index), .unsupported_feature);
+                    const msg = try std.fmt.allocPrint(self.allocator, "mapping '{s}' requires key; use {s}.get(key)", .{ field_name, field_name });
+                    try self.temp_strings.append(self.allocator, msg);
+                    try self.addError(msg, self.nodeLocation(index), .unsupported_feature);
                     return ast.Expression.lit(ast.Literal.number(0));
                 }
                 if (sv.size_bits < 256) {
@@ -3273,7 +3281,9 @@ pub const Transformer = struct {
             const base_name = obj_src["self.".len..];
             if (self.storageVarForNested(base_name, field_name)) |sv| {
                 if (sv.is_mapping) {
-                    try self.addError("mapping access requires key", self.nodeLocation(index), .unsupported_feature);
+                    const msg = try std.fmt.allocPrint(self.allocator, "mapping '{s}.{s}' requires key; use {s}.{s}.get(key)", .{ base_name, field_name, base_name, field_name });
+                    try self.temp_strings.append(self.allocator, msg);
+                    try self.addError(msg, self.nodeLocation(index), .unsupported_feature);
                     return ast.Expression.lit(ast.Literal.number(0));
                 }
                 if (sv.size_bits < 256) {
@@ -3310,7 +3320,7 @@ pub const Transformer = struct {
 
         if (try self.mappingSlotExprFromArrayAccess(index, loc)) |access| {
             const value_type = access.value_type orelse {
-                try self.addError("mapping value type missing", loc, .unsupported_feature);
+                try self.addError("mapping value type missing; declare evm.Mapping(key, value)", loc, .unsupported_feature);
                 return ast.Expression.lit(ast.Literal.number(0));
             };
             if (self.mappingValueTypeName(value_type) != null) {
@@ -3340,7 +3350,7 @@ pub const Transformer = struct {
                 if (self.storageVarFor(field_name)) |sv| {
                     const idx_expr = try self.translateExpression(index_node);
                     if (sv.is_mapping) {
-                        try self.addError("mapping access requires key", loc, .unsupported_feature);
+                        try self.addError("mapping access requires key; use get(key)", loc, .unsupported_feature);
                         return ast.Expression.lit(ast.Literal.number(0));
                     }
                     const addr = try self.indexedStorageSlot(sv.slot, idx_expr);
@@ -3351,7 +3361,7 @@ pub const Transformer = struct {
                 if (self.storageVarForNested(base_name, field_name)) |sv| {
                     const idx_expr = try self.translateExpression(index_node);
                     if (sv.is_mapping) {
-                        try self.addError("mapping access requires key", loc, .unsupported_feature);
+                        try self.addError("mapping access requires key; use get(key)", loc, .unsupported_feature);
                         return ast.Expression.lit(ast.Literal.number(0));
                     }
                     const addr = try self.indexedStorageSlot(sv.slot, idx_expr);
@@ -3414,7 +3424,7 @@ pub const Transformer = struct {
 
         if (try self.mappingSlotExprFromArrayAccess(target, loc)) |access| {
             const value_type = access.value_type orelse {
-                try self.addError("mapping value type missing", loc, .unsupported_feature);
+                try self.addError("mapping value type missing; declare evm.Mapping(key, value)", loc, .unsupported_feature);
                 return null;
             };
             if (self.mappingValueTypeName(value_type) != null) {
