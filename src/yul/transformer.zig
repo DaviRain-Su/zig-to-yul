@@ -2512,14 +2512,23 @@ pub const Transformer = struct {
         const obj_node = data[0];
         const method_name = p.getIdentifier(data[1]);
 
-        const returns_ref = std.mem.eql(u8, method_name, "getPtr") or
-            std.mem.eql(u8, method_name, "valuePtrAt");
+        const returns_ref = std.mem.eql(u8, method_name, "at");
         if (!returns_ref) return null;
 
         if (self.arrayStorageVarForNode(obj_node)) |sv| {
             const value_ty = sv.array_elem_type orelse return null;
-            return ArrayRefTypeInfo{ .value_type = value_ty };
+            const inner = self.arrayElemTypeName(value_ty) orelse return null;
+            return ArrayRefTypeInfo{ .value_type = inner };
         }
+
+        if (p.getNodeTag(obj_node) == .identifier) {
+            const obj_src = p.getNodeSource(obj_node);
+            if (self.local_array_ref_vars.get(obj_src)) |info| {
+                const inner = self.arrayElemTypeName(info.value_type) orelse return null;
+                return ArrayRefTypeInfo{ .value_type = inner };
+            }
+        }
+
         return null;
     }
 
@@ -3416,11 +3425,26 @@ pub const Transformer = struct {
 
         const info = self.local_array_ref_vars.get(obj_src) orelse return null;
 
+        const is_len = std.mem.eql(u8, method_name, "len");
+        const is_is_empty = std.mem.eql(u8, method_name, "isEmpty");
+        const is_count = std.mem.eql(u8, method_name, "count");
         const is_get = std.mem.eql(u8, method_name, "get");
         const is_set = std.mem.eql(u8, method_name, "set");
+        const is_get_ptr = std.mem.eql(u8, method_name, "getPtr");
+        const is_value_ptr_at = std.mem.eql(u8, method_name, "valuePtrAt");
+        const is_at = std.mem.eql(u8, method_name, "at");
+        const is_push = std.mem.eql(u8, method_name, "push");
+        const is_pop = std.mem.eql(u8, method_name, "pop");
+        const is_remove = std.mem.eql(u8, method_name, "remove");
+        const is_swap_remove = std.mem.eql(u8, method_name, "swapRemove");
+        const is_remove_stable = std.mem.eql(u8, method_name, "removeStable");
+        const is_insert = std.mem.eql(u8, method_name, "insert");
+        const is_resize = std.mem.eql(u8, method_name, "resize");
+        const is_clear = std.mem.eql(u8, method_name, "clear");
+        const is_clear_and_zero = std.mem.eql(u8, method_name, "clearAndZero");
         const is_index = std.mem.eql(u8, method_name, "getIndex");
         const is_slot = std.mem.eql(u8, method_name, "getSlot");
-        if (!is_get and !is_set and !is_index and !is_slot) return null;
+        if (!is_len and !is_is_empty and !is_count and !is_get and !is_set and !is_get_ptr and !is_value_ptr_at and !is_at and !is_push and !is_pop and !is_remove and !is_swap_remove and !is_remove_stable and !is_insert and !is_resize and !is_clear and !is_clear_and_zero and !is_index and !is_slot) return null;
 
         const ref_expr = ast.Expression.id(obj_src);
         const base_expr = try self.arrayRefFieldExpr(ref_expr, 0);
@@ -3443,21 +3467,149 @@ pub const Transformer = struct {
             return slot_expr;
         }
 
-        if (is_set) {
+        if (self.isMappingTypeName(info.value_type)) {
+            try self.addError("array element mapping not supported", loc, .unsupported_feature);
+            return null;
+        }
+        const value_is_array = self.isArrayTypeName(info.value_type);
+
+        if (value_is_array and (is_get or is_set or is_get_ptr or is_value_ptr_at or is_push or is_pop or is_remove or is_swap_remove or is_remove_stable or is_insert)) {
+            try self.addError("nested array element requires at(index) for access", loc, .unsupported_feature);
+            return null;
+        }
+
+        if (is_len or is_count) {
+            if (args.len != 0) {
+                try self.addError("array.len expects no arguments", loc, .unsupported_feature);
+                return null;
+            }
+            return try self.builder.builtinCall("sload", &.{base_expr});
+        }
+
+        if (is_is_empty) {
+            if (args.len != 0) {
+                try self.addError("array.isEmpty expects no arguments", loc, .unsupported_feature);
+                return null;
+            }
+            const len_expr = try self.builder.builtinCall("sload", &.{base_expr});
+            return try self.builder.builtinCall("iszero", &.{len_expr});
+        }
+
+        if (is_get) {
             if (args.len != 1) {
-                try self.addError("array ref set expects value", loc, .unsupported_feature);
+                try self.addError("array.get expects index", loc, .unsupported_feature);
+                return null;
+            }
+            const helper = try self.ensureArrayGetHelper(info.value_type);
+            return try self.builder.call(helper, &.{ base_expr, args[0] });
+        }
+
+        if (is_set) {
+            if (args.len != 2) {
+                try self.addError("array.set expects index and value", loc, .unsupported_feature);
                 return null;
             }
             const helper = try self.ensureArraySetHelper(info.value_type);
-            return try self.builder.call(helper, &.{ base_expr, index_expr, args[0] });
+            return try self.builder.call(helper, &.{ base_expr, args[0], args[1] });
         }
 
-        if (args.len != 0) {
-            try self.addError("array ref get expects no arguments", loc, .unsupported_feature);
-            return null;
+        if (is_get_ptr or is_value_ptr_at) {
+            if (args.len != 1) {
+                try self.addError("array.getPtr expects index", loc, .unsupported_feature);
+                return null;
+            }
+            const elem_slot = try self.arrayElementSlotExpr(base_expr, args[0], info.value_type);
+            const helper = try self.ensureArrayRefHelper();
+            return try self.builder.call(helper, &.{ base_expr, args[0], elem_slot });
         }
-        const helper = try self.ensureArrayGetHelper(info.value_type);
-        return try self.builder.call(helper, &.{ base_expr, index_expr });
+
+        if (is_at) {
+            if (!value_is_array) {
+                try self.addError("array.at requires nested array element", loc, .unsupported_feature);
+                return null;
+            }
+            if (args.len != 1) {
+                try self.addError("array.at expects index", loc, .unsupported_feature);
+                return null;
+            }
+            const elem_slot = try self.arrayElementSlotExpr(base_expr, args[0], info.value_type);
+            const helper = try self.ensureArrayRefHelper();
+            return try self.builder.call(helper, &.{ base_expr, args[0], elem_slot });
+        }
+
+        if (is_push) {
+            if (args.len != 1) {
+                try self.addError("array.push expects value", loc, .unsupported_feature);
+                return null;
+            }
+            const helper = try self.ensureArrayPushHelper(info.value_type);
+            return try self.builder.call(helper, &.{ base_expr, args[0] });
+        }
+
+        if (is_pop) {
+            if (args.len != 0) {
+                try self.addError("array.pop expects no arguments", loc, .unsupported_feature);
+                return null;
+            }
+            const helper = try self.ensureArrayPopHelper(info.value_type);
+            return try self.builder.call(helper, &.{base_expr});
+        }
+
+        if (is_remove or is_swap_remove) {
+            if (args.len != 1) {
+                try self.addError("array.remove expects index", loc, .unsupported_feature);
+                return null;
+            }
+            const helper = try self.ensureArrayRemoveHelper(info.value_type);
+            return try self.builder.call(helper, &.{ base_expr, args[0] });
+        }
+
+        if (is_remove_stable) {
+            if (args.len != 1) {
+                try self.addError("array.removeStable expects index", loc, .unsupported_feature);
+                return null;
+            }
+            const helper = try self.ensureArrayRemoveStableHelper(info.value_type);
+            return try self.builder.call(helper, &.{ base_expr, args[0] });
+        }
+
+        if (is_insert) {
+            if (args.len != 2) {
+                try self.addError("array.insert expects index and value", loc, .unsupported_feature);
+                return null;
+            }
+            const helper = try self.ensureArrayInsertHelper(info.value_type);
+            return try self.builder.call(helper, &.{ base_expr, args[0], args[1] });
+        }
+
+        if (is_resize) {
+            if (args.len != 1) {
+                try self.addError("array.resize expects length", loc, .unsupported_feature);
+                return null;
+            }
+            const helper = try self.ensureArrayResizeHelper();
+            return try self.builder.call(helper, &.{ base_expr, args[0] });
+        }
+
+        if (is_clear) {
+            if (args.len != 0) {
+                try self.addError("array.clear expects no arguments", loc, .unsupported_feature);
+                return null;
+            }
+            const helper = try self.ensureArrayClearHelper();
+            return try self.builder.call(helper, &.{base_expr});
+        }
+
+        if (is_clear_and_zero) {
+            if (args.len != 0) {
+                try self.addError("array.clearAndZero expects no arguments", loc, .unsupported_feature);
+                return null;
+            }
+            const helper = try self.ensureArrayClearAndZeroHelper(info.value_type);
+            return try self.builder.call(helper, &.{base_expr});
+        }
+
+        return null;
     }
 
     fn translateArrayMethod(
@@ -3480,6 +3632,7 @@ pub const Transformer = struct {
         const is_set = std.mem.eql(u8, method_name, "set");
         const is_get_ptr = std.mem.eql(u8, method_name, "getPtr");
         const is_value_ptr_at = std.mem.eql(u8, method_name, "valuePtrAt");
+        const is_at = std.mem.eql(u8, method_name, "at");
         const is_push = std.mem.eql(u8, method_name, "push");
         const is_pop = std.mem.eql(u8, method_name, "pop");
         const is_remove = std.mem.eql(u8, method_name, "remove");
@@ -3489,19 +3642,25 @@ pub const Transformer = struct {
         const is_resize = std.mem.eql(u8, method_name, "resize");
         const is_clear = std.mem.eql(u8, method_name, "clear");
         const is_clear_and_zero = std.mem.eql(u8, method_name, "clearAndZero");
-        if (!is_len and !is_is_empty and !is_count and !is_get and !is_set and !is_get_ptr and !is_value_ptr_at and !is_push and !is_pop and !is_remove and !is_swap_remove and !is_remove_stable and !is_insert and !is_resize and !is_clear and !is_clear_and_zero) return null;
+        if (!is_len and !is_is_empty and !is_count and !is_get and !is_set and !is_get_ptr and !is_value_ptr_at and !is_at and !is_push and !is_pop and !is_remove and !is_swap_remove and !is_remove_stable and !is_insert and !is_resize and !is_clear and !is_clear_and_zero) return null;
 
         const sv = self.arrayStorageVarForNode(obj_node) orelse return null;
         const value_type = sv.array_elem_type orelse {
             try self.addError("array element type missing; declare evm.Array(T)", loc, .unsupported_feature);
             return null;
         };
-        if (self.isMappingTypeName(value_type) or self.isArrayTypeName(value_type)) {
-            try self.addError("nested array element type not supported", loc, .unsupported_feature);
+        if (self.isMappingTypeName(value_type)) {
+            try self.addError("array element mapping not supported", loc, .unsupported_feature);
             return null;
         }
+        const value_is_array = self.isArrayTypeName(value_type);
 
         const base_slot_expr = ast.Expression.lit(ast.Literal.number(sv.slot));
+
+        if (value_is_array and (is_get or is_set or is_get_ptr or is_value_ptr_at or is_push or is_pop or is_remove or is_swap_remove or is_remove_stable or is_insert)) {
+            try self.addError("nested array element requires at(index) for access", loc, .unsupported_feature);
+            return null;
+        }
 
         if (is_len or is_count) {
             if (args.len != 0) {
@@ -3541,6 +3700,20 @@ pub const Transformer = struct {
         if (is_get_ptr or is_value_ptr_at) {
             if (args.len != 1) {
                 try self.addError("array.getPtr expects index", loc, .unsupported_feature);
+                return null;
+            }
+            const slot_expr = try self.arrayElementSlotExpr(base_slot_expr, args[0], value_type);
+            const helper = try self.ensureArrayRefHelper();
+            return try self.builder.call(helper, &.{ base_slot_expr, args[0], slot_expr });
+        }
+
+        if (is_at) {
+            if (!value_is_array) {
+                try self.addError("array.at requires nested array element", loc, .unsupported_feature);
+                return null;
+            }
+            if (args.len != 1) {
+                try self.addError("array.at expects index", loc, .unsupported_feature);
                 return null;
             }
             const slot_expr = try self.arrayElementSlotExpr(base_slot_expr, args[0], value_type);

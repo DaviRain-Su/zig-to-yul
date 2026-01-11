@@ -358,6 +358,112 @@ pub fn Array(comptime Element: type) type {
             }
         };
 
+        pub const ArrayRef = struct {
+            base: U256,
+            index: U256,
+            slot: U256,
+
+            pub fn len(self: ArrayRef) U256 {
+                _ = self;
+                return 0;
+            }
+
+            pub fn isEmpty(self: ArrayRef) bool {
+                _ = self;
+                return true;
+            }
+
+            pub fn count(self: ArrayRef) U256 {
+                _ = self;
+                return 0;
+            }
+
+            pub fn get(self: ArrayRef, index: U256) Element {
+                _ = self;
+                _ = index;
+                return undefined;
+            }
+
+            pub fn set(self: ArrayRef, index: U256, value: Element) void {
+                _ = self;
+                _ = index;
+                _ = value;
+            }
+
+            pub fn getPtr(self: ArrayRef, index: U256) Ref {
+                _ = self;
+                _ = index;
+                return undefined;
+            }
+
+            pub fn valuePtrAt(self: ArrayRef, index: U256) Ref {
+                _ = self;
+                _ = index;
+                return undefined;
+            }
+
+            pub fn push(self: ArrayRef, value: Element) void {
+                _ = self;
+                _ = value;
+            }
+
+            pub fn pop(self: ArrayRef) Element {
+                _ = self;
+                return undefined;
+            }
+
+            pub fn remove(self: ArrayRef, index: U256) Element {
+                _ = self;
+                _ = index;
+                return undefined;
+            }
+
+            pub fn swapRemove(self: ArrayRef, index: U256) Element {
+                _ = self;
+                _ = index;
+                return undefined;
+            }
+
+            pub fn removeStable(self: ArrayRef, index: U256) Element {
+                _ = self;
+                _ = index;
+                return undefined;
+            }
+
+            pub fn insert(self: ArrayRef, index: U256, value: Element) void {
+                _ = self;
+                _ = index;
+                _ = value;
+            }
+
+            pub fn resize(self: ArrayRef, new_len: U256) void {
+                _ = self;
+                _ = new_len;
+            }
+
+            pub fn clear(self: ArrayRef) void {
+                _ = self;
+            }
+
+            pub fn clearAndZero(self: ArrayRef) void {
+                _ = self;
+            }
+
+            pub fn at(self: ArrayRef, index: U256) ArrayRef {
+                _ = self;
+                _ = index;
+                return undefined;
+            }
+
+            pub fn getIndex(self: ArrayRef) U256 {
+                return self.index;
+            }
+
+            pub fn getSlot(self: ArrayRef) U256 {
+                return self.slot;
+            }
+        };
+
         pub const Iterator = struct {
             array: *Self,
             index: U256,
@@ -431,6 +537,12 @@ pub fn Array(comptime Element: type) type {
         }
 
         pub fn valuePtrAt(self: *Self, index: U256) Ref {
+            _ = self;
+            _ = index;
+            return undefined;
+        }
+
+        pub fn at(self: *Self, index: U256) ArrayRef {
             _ = self;
             _ = index;
             return undefined;
@@ -881,4 +993,10 @@ test "array api" {
     it.forEach(struct {
         fn visit(_: Arr.Iterator.Item) void {}
     }.visit);
+
+    const Nested = Array(Array(U256));
+    var nested: Nested = .{};
+    _ = nested.at(0);
+    _ = nested.len();
+    nested.resize(0);
 }
