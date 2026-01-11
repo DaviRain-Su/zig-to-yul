@@ -369,9 +369,11 @@ pub fn bumpBalance(self: *Token, owner: evm.Address, delta: u256) void {
 
 Notes:
 - `getPtr`/`getOrPutPtr`/`fetchPutPtr`/`putNoClobberPtr` return a storage-backed ref with `get`/`set`/`exists`.
+- `getKey()`/`getSlot()` expose the key/slot stored in the ref.
 - `valuePtrAt(index)` returns a ref for the entry at `index`.
 - `keyPtrAt(index)` is the same as `keyAt(index)` for fixed keys.
 - `removeOrNull` returns zero when the key is missing.
+- `removeOrNullInfo` returns a `RemoveRef` with `removed()` and `getValue()` for "bool + value" semantics.
 - `ensureCapacity`/`shrinkToFit` are no-ops for mappings.
 
 ### EVM Built-in Functions

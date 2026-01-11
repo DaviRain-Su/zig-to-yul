@@ -19,6 +19,10 @@ const MappingRefTypeInfo = struct {
     value_type: []const u8,
 };
 
+const MappingRemoveRefTypeInfo = struct {
+    value_type: []const u8,
+};
+
 pub const Transformer = struct {
     allocator: Allocator,
     zig_parser: ?parser.Parser,
@@ -30,6 +34,7 @@ pub const Transformer = struct {
     struct_init_helpers: std.StringHashMap([]const u8),
     local_struct_vars: std.StringHashMap([]const u8),
     local_mapping_ref_vars: std.StringHashMap(MappingRefTypeInfo),
+    local_mapping_remove_ref_vars: std.StringHashMap(MappingRemoveRefTypeInfo),
     local_array_elem_types: std.StringHashMap([]const u8),
 
     function_param_structs: std.StringHashMap([]const []const u8),
@@ -145,6 +150,7 @@ pub const Transformer = struct {
             .struct_init_helpers = std.StringHashMap([]const u8).init(allocator),
             .local_struct_vars = std.StringHashMap([]const u8).init(allocator),
             .local_mapping_ref_vars = std.StringHashMap(MappingRefTypeInfo).init(allocator),
+            .local_mapping_remove_ref_vars = std.StringHashMap(MappingRemoveRefTypeInfo).init(allocator),
             .local_array_elem_types = std.StringHashMap([]const u8).init(allocator),
             .function_param_structs = std.StringHashMap([]const []const u8).init(allocator),
             .precompile_helpers = std.StringHashMap([]const u8).init(allocator),
@@ -199,6 +205,12 @@ pub const Transformer = struct {
             self.allocator.free(entry.value_ptr.*.value_type);
         }
         self.local_mapping_ref_vars.deinit();
+        var remove_ref_it = self.local_mapping_remove_ref_vars.iterator();
+        while (remove_ref_it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            self.allocator.free(entry.value_ptr.*.value_type);
+        }
+        self.local_mapping_remove_ref_vars.deinit();
         var array_it = self.local_array_elem_types.iterator();
         while (array_it.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
@@ -926,6 +938,9 @@ pub const Transformer = struct {
                     if (try self.mappingRefTypeForCall(init_idx)) |ref_info| {
                         try self.setLocalMappingRefVar(name, ref_info);
                     }
+                    if (try self.mappingRemoveRefTypeForCall(init_idx)) |ref_info| {
+                        try self.setLocalMappingRemoveRefVar(name, ref_info);
+                    }
                 }
             } else if (type_override == null) {
                 try self.addError("variable requires type or initializer", self.nodeLocation(index), .type_error);
@@ -958,6 +973,9 @@ pub const Transformer = struct {
             const target_name = p.getNodeSource(target_node);
             if (try self.mappingRefTypeForCall(value_node)) |ref_info| {
                 try self.setLocalMappingRefVar(target_name, ref_info);
+            }
+            if (try self.mappingRemoveRefTypeForCall(value_node)) |ref_info| {
+                try self.setLocalMappingRemoveRefVar(target_name, ref_info);
             }
         }
 
@@ -2176,7 +2194,9 @@ pub const Transformer = struct {
         const is_set = std.mem.eql(u8, method_name, "set");
         const is_exists = std.mem.eql(u8, method_name, "exists");
         const is_inserted = std.mem.eql(u8, method_name, "wasInserted");
-        if (!is_get and !is_set and !is_exists and !is_inserted) return null;
+        const is_key = std.mem.eql(u8, method_name, "getKey");
+        const is_slot = std.mem.eql(u8, method_name, "getSlot");
+        if (!is_get and !is_set and !is_exists and !is_inserted and !is_key and !is_slot) return null;
 
         const ref_expr = ast.Expression.id(obj_src);
         const base_expr = try self.mappingRefFieldExpr(ref_expr, 0);
@@ -2189,6 +2209,22 @@ pub const Transformer = struct {
                 return null;
             }
             return try self.mappingRefFieldExpr(ref_expr, 96);
+        }
+
+        if (is_key) {
+            if (args.len != 0) {
+                try self.addError("mapping ref getKey expects no arguments", loc, .unsupported_feature);
+                return null;
+            }
+            return key_expr;
+        }
+
+        if (is_slot) {
+            if (args.len != 0) {
+                try self.addError("mapping ref getSlot expects no arguments", loc, .unsupported_feature);
+                return null;
+            }
+            return slot_expr;
         }
 
         if (is_exists) {
@@ -2276,6 +2312,72 @@ pub const Transformer = struct {
         return null;
     }
 
+    fn mappingRemoveRefTypeForCall(self: *Self, call_index: ZigAst.Node.Index) TransformProcessError!?MappingRemoveRefTypeInfo {
+        const p = &self.zig_parser.?;
+        var call_buf: [1]ZigAst.Node.Index = undefined;
+        const call_info = p.ast.fullCall(&call_buf, call_index) orelse return null;
+        if (p.getNodeTag(call_info.ast.fn_expr) != .field_access) return null;
+
+        const data = p.ast.nodeData(call_info.ast.fn_expr).node_and_token;
+        const obj_node = data[0];
+        const method_name = p.getIdentifier(data[1]);
+
+        const returns_remove_ref = std.mem.eql(u8, method_name, "removeOrNullInfo");
+        if (!returns_remove_ref) return null;
+
+        if (self.mappingStorageVarForNode(obj_node)) |sv| {
+            const value_ty = sv.mapping_value_type orelse return null;
+            return MappingRemoveRefTypeInfo{ .value_type = value_ty };
+        }
+        if (p.getNodeTag(obj_node) == .array_access) {
+            const access = try self.mappingSlotExprFromArrayAccess(obj_node, self.nodeLocation(call_index)) orelse return null;
+            const mapping_type = access.value_type orelse return null;
+            const nested_value = self.mappingValueTypeName(mapping_type) orelse return null;
+            return MappingRemoveRefTypeInfo{ .value_type = nested_value };
+        }
+        return null;
+    }
+
+    fn mappingRemoveRefFieldExpr(self: *Self, ref_expr: ast.Expression, offset: ast.U256) TransformProcessError!ast.Expression {
+        const addr = if (offset == 0)
+            ref_expr
+        else
+            try self.builder.builtinCall("add", &.{ ref_expr, ast.Expression.lit(ast.Literal.number(offset)) });
+        return try self.builder.builtinCall("mload", &.{addr});
+    }
+
+    fn translateMappingRemoveRefMethod(
+        self: *Self,
+        fn_expr: ZigAst.Node.Index,
+        args: []const ast.Expression,
+        loc: ast.SourceLocation,
+    ) TransformProcessError!?ast.Expression {
+        const p = &self.zig_parser.?;
+        if (p.getNodeTag(fn_expr) != .field_access) return null;
+
+        const data = p.ast.nodeData(fn_expr).node_and_token;
+        const obj_node = data[0];
+        const obj_src = p.getNodeSource(obj_node);
+        const method_name = p.getIdentifier(data[1]);
+
+        _ = self.local_mapping_remove_ref_vars.get(obj_src) orelse return null;
+
+        const is_removed = std.mem.eql(u8, method_name, "removed");
+        const is_value = std.mem.eql(u8, method_name, "getValue");
+        if (!is_removed and !is_value) return null;
+
+        if (args.len != 0) {
+            try self.addError("remove ref method expects no arguments", loc, .unsupported_feature);
+            return null;
+        }
+
+        const ref_expr = ast.Expression.id(obj_src);
+        if (is_removed) {
+            return try self.mappingRemoveRefFieldExpr(ref_expr, 0);
+        }
+        return try self.mappingRemoveRefFieldExpr(ref_expr, 32);
+    }
+
     fn translateMappingMethod(
         self: *Self,
         fn_expr: ZigAst.Node.Index,
@@ -2311,12 +2413,13 @@ pub const Transformer = struct {
         const is_fetch_put = std.mem.eql(u8, method_name, "fetchPut");
         const is_remove_value = std.mem.eql(u8, method_name, "removeValue");
         const is_remove_or_null = std.mem.eql(u8, method_name, "removeOrNull");
+        const is_remove_or_null_info = std.mem.eql(u8, method_name, "removeOrNullInfo");
         const is_get_ptr = std.mem.eql(u8, method_name, "getPtr");
         const is_get_or_put_ptr = std.mem.eql(u8, method_name, "getOrPutPtr");
         const is_get_or_put_ptr_default = std.mem.eql(u8, method_name, "getOrPutPtrDefault");
         const is_put_no_clobber_ptr = std.mem.eql(u8, method_name, "putNoClobberPtr");
         const is_fetch_put_ptr = std.mem.eql(u8, method_name, "fetchPutPtr");
-        if (!is_get and !is_set and !is_contains and !is_remove and !is_len and !is_is_empty and !is_count and !is_ensure_capacity and !is_shrink_to_fit and !is_key_at and !is_value_at and !is_key_ptr_at and !is_value_ptr_at and !is_keys and !is_values and !is_clear and !is_get_or_put and !is_get_or_put_default and !is_put_no_clobber and !is_fetch_put and !is_remove_value and !is_remove_or_null and !is_get_ptr and !is_get_or_put_ptr and !is_get_or_put_ptr_default and !is_put_no_clobber_ptr and !is_fetch_put_ptr) return null;
+        if (!is_get and !is_set and !is_contains and !is_remove and !is_len and !is_is_empty and !is_count and !is_ensure_capacity and !is_shrink_to_fit and !is_key_at and !is_value_at and !is_key_ptr_at and !is_value_ptr_at and !is_keys and !is_values and !is_clear and !is_get_or_put and !is_get_or_put_default and !is_put_no_clobber and !is_fetch_put and !is_remove_value and !is_remove_or_null and !is_remove_or_null_info and !is_get_ptr and !is_get_or_put_ptr and !is_get_or_put_ptr_default and !is_put_no_clobber_ptr and !is_fetch_put_ptr) return null;
 
         var base_slot_expr: ast.Expression = undefined;
         var key_type: ?[]const u8 = null;
@@ -2402,7 +2505,7 @@ pub const Transformer = struct {
             return try self.builder.call(helper, &.{base_slot_expr});
         }
 
-        if (is_get_ptr or is_get_or_put_ptr or is_get_or_put_ptr_default or is_put_no_clobber_ptr or is_fetch_put_ptr or is_remove_or_null) {
+        if (is_get_ptr or is_get_or_put_ptr or is_get_or_put_ptr_default or is_put_no_clobber_ptr or is_fetch_put_ptr or is_remove_or_null or is_remove_or_null_info) {
             const key_ty = key_type orelse {
                 try self.addError("mapping key type missing", loc, .unsupported_feature);
                 return null;
@@ -2464,6 +2567,14 @@ pub const Transformer = struct {
                     return null;
                 }
                 const helper = try self.ensureMappingRemoveOrNullHelper(key_ty, base_value_type);
+                return try self.builder.call(helper, &.{ slot_expr, base_slot_expr, key_expr });
+            }
+            if (is_remove_or_null_info) {
+                if (args.len != 1) {
+                    try self.addError("removeOrNullInfo expects key", loc, .unsupported_feature);
+                    return null;
+                }
+                const helper = try self.ensureMappingRemoveOrNullInfoHelper(key_ty, base_value_type);
                 return try self.builder.call(helper, &.{ slot_expr, base_slot_expr, key_expr });
             }
         }
@@ -2740,6 +2851,9 @@ pub const Transformer = struct {
             try args.append(self.allocator, try self.translateExpression(param_node));
         }
 
+        if (try self.translateMappingRemoveRefMethod(call_info.ast.fn_expr, args.items, self.nodeLocation(index))) |expr| {
+            return expr;
+        }
         if (try self.translateMappingRefMethod(call_info.ast.fn_expr, args.items, self.nodeLocation(index))) |expr| {
             return expr;
         }
@@ -5097,6 +5211,66 @@ pub const Transformer = struct {
         return helper_name;
     }
 
+    fn ensureMappingRemoveOrNullInfoHelper(self: *Self, key_type: []const u8, value_type: []const u8) ![]const u8 {
+        const key_name = try std.fmt.allocPrint(self.allocator, "mapping_remove_or_null_info:{s}:{s}", .{ key_type, value_type });
+        defer self.allocator.free(key_name);
+        if (self.math_helpers.get(key_name)) |helper| return helper;
+
+        const type_id = try std.fmt.allocPrint(self.allocator, "{s}_{s}", .{ key_type, value_type });
+        defer self.allocator.free(type_id);
+        const helper_name = try self.mappingStructHelperName("__zig2yul$map_remoni$", type_id);
+        const key = try self.allocator.dupe(u8, key_name);
+        try self.math_helpers.put(key, helper_name);
+
+        var stmts: std.ArrayList(ast.Statement) = .empty;
+        defer stmts.deinit(self.allocator);
+
+        const ptr_expr = try self.builder.builtinCall("mload", &.{
+            ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0x40))),
+        });
+        try stmts.append(self.allocator, try self.builder.varDecl(&.{"ptr"}, ptr_expr));
+
+        const zero = ast.Expression.lit(ast.Literal.number(0));
+        const store_removed = try self.builder.builtinCall("mstore", &.{ ast.Expression.id("ptr"), zero });
+        try stmts.append(self.allocator, ast.Statement.expr(store_removed));
+
+        const value_addr = try self.builder.builtinCall("add", &.{ ast.Expression.id("ptr"), ast.Expression.lit(ast.Literal.number(32)) });
+        try stmts.append(self.allocator, try self.builder.varDecl(&.{"value_ptr"}, value_addr));
+        const store_value = try self.builder.builtinCall("mstore", &.{ ast.Expression.id("value_ptr"), zero });
+        try stmts.append(self.allocator, ast.Statement.expr(store_value));
+
+        const exists_slot = try self.mappingExistsSlotExpr(ast.Expression.id("base"), ast.Expression.id("key"), key_type);
+        const exists_val = try self.builder.builtinCall("sload", &.{exists_slot});
+        try stmts.append(self.allocator, try self.builder.varDecl(&.{"exists"}, exists_val));
+
+        const cond = try self.builder.builtinCall("iszero", &.{
+            try self.builder.builtinCall("iszero", &.{ast.Expression.id("exists")}),
+        });
+
+        const value_expr = try self.mappingValueExpr(ast.Expression.id("slot"), value_type, .{ .start = 0, .end = 0 });
+        const store_value_if = try self.builder.builtinCall("mstore", &.{ ast.Expression.id("value_ptr"), value_expr });
+        const remove_helper = try self.ensureMappingRemoveHelper(key_type, value_type, true);
+        const remove_expr = try self.builder.call(remove_helper, &.{ ast.Expression.id("slot"), ast.Expression.id("base"), ast.Expression.id("key") });
+        const store_removed_if = try self.builder.builtinCall("mstore", &.{ ast.Expression.id("ptr"), ast.Expression.lit(ast.Literal.number(1)) });
+        const if_block = try self.builder.block(&.{ ast.Statement.expr(store_value_if), ast.Statement.expr(remove_expr), ast.Statement.expr(store_removed_if) });
+        try stmts.append(self.allocator, self.builder.ifStmt(cond, if_block));
+
+        const update_free = try self.builder.builtinCall("mstore", &.{
+            ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0x40))),
+            try self.builder.builtinCall("add", &.{ ast.Expression.id("ptr"), ast.Expression.lit(ast.Literal.number(64)) }),
+        });
+        try stmts.append(self.allocator, ast.Statement.expr(update_free));
+
+        const assign_ptr = try self.builder.assign(&.{"result"}, ast.Expression.id("ptr"));
+        try stmts.append(self.allocator, assign_ptr);
+
+        const body = try self.builder.block(stmts.items);
+        const func = try self.builder.funcDef(helper_name, &.{ "slot", "base", "key" }, &.{"result"}, body);
+        try self.extra_functions.append(self.allocator, func);
+
+        return helper_name;
+    }
+
     fn ensureMappingClearHelper(self: *Self, key_type: []const u8, value_type: []const u8) ![]const u8 {
         const key_name = try std.fmt.allocPrint(self.allocator, "mapping_clear:{s}:{s}", .{ key_type, value_type });
         defer self.allocator.free(key_name);
@@ -6010,6 +6184,21 @@ pub const Transformer = struct {
             .value_type = try self.allocator.dupe(u8, info.value_type),
         };
         try self.local_mapping_ref_vars.put(key, value);
+    }
+
+    fn setLocalMappingRemoveRefVar(self: *Self, name: []const u8, info: MappingRemoveRefTypeInfo) !void {
+        if (self.local_mapping_remove_ref_vars.getEntry(name)) |entry| {
+            self.allocator.free(entry.value_ptr.*.value_type);
+            entry.value_ptr.* = .{
+                .value_type = try self.allocator.dupe(u8, info.value_type),
+            };
+            return;
+        }
+        const key = try self.allocator.dupe(u8, name);
+        const value = MappingRemoveRefTypeInfo{
+            .value_type = try self.allocator.dupe(u8, info.value_type),
+        };
+        try self.local_mapping_remove_ref_vars.put(key, value);
     }
 
     fn setLocalArrayElemType(self: *Self, name: []const u8, elem_type: []const u8) !void {

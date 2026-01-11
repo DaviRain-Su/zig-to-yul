@@ -114,6 +114,12 @@ pub fn Mapping(comptime Key: type, comptime Value: type) type {
             return undefined;
         }
 
+        pub fn removeOrNullInfo(self: *@This(), key: Key) RemoveRef {
+            _ = self;
+            _ = key;
+            return undefined;
+        }
+
         pub fn isEmpty(self: *@This()) bool {
             _ = self;
             return true;
@@ -156,6 +162,27 @@ pub fn Mapping(comptime Key: type, comptime Value: type) type {
 
             pub fn wasInserted(self: Ref) bool {
                 return self.inserted;
+            }
+
+            pub fn getKey(self: Ref) Key {
+                return self.key;
+            }
+
+            pub fn getSlot(self: Ref) U256 {
+                return self.slot;
+            }
+        };
+
+        pub const RemoveRef = struct {
+            removed_flag: bool,
+            value: Value,
+
+            pub fn removed(self: RemoveRef) bool {
+                return self.removed_flag;
+            }
+
+            pub fn getValue(self: RemoveRef) Value {
+                return self.value;
             }
         };
 
@@ -612,6 +639,8 @@ test "mapping iterator api" {
     const ref = mapping.getPtr(0);
     _ = ref.exists();
     _ = ref.wasInserted();
+    _ = ref.getKey();
+    _ = ref.getSlot();
     ref.set(0);
     _ = ref.get();
 
@@ -621,4 +650,8 @@ test "mapping iterator api" {
     _ = mapping.fetchPutPtr(0, 1);
     _ = mapping.keyPtrAt(0);
     _ = mapping.valuePtrAt(0);
+
+    const remove_info = mapping.removeOrNullInfo(0);
+    _ = remove_info.removed();
+    _ = remove_info.getValue();
 }
