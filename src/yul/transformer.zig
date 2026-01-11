@@ -758,6 +758,12 @@ pub const Transformer = struct {
             .assign_add => {
                 try self.processAssignAdd(index, stmts);
             },
+            .assign_sub => {
+                try self.processAssignSub(index, stmts);
+            },
+            .assign_mul => {
+                try self.processAssignMul(index, stmts);
+            },
             .@"return" => {
                 try self.processReturn(index, stmts);
             },
@@ -821,6 +827,8 @@ pub const Transformer = struct {
                 } else {
                     value = try self.translateExpression(init_idx);
                 }
+            } else if (type_override == null) {
+                try self.addError("variable requires type or initializer", self.nodeLocation(index), .type_error);
             }
 
             const stmt = try self.builder.varDecl(&.{name}, value);
@@ -926,7 +934,7 @@ pub const Transformer = struct {
         try stmts.append(self.allocator, self.stmtWithLocation(stmt, self.nodeLocation(index)));
     }
 
-    fn processAssignAdd(self: *Self, index: ZigAst.Node.Index, stmts: *std.ArrayList(ast.Statement)) TransformProcessError!void {
+    fn processAssignBinary(self: *Self, index: ZigAst.Node.Index, stmts: *std.ArrayList(ast.Statement), op: []const u8) TransformProcessError!void {
         const p = &self.zig_parser.?;
         const data = p.ast.nodeData(index);
         const nodes = data.node_and_node;
@@ -938,7 +946,7 @@ pub const Transformer = struct {
 
         const target_expr = try self.translateExpression(target_node);
         const value_expr = try self.translateExpression(value_node);
-        const add_expr = try self.builder.builtinCall("add", &.{ target_expr, value_expr });
+        const op_expr = try self.builder.builtinCall(op, &.{ target_expr, value_expr });
 
         if (target_tag == .field_access) {
             const target_data = p.ast.nodeData(target_node).node_and_token;
@@ -953,12 +961,12 @@ pub const Transformer = struct {
                         return;
                     }
                     if (sv.size_bits < 256) {
-                        try self.genPackedWrite(sv, add_expr, stmts, index);
+                        try self.genPackedWrite(sv, op_expr, stmts, index);
                         return;
                     }
                     const sstore_call = try self.builder.builtinCall("sstore", &.{
                         ast.Expression.lit(ast.Literal.number(sv.slot)),
-                        add_expr,
+                        op_expr,
                     });
                     try stmts.append(self.allocator, self.stmtWithLocation(ast.Statement.expr(sstore_call), self.nodeLocation(index)));
                     return;
@@ -971,12 +979,12 @@ pub const Transformer = struct {
                         return;
                     }
                     if (sv.size_bits < 256) {
-                        try self.genPackedWrite(sv, add_expr, stmts, index);
+                        try self.genPackedWrite(sv, op_expr, stmts, index);
                         return;
                     }
                     const sstore_call = try self.builder.builtinCall("sstore", &.{
                         ast.Expression.lit(ast.Literal.number(sv.slot)),
-                        add_expr,
+                        op_expr,
                     });
                     try stmts.append(self.allocator, self.stmtWithLocation(ast.Statement.expr(sstore_call), self.nodeLocation(index)));
                     return;
@@ -990,7 +998,7 @@ pub const Transformer = struct {
                             ast.Expression.id(obj_src),
                             ast.Expression.lit(ast.Literal.number(offset)),
                         });
-                        const mstore_call = try self.builder.builtinCall("mstore", &.{ addr, add_expr });
+                        const mstore_call = try self.builder.builtinCall("mstore", &.{ addr, op_expr });
                         try stmts.append(self.allocator, self.stmtWithLocation(ast.Statement.expr(mstore_call), self.nodeLocation(index)));
                         return;
                     }
@@ -999,7 +1007,7 @@ pub const Transformer = struct {
         }
 
         if (target_tag == .array_access) {
-            if (try self.translateArrayAccessStore(target_node, add_expr)) |stmt| {
+            if (try self.translateArrayAccessStore(target_node, op_expr)) |stmt| {
                 try stmts.append(self.allocator, self.stmtWithLocation(stmt, self.nodeLocation(index)));
                 return;
             }
@@ -1013,11 +1021,23 @@ pub const Transformer = struct {
                     return;
                 }
             }
-            try stmts.append(self.allocator, self.stmtWithLocation(ast.Statement.expr(add_expr), self.nodeLocation(index)));
+            try stmts.append(self.allocator, self.stmtWithLocation(ast.Statement.expr(op_expr), self.nodeLocation(index)));
             return;
         }
-        const stmt = try self.builder.assign(&.{target_name}, add_expr);
+        const stmt = try self.builder.assign(&.{target_name}, op_expr);
         try stmts.append(self.allocator, self.stmtWithLocation(stmt, self.nodeLocation(index)));
+    }
+
+    fn processAssignAdd(self: *Self, index: ZigAst.Node.Index, stmts: *std.ArrayList(ast.Statement)) TransformProcessError!void {
+        try self.processAssignBinary(index, stmts, "add");
+    }
+
+    fn processAssignSub(self: *Self, index: ZigAst.Node.Index, stmts: *std.ArrayList(ast.Statement)) TransformProcessError!void {
+        try self.processAssignBinary(index, stmts, "sub");
+    }
+
+    fn processAssignMul(self: *Self, index: ZigAst.Node.Index, stmts: *std.ArrayList(ast.Statement)) TransformProcessError!void {
+        try self.processAssignBinary(index, stmts, "mul");
     }
 
     fn processReturn(self: *Self, index: ZigAst.Node.Index, stmts: *std.ArrayList(ast.Statement)) TransformProcessError!void {
@@ -1811,6 +1831,7 @@ pub const Transformer = struct {
             .bool_not => try self.translateUnaryIsZero(index),
             .bit_not => try self.translateUnaryOp(index, "not"),
             .negation, .negation_wrap => try self.translateUnaryNegation(index),
+            .builtin_call => try self.translateBuiltinCall(index),
             .call, .call_one => try self.translateCall(index),
             .field_access => try self.translateFieldAccess(index),
             .array_access => try self.translateArrayAccess(index),
@@ -1941,6 +1962,27 @@ pub const Transformer = struct {
         });
     }
 
+    fn translateBuiltinCall(self: *Self, index: ZigAst.Node.Index) TransformProcessError!ast.Expression {
+        const p = &self.zig_parser.?;
+        var call_buf: [1]ZigAst.Node.Index = undefined;
+        const call_info = p.ast.fullCall(&call_buf, index) orelse {
+            self.reportUnsupportedExpr(index) catch {};
+            return ast.Expression.lit(ast.Literal.number(0));
+        };
+
+        const callee_src = p.getNodeSource(call_info.ast.fn_expr);
+        if (std.mem.eql(u8, callee_src, "@as")) {
+            if (call_info.ast.params.len != 2) {
+                try self.addError("@as expects two arguments", self.nodeLocation(index), .unsupported_feature);
+                return ast.Expression.lit(ast.Literal.number(0));
+            }
+            return try self.translateExpression(call_info.ast.params[1]);
+        }
+
+        self.reportUnsupportedExpr(index) catch {};
+        return ast.Expression.lit(ast.Literal.number(0));
+    }
+
     fn translateCall(self: *Self, index: ZigAst.Node.Index) TransformProcessError!ast.Expression {
         const p = &self.zig_parser.?;
 
@@ -2038,7 +2080,7 @@ pub const Transformer = struct {
         }
 
         // Regular function call
-        return try self.builder.call(callee_src, args.items);
+        return try self.builder.call(call_lookup, args.items);
     }
 
     fn precompileAddress(self: *Self, name: []const u8) ?ast.U256 {
