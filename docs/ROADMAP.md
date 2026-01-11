@@ -56,6 +56,7 @@
   - SourceMap 格式对齐
 
 ### Related Docs
+- `docs/AUDIT-REPORT.md` - 项目功能完整性审查报告
 - `docs/libyul-comparison.md`
 - `docs/gas-optimization-roadmap.md`
 - `todo.md`

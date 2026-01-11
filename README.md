@@ -524,6 +524,16 @@ zig-to-yul/
 └─────────────────────────────────────────────────────────────┘
 ```
 
+## Documentation
+
+| 文档 | 说明 |
+|------|------|
+| [AUDIT-REPORT.md](docs/AUDIT-REPORT.md) | 项目功能完整性审查报告 |
+| [ROADMAP.md](docs/ROADMAP.md) | 版本路线图与开发计划 |
+| [libyul-comparison.md](docs/libyul-comparison.md) | 与 Solidity libyul 功能对比 |
+| [gas-optimization-roadmap.md](docs/gas-optimization-roadmap.md) | Gas 优化计划 |
+| [TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | 故障排除指南 |
+
 ## Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.
