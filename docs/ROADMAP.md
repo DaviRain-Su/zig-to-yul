@@ -22,6 +22,13 @@
   - AST/Transformer 完整标注
   - printer/sourcemap 输出对齐
 
+- 语言体验（语法糖/可读性）
+  - self.otherMethod() 方法互调（已完成）
+  - @as 基础类型转换（Address <-> u256）（已完成）
+  - -= / *= 等复合赋值运算（已完成）
+  - while (cond) : (i += 1) 语法（已完成）
+  - const/var 基本推导的安全报错提示
+
 - 5.1 EOF Prague
   - 指令清单与语义实现
   - gas 表更新
