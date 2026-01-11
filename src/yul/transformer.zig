@@ -2207,10 +2207,6 @@ pub const Transformer = struct {
                 try self.addError("mapping keys/values not supported for nested mappings", loc, .unsupported_feature);
                 return null;
             }
-            if (is_values and (self.isStructTypeName(base_value_type) or self.isDynamicValueType(base_value_type))) {
-                try self.addError("mapping values does not support struct or dynamic values", loc, .unsupported_feature);
-                return null;
-            }
             if (is_keys) {
                 const helper = try self.ensureMappingKeysHelper();
                 return try self.builder.call(helper, &.{base_slot_expr});
@@ -3571,15 +3567,31 @@ pub const Transformer = struct {
         });
         const key_expr = try self.builder.builtinCall("sload", &.{key_slot});
         const slot_expr = try self.mappingSlotExprForKey(ast.Expression.id("base"), key_expr, key_type);
-        const value_expr = if (storageTypeSizeBits(value_type) < 256)
-            try self.genPackedReadDynamic(slot_expr, storageTypeSizeBits(value_type), 0)
-        else
-            try self.builder.builtinCall("sload", &.{slot_expr});
+
+        const value_ptr = blk: {
+            if (self.isDynamicValueType(value_type)) {
+                const helper = try self.ensureMappingDynamicGetHelper(value_type);
+                break :blk try self.builder.call(helper, &.{slot_expr});
+            }
+            if (self.isStructTypeName(value_type)) {
+                const fields = self.struct_defs.get(value_type) orelse {
+                    try self.addError("unknown struct type in mapping", .{ .start = 0, .end = 0 }, .unsupported_feature);
+                    break :blk ast.Expression.lit(ast.Literal.number(0));
+                };
+                const helper = try self.ensureMappingStructGetHelper(value_type, fields);
+                break :blk try self.builder.call(helper, &.{slot_expr});
+            }
+            if (storageTypeSizeBits(value_type) < 256) {
+                break :blk try self.genPackedReadDynamic(slot_expr, storageTypeSizeBits(value_type), 0);
+            }
+            break :blk try self.builder.builtinCall("sload", &.{slot_expr});
+        };
+
         const dst = try self.builder.builtinCall("add", &.{
             ast.Expression.id("data_ptr"),
             try self.builder.builtinCall("mul", &.{ ast.Expression.id("i"), ast.Expression.lit(ast.Literal.number(@as(ast.U256, 32))) }),
         });
-        const store = try self.builder.builtinCall("mstore", &.{ dst, value_expr });
+        const store = try self.builder.builtinCall("mstore", &.{ dst, value_ptr });
         try body_stmts.append(self.allocator, ast.Statement.expr(store));
         const body_block = try self.builder.block(body_stmts.items);
 
