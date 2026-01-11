@@ -458,6 +458,48 @@ pub fn Queue(comptime Element: type) type {
     return Deque(Element);
 }
 
+/// Defines a Solidity-style stack type for contracts.
+pub fn Stack(comptime Element: type) type {
+    return struct {
+        pub const ElementType = Element;
+        const Self = @This();
+
+        pub fn len(self: *Self) U256 {
+            _ = self;
+            return 0;
+        }
+
+        pub fn isEmpty(self: *Self) bool {
+            _ = self;
+            return true;
+        }
+
+        pub fn count(self: *Self) U256 {
+            _ = self;
+            return 0;
+        }
+
+        pub fn push(self: *Self, value: Element) void {
+            _ = self;
+            _ = value;
+        }
+
+        pub fn pop(self: *Self) Element {
+            _ = self;
+            return undefined;
+        }
+
+        pub fn peek(self: *Self) Element {
+            _ = self;
+            return undefined;
+        }
+
+        pub fn clear(self: *Self) void {
+            _ = self;
+        }
+    };
+}
+
 /// Defines a Solidity-style dynamic array type for contracts.
 pub fn Array(comptime Element: type) type {
     return struct {
@@ -1133,6 +1175,19 @@ test "deque api" {
     queue.push(1);
     _ = queue.pop();
     _ = queue.peek();
+}
+
+test "stack api" {
+    const St = Stack(U256);
+    var stack: St = .{};
+
+    _ = stack.len();
+    _ = stack.isEmpty();
+    _ = stack.count();
+    stack.push(1);
+    _ = stack.pop();
+    _ = stack.peek();
+    stack.clear();
 }
 
 test "array api" {
