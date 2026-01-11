@@ -999,4 +999,9 @@ test "array api" {
     _ = nested.at(0);
     _ = nested.len();
     nested.resize(0);
+
+    const MapArr = Array(Mapping(U256, U256));
+    var map_arr: MapArr = .{};
+    _ = map_arr.len();
+    map_arr.resize(0);
 }

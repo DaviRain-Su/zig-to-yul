@@ -3467,11 +3467,13 @@ pub const Transformer = struct {
             return slot_expr;
         }
 
-        if (self.isMappingTypeName(info.value_type)) {
-            try self.addError("array element mapping not supported", loc, .unsupported_feature);
+        const value_is_mapping = self.isMappingTypeName(info.value_type);
+        const value_is_array = self.isArrayTypeName(info.value_type);
+
+        if (value_is_mapping and (is_get or is_set or is_get_ptr or is_value_ptr_at or is_at or is_push or is_pop or is_remove or is_swap_remove or is_remove_stable or is_insert)) {
+            try self.addError("array element mapping requires arr[index].get(key)", loc, .unsupported_feature);
             return null;
         }
-        const value_is_array = self.isArrayTypeName(info.value_type);
 
         if (value_is_array and (is_get or is_set or is_get_ptr or is_value_ptr_at or is_push or is_pop or is_remove or is_swap_remove or is_remove_stable or is_insert)) {
             try self.addError("nested array element requires at(index) for access", loc, .unsupported_feature);
@@ -3649,11 +3651,13 @@ pub const Transformer = struct {
             try self.addError("array element type missing; declare evm.Array(T)", loc, .unsupported_feature);
             return null;
         };
-        if (self.isMappingTypeName(value_type)) {
-            try self.addError("array element mapping not supported", loc, .unsupported_feature);
+        const value_is_mapping = self.isMappingTypeName(value_type);
+        const value_is_array = self.isArrayTypeName(value_type);
+
+        if (value_is_mapping and (is_get or is_set or is_get_ptr or is_value_ptr_at or is_at or is_push or is_pop or is_remove or is_swap_remove or is_remove_stable or is_insert)) {
+            try self.addError("array element mapping requires arr[index].get(key)", loc, .unsupported_feature);
             return null;
         }
-        const value_is_array = self.isArrayTypeName(value_type);
 
         const base_slot_expr = ast.Expression.lit(ast.Literal.number(sv.slot));
 
@@ -3844,6 +3848,10 @@ pub const Transformer = struct {
                             try self.addError("array element type missing; declare evm.Array(T)", loc, .unsupported_feature);
                             return ast.Expression.lit(ast.Literal.number(0));
                         };
+                        if (self.isMappingTypeName(elem_type)) {
+                            try self.addError("array element mapping requires arr[index].get(key)", loc, .unsupported_feature);
+                            return ast.Expression.lit(ast.Literal.number(0));
+                        }
                         const helper = try self.ensureArrayGetHelper(elem_type);
                         return try self.builder.call(helper, &.{ ast.Expression.lit(ast.Literal.number(sv.slot)), idx_expr });
                     }
@@ -3863,6 +3871,10 @@ pub const Transformer = struct {
                             try self.addError("array element type missing; declare evm.Array(T)", loc, .unsupported_feature);
                             return ast.Expression.lit(ast.Literal.number(0));
                         };
+                        if (self.isMappingTypeName(elem_type)) {
+                            try self.addError("array element mapping requires arr[index].get(key)", loc, .unsupported_feature);
+                            return ast.Expression.lit(ast.Literal.number(0));
+                        }
                         const helper = try self.ensureArrayGetHelper(elem_type);
                         return try self.builder.call(helper, &.{ ast.Expression.lit(ast.Literal.number(sv.slot)), idx_expr });
                     }
@@ -4462,22 +4474,28 @@ pub const Transformer = struct {
                 value_type = sv.mapping_value_type;
             },
             .array_access => {
-                const base_access = try self.mappingSlotExprFromArrayAccess(base_node, loc) orelse return null;
-                const mapping_type = base_access.value_type orelse {
-                    try self.addError("nested mapping requires mapping value type", loc, .unsupported_feature);
-                    return null;
-                };
-                const nested_value = self.mappingValueTypeName(mapping_type) orelse {
-                    try self.addError("nested mapping requires mapping value type", loc, .unsupported_feature);
-                    return null;
-                };
-                const nested_key = self.mappingKeyTypeName(mapping_type) orelse {
-                    try self.addError("nested mapping requires mapping key type", loc, .unsupported_feature);
-                    return null;
-                };
-                base_slot_expr = base_access.slot_expr;
-                key_type = nested_key;
-                value_type = nested_value;
+                if (try self.arrayMappingBaseFromArrayAccess(base_node)) |mapping_base| {
+                    base_slot_expr = mapping_base.base_slot_expr;
+                    key_type = mapping_base.key_type;
+                    value_type = mapping_base.value_type;
+                } else {
+                    const base_access = try self.mappingSlotExprFromArrayAccess(base_node, loc) orelse return null;
+                    const mapping_type = base_access.value_type orelse {
+                        try self.addError("nested mapping requires mapping value type", loc, .unsupported_feature);
+                        return null;
+                    };
+                    const nested_value = self.mappingValueTypeName(mapping_type) orelse {
+                        try self.addError("nested mapping requires mapping value type", loc, .unsupported_feature);
+                        return null;
+                    };
+                    const nested_key = self.mappingKeyTypeName(mapping_type) orelse {
+                        try self.addError("nested mapping requires mapping key type", loc, .unsupported_feature);
+                        return null;
+                    };
+                    base_slot_expr = base_access.slot_expr;
+                    key_type = nested_key;
+                    value_type = nested_value;
+                }
             },
             else => return null,
         }
@@ -4494,6 +4512,30 @@ pub const Transformer = struct {
             .key_expr = idx_expr,
             .key_type = key_type,
             .value_type = value_type,
+        };
+    }
+
+    fn arrayMappingBaseFromArrayAccess(self: *Self, node: ZigAst.Node.Index) TransformProcessError!?MappingAccess {
+        const p = &self.zig_parser.?;
+        if (p.getNodeTag(node) != .array_access) return null;
+        const data = p.ast.nodeData(node).node_and_node;
+        const base_node = data[0];
+        const index_node = data[1];
+
+        const sv = self.arrayStorageVarForNode(base_node) orelse return null;
+        const elem_type = sv.array_elem_type orelse return null;
+        const key_ty = self.mappingKeyTypeName(elem_type) orelse return null;
+        const value_ty = self.mappingValueTypeName(elem_type) orelse return null;
+
+        const idx_expr = try self.translateExpression(index_node);
+        const base_slot_expr = try self.arrayElementSlotExpr(ast.Expression.lit(ast.Literal.number(sv.slot)), idx_expr, elem_type);
+
+        return MappingAccess{
+            .slot_expr = base_slot_expr,
+            .base_slot_expr = base_slot_expr,
+            .key_expr = null,
+            .key_type = key_ty,
+            .value_type = value_ty,
         };
     }
 
