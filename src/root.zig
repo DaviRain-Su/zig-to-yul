@@ -26,6 +26,7 @@ pub const evm = struct {
     pub const Deque = types.Deque;
     pub const Queue = types.Queue;
     pub const Stack = types.Stack;
+    pub const Option = types.Option;
     pub const Array = types.Array;
     pub const EvmType = types.EvmType;
 };

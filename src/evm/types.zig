@@ -500,6 +500,38 @@ pub fn Stack(comptime Element: type) type {
     };
 }
 
+/// Defines an optional value with explicit presence semantics.
+pub fn Option(comptime Element: type) type {
+    return struct {
+        pub const ElementType = Element;
+        const Self = @This();
+
+        pub fn isSome(self: *Self) bool {
+            _ = self;
+            return false;
+        }
+
+        pub fn isNone(self: *Self) bool {
+            _ = self;
+            return true;
+        }
+
+        pub fn get(self: *Self) Element {
+            _ = self;
+            return undefined;
+        }
+
+        pub fn set(self: *Self, value: Element) void {
+            _ = self;
+            _ = value;
+        }
+
+        pub fn clear(self: *Self) void {
+            _ = self;
+        }
+    };
+}
+
 /// Defines a Solidity-style dynamic array type for contracts.
 pub fn Array(comptime Element: type) type {
     return struct {
@@ -1188,6 +1220,17 @@ test "stack api" {
     _ = stack.pop();
     _ = stack.peek();
     stack.clear();
+}
+
+test "option api" {
+    const Opt = Option(U256);
+    var opt: Opt = .{};
+
+    _ = opt.isSome();
+    _ = opt.isNone();
+    _ = opt.get();
+    opt.set(1);
+    opt.clear();
 }
 
 test "array api" {

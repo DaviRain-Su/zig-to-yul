@@ -78,6 +78,8 @@ pub const Transformer = struct {
         deque_elem_type: ?[]const u8,
         is_stack: bool,
         stack_elem_type: ?[]const u8,
+        is_option: bool,
+        option_elem_type: ?[]const u8,
     };
 
     pub const StructFieldDef = struct {
@@ -641,6 +643,37 @@ pub const Transformer = struct {
 
     fn stackElemTypeName(self: *Self, type_name: []const u8) ?[]const u8 {
         const info = self.parseStackType(type_name) orelse return null;
+        return info.elem;
+    }
+
+    fn isOptionTypeName(self: *Self, type_name: []const u8) bool {
+        return self.parseOptionType(type_name) != null;
+    }
+
+    const OptionTypeInfo = struct {
+        elem: []const u8,
+    };
+
+    fn parseOptionType(self: *Self, type_name: []const u8) ?OptionTypeInfo {
+        _ = self;
+        const trimmed = std.mem.trim(u8, type_name, " \t\r\n");
+        const prefix: []const u8 = blk: {
+            if (std.mem.startsWith(u8, trimmed, "evm.Option(")) {
+                break :blk "evm.Option(";
+            } else if (std.mem.startsWith(u8, trimmed, "Option(")) {
+                break :blk "Option(";
+            } else if (std.mem.startsWith(u8, trimmed, "evm.types.Option(")) {
+                break :blk "evm.types.Option(";
+            }
+            return null;
+        };
+        const end = if (std.mem.endsWith(u8, trimmed, ")")) trimmed.len - 1 else return null;
+        const inner = std.mem.trim(u8, trimmed[prefix.len..end], " \t\r\n");
+        return if (inner.len > 0) .{ .elem = inner } else null;
+    }
+
+    fn optionElemTypeName(self: *Self, type_name: []const u8) ?[]const u8 {
+        const info = self.parseOptionType(type_name) orelse return null;
         return info.elem;
     }
 
@@ -3169,6 +3202,9 @@ pub const Transformer = struct {
         if (try self.translateStackMethod(call_info.ast.fn_expr, args.items, self.nodeLocation(index))) |expr| {
             return expr;
         }
+        if (try self.translateOptionMethod(call_info.ast.fn_expr, args.items, self.nodeLocation(index))) |expr| {
+            return expr;
+        }
         if (try self.translateArrayMethod(call_info.ast.fn_expr, args.items, self.nodeLocation(index))) |expr| {
             return expr;
         }
@@ -4220,6 +4256,78 @@ pub const Transformer = struct {
         return null;
     }
 
+    fn translateOptionMethod(
+        self: *Self,
+        fn_expr: ZigAst.Node.Index,
+        args: []const ast.Expression,
+        loc: ast.SourceLocation,
+    ) TransformProcessError!?ast.Expression {
+        const p = &self.zig_parser.?;
+        if (p.getNodeTag(fn_expr) != .field_access) return null;
+
+        const data = p.ast.nodeData(fn_expr).node_and_token;
+        const obj_node = data[0];
+        const method_name = p.getIdentifier(data[1]);
+
+        const is_some = std.mem.eql(u8, method_name, "isSome");
+        const is_none = std.mem.eql(u8, method_name, "isNone");
+        const is_get = std.mem.eql(u8, method_name, "get");
+        const is_set = std.mem.eql(u8, method_name, "set");
+        const is_clear = std.mem.eql(u8, method_name, "clear");
+        if (!is_some and !is_none and !is_get and !is_set and !is_clear) return null;
+
+        const sv = self.optionStorageVarForNode(obj_node) orelse return null;
+        const value_type = sv.option_elem_type orelse {
+            try self.addError("option element type missing; declare evm.Option(T)", loc, .unsupported_feature);
+            return null;
+        };
+        if (self.isMappingTypeName(value_type) or self.isArrayTypeName(value_type) or self.isSetTypeName(value_type) or self.isDequeTypeName(value_type) or self.isStackTypeName(value_type) or self.isOptionTypeName(value_type)) {
+            try self.addError("option element type must be scalar", loc, .unsupported_feature);
+            return null;
+        }
+
+        const base_slot_expr = ast.Expression.lit(ast.Literal.number(sv.slot));
+
+        if (is_some or is_none) {
+            if (args.len != 0) {
+                try self.addError("option.isSome expects no arguments", loc, .unsupported_feature);
+                return null;
+            }
+            const flag = try self.builder.builtinCall("sload", &.{base_slot_expr});
+            const is_zero = try self.builder.builtinCall("iszero", &.{flag});
+            return if (is_none) is_zero else try self.builder.builtinCall("iszero", &.{is_zero});
+        }
+
+        if (is_get) {
+            if (args.len != 0) {
+                try self.addError("option.get expects no arguments", loc, .unsupported_feature);
+                return null;
+            }
+            const helper = try self.ensureOptionGetHelper(value_type, loc);
+            return try self.builder.call(helper, &.{base_slot_expr});
+        }
+
+        if (is_set) {
+            if (args.len != 1) {
+                try self.addError("option.set expects value", loc, .unsupported_feature);
+                return null;
+            }
+            const helper = try self.ensureOptionSetHelper(value_type, loc);
+            return try self.builder.call(helper, &.{ base_slot_expr, args[0] });
+        }
+
+        if (is_clear) {
+            if (args.len != 0) {
+                try self.addError("option.clear expects no arguments", loc, .unsupported_feature);
+                return null;
+            }
+            const helper = try self.ensureOptionClearHelper(value_type, loc);
+            return try self.builder.call(helper, &.{base_slot_expr});
+        }
+
+        return null;
+    }
+
     fn translateArrayAccess(self: *Self, index: ZigAst.Node.Index) TransformProcessError!ast.Expression {
         const p = &self.zig_parser.?;
         const data = p.ast.nodeData(index).node_and_node;
@@ -4869,6 +4977,36 @@ pub const Transformer = struct {
                     const base_name = obj_src["self.".len..];
                     if (self.storageVarForNested(base_name, field_name)) |sv| {
                         if (sv.is_stack) return sv;
+                    }
+                }
+            },
+            else => {},
+        }
+        return null;
+    }
+
+    fn optionStorageVarForNode(self: *Self, node: ZigAst.Node.Index) ?StorageVar {
+        const p = &self.zig_parser.?;
+        const tag = p.getNodeTag(node);
+        switch (tag) {
+            .identifier => {
+                const name = p.getNodeSource(node);
+                if (self.storageVarByName(name)) |sv| {
+                    if (sv.is_option) return sv;
+                }
+            },
+            .field_access => {
+                const data = p.ast.nodeData(node).node_and_token;
+                const obj_src = p.getNodeSource(data[0]);
+                const field_name = p.getIdentifier(data[1]);
+                if (std.mem.eql(u8, obj_src, "self")) {
+                    if (self.storageVarByName(field_name)) |sv| {
+                        if (sv.is_option) return sv;
+                    }
+                } else if (std.mem.startsWith(u8, obj_src, "self.")) {
+                    const base_name = obj_src["self.".len..];
+                    if (self.storageVarForNested(base_name, field_name)) |sv| {
+                        if (sv.is_option) return sv;
                     }
                 }
             },
@@ -6541,6 +6679,122 @@ pub const Transformer = struct {
 
         const body = try self.builder.block(stmts.items);
         const func = try self.builder.funcDef(helper_name, &.{"values_base"}, &.{"result"}, body);
+        try self.extra_functions.append(self.allocator, func);
+
+        return helper_name;
+    }
+
+    fn ensureOptionGetHelper(self: *Self, value_type: []const u8, loc: ast.SourceLocation) ![]const u8 {
+        const key_name = try std.fmt.allocPrint(self.allocator, "option_get:{s}", .{value_type});
+        defer self.allocator.free(key_name);
+        if (self.math_helpers.get(key_name)) |helper| return helper;
+
+        const helper_name = try self.mappingStructHelperName("__zig2yul$opt_get$", value_type);
+        const key = try self.allocator.dupe(u8, key_name);
+        try self.math_helpers.put(key, helper_name);
+
+        var stmts: std.ArrayList(ast.Statement) = .empty;
+        defer stmts.deinit(self.allocator);
+
+        const flag = try self.builder.builtinCall("sload", &.{ast.Expression.id("base")});
+        try stmts.append(self.allocator, try self.builder.varDecl(&.{"flag"}, flag));
+        const is_none = try self.builder.builtinCall("iszero", &.{ast.Expression.id("flag")});
+        try self.appendRevertIf(&stmts, is_none);
+
+        const value_slot = try self.builder.builtinCall("add", &.{ ast.Expression.id("base"), ast.Expression.lit(ast.Literal.number(1)) });
+        const value_expr = try self.arrayLoadValueExpr(value_slot, value_type, loc);
+        const assign = try self.builder.assign(&.{"result"}, value_expr);
+        try stmts.append(self.allocator, assign);
+
+        const body = try self.builder.block(stmts.items);
+        const func = try self.builder.funcDef(helper_name, &.{"base"}, &.{"result"}, body);
+        try self.extra_functions.append(self.allocator, func);
+
+        return helper_name;
+    }
+
+    fn ensureOptionSetHelper(self: *Self, value_type: []const u8, loc: ast.SourceLocation) ![]const u8 {
+        const key_name = try std.fmt.allocPrint(self.allocator, "option_set:{s}", .{value_type});
+        defer self.allocator.free(key_name);
+        if (self.math_helpers.get(key_name)) |helper| return helper;
+
+        const helper_name = try self.mappingStructHelperName("__zig2yul$opt_set$", value_type);
+        const key = try self.allocator.dupe(u8, key_name);
+        try self.math_helpers.put(key, helper_name);
+
+        var stmts: std.ArrayList(ast.Statement) = .empty;
+        defer stmts.deinit(self.allocator);
+
+        const store_flag = try self.builder.builtinCall("sstore", &.{ ast.Expression.id("base"), ast.Expression.lit(ast.Literal.number(1)) });
+        try stmts.append(self.allocator, ast.Statement.expr(store_flag));
+
+        const value_slot = try self.builder.builtinCall("add", &.{ ast.Expression.id("base"), ast.Expression.lit(ast.Literal.number(1)) });
+        const store_stmt = try self.arrayStoreValueStmt(value_slot, value_type, ast.Expression.id("value"), loc);
+        try stmts.append(self.allocator, store_stmt);
+
+        const assign = try self.builder.assign(&.{"result"}, ast.Expression.lit(ast.Literal.number(0)));
+        try stmts.append(self.allocator, assign);
+
+        const body = try self.builder.block(stmts.items);
+        const func = try self.builder.funcDef(helper_name, &.{ "base", "value" }, &.{"result"}, body);
+        try self.extra_functions.append(self.allocator, func);
+
+        return helper_name;
+    }
+
+    fn ensureOptionClearHelper(self: *Self, value_type: []const u8, loc: ast.SourceLocation) ![]const u8 {
+        _ = loc;
+        const key_name = try std.fmt.allocPrint(self.allocator, "option_clear:{s}", .{value_type});
+        defer self.allocator.free(key_name);
+        if (self.math_helpers.get(key_name)) |helper| return helper;
+
+        const helper_name = try self.mappingStructHelperName("__zig2yul$opt_clr$", value_type);
+        const key = try self.allocator.dupe(u8, key_name);
+        try self.math_helpers.put(key, helper_name);
+
+        var stmts: std.ArrayList(ast.Statement) = .empty;
+        defer stmts.deinit(self.allocator);
+
+        const store_flag = try self.builder.builtinCall("sstore", &.{ ast.Expression.id("base"), ast.Expression.lit(ast.Literal.number(0)) });
+        try stmts.append(self.allocator, ast.Statement.expr(store_flag));
+
+        const value_slot = try self.builder.builtinCall("add", &.{ ast.Expression.id("base"), ast.Expression.lit(ast.Literal.number(1)) });
+        const store_zero = try self.builder.builtinCall("sstore", &.{ value_slot, ast.Expression.lit(ast.Literal.number(0)) });
+        try stmts.append(self.allocator, ast.Statement.expr(store_zero));
+
+        if (self.isStructTypeName(value_type)) {
+            const extra_slots = self.structStorageSlots(value_type) orelse 1;
+            if (extra_slots > 1) {
+                var pre_stmts: std.ArrayList(ast.Statement) = .empty;
+                defer pre_stmts.deinit(self.allocator);
+                try pre_stmts.append(self.allocator, try self.builder.varDecl(&.{"i"}, ast.Expression.lit(ast.Literal.number(1))));
+                const pre_block = try self.builder.block(pre_stmts.items);
+
+                const cond = try self.builder.builtinCall("lt", &.{ ast.Expression.id("i"), ast.Expression.lit(ast.Literal.number(extra_slots)) });
+
+                var post_stmts: std.ArrayList(ast.Statement) = .empty;
+                defer post_stmts.deinit(self.allocator);
+                const inc = try self.builder.builtinCall("add", &.{ ast.Expression.id("i"), ast.Expression.lit(ast.Literal.number(1)) });
+                try post_stmts.append(self.allocator, try self.builder.assign(&.{"i"}, inc));
+                const post_block = try self.builder.block(post_stmts.items);
+
+                var body_stmts: std.ArrayList(ast.Statement) = .empty;
+                defer body_stmts.deinit(self.allocator);
+                const slot_expr = try self.builder.builtinCall("add", &.{ value_slot, ast.Expression.id("i") });
+                const clear_expr = try self.builder.builtinCall("sstore", &.{ slot_expr, ast.Expression.lit(ast.Literal.number(0)) });
+                try body_stmts.append(self.allocator, ast.Statement.expr(clear_expr));
+                const body_block = try self.builder.block(body_stmts.items);
+
+                const loop_stmt = ast.Statement.forStmt(pre_block, cond, post_block, body_block);
+                try stmts.append(self.allocator, loop_stmt);
+            }
+        }
+
+        const assign = try self.builder.assign(&.{"result"}, ast.Expression.lit(ast.Literal.number(0)));
+        try stmts.append(self.allocator, assign);
+
+        const body = try self.builder.block(stmts.items);
+        const func = try self.builder.funcDef(helper_name, &.{"base"}, &.{"result"}, body);
         try self.extra_functions.append(self.allocator, func);
 
         return helper_name;
@@ -8410,6 +8664,7 @@ pub const Transformer = struct {
         if (std.mem.startsWith(u8, trimmed, "evm.Set(") or std.mem.startsWith(u8, trimmed, "Set(") or std.mem.startsWith(u8, trimmed, "evm.types.Set(")) return 256;
         if (std.mem.startsWith(u8, trimmed, "evm.Deque(") or std.mem.startsWith(u8, trimmed, "Deque(") or std.mem.startsWith(u8, trimmed, "evm.types.Deque(") or std.mem.startsWith(u8, trimmed, "evm.Queue(") or std.mem.startsWith(u8, trimmed, "Queue(") or std.mem.startsWith(u8, trimmed, "evm.types.Queue(")) return 256;
         if (std.mem.startsWith(u8, trimmed, "evm.Stack(") or std.mem.startsWith(u8, trimmed, "Stack(") or std.mem.startsWith(u8, trimmed, "evm.types.Stack(")) return 256;
+        if (std.mem.startsWith(u8, trimmed, "evm.Option(") or std.mem.startsWith(u8, trimmed, "Option(") or std.mem.startsWith(u8, trimmed, "evm.types.Option(")) return 256;
         if (std.mem.eql(u8, type_name, "bool")) return 8;
         if (std.mem.eql(u8, type_name, "u8")) return 8;
         if (std.mem.eql(u8, type_name, "u16")) return 16;
@@ -8460,6 +8715,8 @@ pub const Transformer = struct {
                 const deque_elem_type = if (is_deque) self.dequeElemTypeName(field_type) else null;
                 const is_stack = self.isStackTypeName(field_type);
                 const stack_elem_type = if (is_stack) self.stackElemTypeName(field_type) else null;
+                const is_option = self.isOptionTypeName(field_type);
+                const option_elem_type = if (is_option) self.optionElemTypeName(field_type) else null;
                 try self.storage_vars.append(self.allocator, .{
                     .name = full_name,
                     .slot = base_slot + base_slot_index,
@@ -8476,6 +8733,8 @@ pub const Transformer = struct {
                     .deque_elem_type = deque_elem_type,
                     .is_stack = is_stack,
                     .stack_elem_type = stack_elem_type,
+                    .is_option = is_option,
+                    .option_elem_type = option_elem_type,
                 });
                 if (is_set) {
                     slot_shift += 1;
@@ -8486,6 +8745,10 @@ pub const Transformer = struct {
                     if (base_slot_index + 2 > max_slot) max_slot = base_slot_index + 2;
                 }
                 if (is_stack) {
+                    slot_shift += 1;
+                    if (base_slot_index + 1 > max_slot) max_slot = base_slot_index + 1;
+                }
+                if (is_option) {
                     slot_shift += 1;
                     if (base_slot_index + 1 > max_slot) max_slot = base_slot_index + 1;
                 }
@@ -8533,8 +8796,10 @@ pub const Transformer = struct {
             const deque_elem_type = if (is_deque) self.dequeElemTypeName(field.type_name) else null;
             const is_stack = self.isStackTypeName(field.type_name);
             const stack_elem_type = if (is_stack) self.stackElemTypeName(field.type_name) else null;
+            const is_option = self.isOptionTypeName(field.type_name);
+            const option_elem_type = if (is_option) self.optionElemTypeName(field.type_name) else null;
 
-            if (is_set or is_deque or is_stack) {
+            if (is_set or is_deque or is_stack or is_option) {
                 if (current_offset != 0) {
                     current_slot += 1;
                     current_offset = 0;
@@ -8555,8 +8820,14 @@ pub const Transformer = struct {
                     .deque_elem_type = deque_elem_type,
                     .is_stack = is_stack,
                     .stack_elem_type = stack_elem_type,
+                    .is_option = is_option,
+                    .option_elem_type = option_elem_type,
                 });
-                current_slot += if (is_deque) 3 else 2;
+                if (is_deque) {
+                    current_slot += 3;
+                } else {
+                    current_slot += 2;
+                }
                 current_offset = 0;
                 continue;
             }
@@ -8588,6 +8859,8 @@ pub const Transformer = struct {
                 .deque_elem_type = null,
                 .is_stack = false,
                 .stack_elem_type = null,
+                .is_option = false,
+                .option_elem_type = null,
             });
 
             current_offset += field_bits;

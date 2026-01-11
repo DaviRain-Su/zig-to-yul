@@ -271,6 +271,7 @@ pub const StoragePacker = struct {
         if (std.mem.startsWith(u8, type_name, "evm.Set(") or std.mem.startsWith(u8, type_name, "Set(") or std.mem.startsWith(u8, type_name, "evm.types.Set(")) return 256;
         if (std.mem.startsWith(u8, type_name, "evm.Deque(") or std.mem.startsWith(u8, type_name, "Deque(") or std.mem.startsWith(u8, type_name, "evm.types.Deque(") or std.mem.startsWith(u8, type_name, "evm.Queue(") or std.mem.startsWith(u8, type_name, "Queue(") or std.mem.startsWith(u8, type_name, "evm.types.Queue(")) return 256;
         if (std.mem.startsWith(u8, type_name, "evm.Stack(") or std.mem.startsWith(u8, type_name, "Stack(") or std.mem.startsWith(u8, type_name, "evm.types.Stack(")) return 256;
+        if (std.mem.startsWith(u8, type_name, "evm.Option(") or std.mem.startsWith(u8, type_name, "Option(") or std.mem.startsWith(u8, type_name, "evm.types.Option(")) return 256;
         return 256; // 默认
     }
 };
