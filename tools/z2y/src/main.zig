@@ -165,15 +165,6 @@ pub fn main() !void {
         return;
     }
 
-    if (std.mem.eql(u8, command, "install")) {
-        if (args.len > 2) {
-            try printUsage();
-            return;
-        }
-        try installTools(allocator);
-        return;
-    }
-
     if (std.mem.eql(u8, command, "info")) {
         if (args.len > 2) {
             try printUsage();
@@ -416,7 +407,6 @@ fn printUsage() !void {
     try stdout.print(
         "Usage:\n" ++
             "  z2y init [dir]\n" ++
-            "  z2y install\n" ++
             "  z2y info\n" ++
             "  z2y build\n" ++
             "  z2y build-abi\n" ++
@@ -429,115 +419,6 @@ fn printUsage() !void {
     );
 
     try stdout.flush();
-}
-
-fn printInstallInstructions() !void {
-    const builtin = @import("builtin");
-    var stdout_buffer: [2048]u8 = undefined;
-    var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
-    const stdout: *std.Io.Writer = &stdout_writer.interface;
-
-    try stdout.print("Required tools:\n", .{});
-    try stdout.print("- Zig 0.15.2\n", .{});
-    try stdout.print("- solc (Solidity compiler)\n", .{});
-    try stdout.print("- zig-to-yul binary in PATH\n", .{});
-    try stdout.print("- Foundry (anvil/forge/cast)\n", .{});
-    try stdout.print("- profiles.json (optional, for named RPC profiles)\n\n", .{});
-
-    switch (builtin.os.tag) {
-        .macos => {
-            try stdout.print("Install Zig (macOS):\n  brew install zig\n", .{});
-        },
-        .linux => {
-            try stdout.print("Install Zig (Linux):\n  https://ziglang.org/download/\n", .{});
-        },
-        .windows => {
-            try stdout.print("Install Zig (Windows):\n  choco install zig\n", .{});
-        },
-        else => {
-            try stdout.print("Install Zig:\n  https://ziglang.org/download/\n", .{});
-        },
-    }
-
-    try stdout.print("\nInstall solc:\n  npm install -g solc\n", .{});
-    try stdout.print("\nInstall Foundry (anvil/forge):\n  curl -L https://foundry.paradigm.xyz | bash\n  foundryup\n", .{});
-    try stdout.print("\nInstall zig-to-yul (needed for compilation):\n  z2y install\n", .{});
-    try stdout.flush();
-}
-
-fn installTools(allocator: std.mem.Allocator) !void {
-    const builtin = @import("builtin");
-    if (builtin.os.tag != .linux and builtin.os.tag != .macos) {
-        try printInstallInstructions();
-        return;
-    }
-
-    const home = std.process.getEnvVarOwned(allocator, "HOME") catch return error.InvalidEnvironment;
-    defer allocator.free(home);
-
-    const bin_dir = try std.fs.path.join(allocator, &.{ home, ".local", "bin" });
-    defer allocator.free(bin_dir);
-
-    try runCommand(allocator, &.{ "mkdir", "-p", bin_dir });
-
-    if (try findExecutablePath(allocator, "zig")) |path| {
-        allocator.free(path);
-    } else {
-        var stdout_buffer: [2048]u8 = undefined;
-        var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
-        const stdout: *std.Io.Writer = &stdout_writer.interface;
-        try stdout.print("Zig not found. Please install Zig 0.15.2 first.\n", .{});
-        try stdout.flush();
-        return error.MissingZig;
-    }
-
-    try installReleaseBinaries(allocator, bin_dir);
-
-    var stdout_buffer: [2048]u8 = undefined;
-    var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
-    const stdout: *std.Io.Writer = &stdout_writer.interface;
-    try stdout.print("Install complete. Ensure {s} is on PATH.\n", .{bin_dir});
-    try stdout.flush();
-}
-
-fn installReleaseBinaries(allocator: std.mem.Allocator, bin_dir: []const u8) !void {
-    const builtin = @import("builtin");
-    const os_tag = builtin.os.tag;
-    const os_label = if (os_tag == .linux) "ubuntu-latest" else "macos-latest";
-
-    const archive_name = try std.fmt.allocPrint(allocator, "zig-to-yul-{s}.tar.gz", .{os_label});
-    defer allocator.free(archive_name);
-    const url = try std.fmt.allocPrint(allocator, "https://github.com/DaviRain-Su/zig-to-yul/releases/download/v0.1.0/{s}", .{archive_name});
-    defer allocator.free(url);
-
-    const tmp_dir = try std.fs.path.join(allocator, &.{ "/tmp", "z2y" });
-    defer allocator.free(tmp_dir);
-    try runCommand(allocator, &.{ "mkdir", "-p", tmp_dir });
-
-    const archive_path = try std.fs.path.join(allocator, &.{ tmp_dir, archive_name });
-    defer allocator.free(archive_path);
-    try runCommand(allocator, &.{ "curl", "-L", "-o", archive_path, url });
-
-    const extract_dir = try std.fs.path.join(allocator, &.{ tmp_dir, "release" });
-    defer allocator.free(extract_dir);
-    try runCommand(allocator, &.{ "rm", "-rf", extract_dir });
-    try runCommand(allocator, &.{ "mkdir", "-p", extract_dir });
-    try runCommand(allocator, &.{ "tar", "-xzf", archive_path, "-C", extract_dir });
-
-    const zig_to_yul_bin = try std.fs.path.join(allocator, &.{ extract_dir, "zig_to_yul" });
-    defer allocator.free(zig_to_yul_bin);
-    const z2y_bin = try std.fs.path.join(allocator, &.{ extract_dir, "z2y" });
-    defer allocator.free(z2y_bin);
-
-    const zig_to_yul_target = try std.fs.path.join(allocator, &.{ bin_dir, "zig_to_yul" });
-    defer allocator.free(zig_to_yul_target);
-
-    try runCommand(allocator, &.{ "cp", zig_to_yul_bin, zig_to_yul_target });
-}
-
-fn runCommand(allocator: std.mem.Allocator, argv: []const []const u8) !void {
-    const output = try runCommandCapture(allocator, argv);
-    allocator.free(output);
 }
 
 fn printToolInfo(allocator: std.mem.Allocator) !void {

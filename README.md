@@ -116,8 +116,8 @@ Available namespaces:
 # Build the z2y tool
 cd tools/z2y && zig build
 
-# Install prerequisites (prints commands)
-./tools/z2y/zig-out/bin/z2y install
+# Install zig-to-yul + z2y
+./scripts/install.sh
 
 # Check tool availability (zig, zig-to-yul, solc, anvil, forge, cast)
 ./tools/z2y/zig-out/bin/z2y info
