@@ -266,7 +266,7 @@ pub const StoragePacker = struct {
         if (std.mem.eql(u8, type_name, "u32")) return 32;
         if (std.mem.eql(u8, type_name, "u64")) return 64;
         if (std.mem.eql(u8, type_name, "u128")) return 128;
-        if (std.mem.eql(u8, type_name, "u256")) return 256;
+        if (std.mem.eql(u8, type_name, "u256") or std.mem.eql(u8, type_name, "U256") or std.mem.eql(u8, type_name, "evm.U256") or std.mem.eql(u8, type_name, "evm.u256")) return 256;
         if (std.mem.eql(u8, type_name, "Address") or std.mem.eql(u8, type_name, "[20]u8")) return 160;
         return 256; // 默认
     }

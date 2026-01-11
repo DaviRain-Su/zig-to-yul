@@ -21,6 +21,24 @@ pub fn Mapping(comptime Key: type, comptime Value: type) type {
     return struct {
         pub const KeyType = Key;
         pub const ValueType = Value;
+
+        pub fn get(self: *@This(), key: Key) Value {
+            _ = self;
+            _ = key;
+            return undefined;
+        }
+
+        pub fn set(self: *@This(), key: Key, value: Value) void {
+            _ = self;
+            _ = key;
+            _ = value;
+        }
+
+        pub fn contains(self: *@This(), key: Key) bool {
+            _ = self;
+            _ = key;
+            return false;
+        }
     };
 }
 

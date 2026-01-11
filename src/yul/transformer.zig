@@ -50,6 +50,7 @@ pub const Transformer = struct {
         size_bits: u16,
         offset_bits: u16,
         is_mapping: bool,
+        mapping_value_type: ?[]const u8,
     };
 
     pub const StructFieldDef = struct {
@@ -412,11 +413,59 @@ pub const Transformer = struct {
     }
 
     fn isMappingTypeName(self: *Self, type_name: []const u8) bool {
+        return self.parseMappingType(type_name) != null;
+    }
+
+    const MappingTypeInfo = struct {
+        key: []const u8,
+        value: []const u8,
+    };
+
+    fn parseMappingType(self: *Self, type_name: []const u8) ?MappingTypeInfo {
         _ = self;
         const trimmed = std.mem.trim(u8, type_name, " \t\r\n");
-        return std.mem.startsWith(u8, trimmed, "evm.Mapping(") or
-            std.mem.startsWith(u8, trimmed, "Mapping(") or
-            std.mem.startsWith(u8, trimmed, "evm.types.Mapping(");
+        var prefix: []const u8 = undefined;
+        if (std.mem.startsWith(u8, trimmed, "evm.Mapping(")) {
+            prefix = "evm.Mapping(";
+        } else if (std.mem.startsWith(u8, trimmed, "Mapping(")) {
+            prefix = "Mapping(";
+        } else if (std.mem.startsWith(u8, trimmed, "evm.types.Mapping(")) {
+            prefix = "evm.types.Mapping(";
+        } else {
+            return null;
+        }
+        if (trimmed.len <= prefix.len + 1) return null;
+        if (trimmed[trimmed.len - 1] != ')') return null;
+        const inner = trimmed[prefix.len .. trimmed.len - 1];
+        var depth: usize = 0;
+        var split_idx: ?usize = null;
+        for (inner, 0..) |c, i| {
+            switch (c) {
+                '(' => depth += 1,
+                ')' => {
+                    if (depth > 0) depth -= 1;
+                },
+                ',' => if (depth == 0) {
+                    split_idx = i;
+                    break;
+                },
+                else => {},
+            }
+        }
+        const comma = split_idx orelse return null;
+        const key = std.mem.trim(u8, inner[0..comma], " \t\r\n");
+        const value = std.mem.trim(u8, inner[comma + 1 ..], " \t\r\n");
+        if (key.len == 0 or value.len == 0) return null;
+        return .{ .key = key, .value = value };
+    }
+
+    fn mappingValueTypeName(self: *Self, type_name: []const u8) ?[]const u8 {
+        const info = self.parseMappingType(type_name) orelse return null;
+        return info.value;
+    }
+
+    fn isStructTypeName(self: *Self, type_name: []const u8) bool {
+        return self.struct_defs.get(type_name) != null;
     }
 
     fn structHasDynamicField(self: *Self, fields: []const StructFieldDef) bool {
@@ -895,6 +944,35 @@ pub const Transformer = struct {
                     try stmts.append(self.allocator, self.stmtWithLocation(ast.Statement.expr(sstore_call), self.nodeLocation(index)));
                     return;
                 }
+            } else if (p.getNodeTag(target_data[0]) == .array_access) {
+                if (try self.mappingSlotExprFromArrayAccess(target_data[0], self.nodeLocation(index))) |access| {
+                    const value_type = access.value_type orelse {
+                        try self.reportUnsupportedStmt(index, "mapping value type missing");
+                        return;
+                    };
+                    if (!self.isStructTypeName(value_type)) {
+                        try self.reportUnsupportedStmt(index, "mapping value is not a struct");
+                        return;
+                    }
+                    const field_info = self.structStorageFieldInfo(value_type, field_name) orelse {
+                        try self.reportUnsupportedStmt(index, "unknown struct field");
+                        return;
+                    };
+                    const field_slot = if (field_info.slot_offset == 0)
+                        access.slot_expr
+                    else
+                        try self.builder.builtinCall("add", &.{
+                            access.slot_expr,
+                            ast.Expression.lit(ast.Literal.number(field_info.slot_offset)),
+                        });
+                    if (field_info.size_bits < 256 or field_info.offset_bits != 0) {
+                        try self.genPackedWriteDynamic(field_slot, field_info.size_bits, field_info.offset_bits, value, stmts);
+                        return;
+                    }
+                    const sstore_call = try self.builder.builtinCall("sstore", &.{ field_slot, value });
+                    try stmts.append(self.allocator, self.stmtWithLocation(ast.Statement.expr(sstore_call), self.nodeLocation(index)));
+                    return;
+                }
             }
 
             if (self.local_struct_vars.get(obj_src)) |struct_name| {
@@ -986,6 +1064,35 @@ pub const Transformer = struct {
                         ast.Expression.lit(ast.Literal.number(sv.slot)),
                         op_expr,
                     });
+                    try stmts.append(self.allocator, self.stmtWithLocation(ast.Statement.expr(sstore_call), self.nodeLocation(index)));
+                    return;
+                }
+            } else if (p.getNodeTag(target_data[0]) == .array_access) {
+                if (try self.mappingSlotExprFromArrayAccess(target_data[0], self.nodeLocation(index))) |access| {
+                    const value_type = access.value_type orelse {
+                        try self.reportUnsupportedStmt(index, "mapping value type missing");
+                        return;
+                    };
+                    if (!self.isStructTypeName(value_type)) {
+                        try self.reportUnsupportedStmt(index, "mapping value is not a struct");
+                        return;
+                    }
+                    const field_info = self.structStorageFieldInfo(value_type, field_name) orelse {
+                        try self.reportUnsupportedStmt(index, "unknown struct field");
+                        return;
+                    };
+                    const field_slot = if (field_info.slot_offset == 0)
+                        access.slot_expr
+                    else
+                        try self.builder.builtinCall("add", &.{
+                            access.slot_expr,
+                            ast.Expression.lit(ast.Literal.number(field_info.slot_offset)),
+                        });
+                    if (field_info.size_bits < 256 or field_info.offset_bits != 0) {
+                        try self.genPackedWriteDynamic(field_slot, field_info.size_bits, field_info.offset_bits, op_expr, stmts);
+                        return;
+                    }
+                    const sstore_call = try self.builder.builtinCall("sstore", &.{ field_slot, op_expr });
                     try stmts.append(self.allocator, self.stmtWithLocation(ast.Statement.expr(sstore_call), self.nodeLocation(index)));
                     return;
                 }
@@ -1983,6 +2090,104 @@ pub const Transformer = struct {
         return ast.Expression.lit(ast.Literal.number(0));
     }
 
+    fn translateMappingMethod(
+        self: *Self,
+        fn_expr: ZigAst.Node.Index,
+        args: []const ast.Expression,
+        loc: ast.SourceLocation,
+    ) TransformProcessError!?ast.Expression {
+        const p = &self.zig_parser.?;
+        if (p.getNodeTag(fn_expr) != .field_access) return null;
+
+        const data = p.ast.nodeData(fn_expr).node_and_token;
+        const obj_node = data[0];
+        const method_name = p.getIdentifier(data[1]);
+
+        const is_get = std.mem.eql(u8, method_name, "get");
+        const is_set = std.mem.eql(u8, method_name, "set");
+        const is_contains = std.mem.eql(u8, method_name, "contains");
+        if (!is_get and !is_set and !is_contains) return null;
+
+        var base_slot_expr: ast.Expression = undefined;
+        var value_type: ?[]const u8 = null;
+
+        if (self.mappingStorageVarForNode(obj_node)) |sv| {
+            base_slot_expr = ast.Expression.lit(ast.Literal.number(sv.slot));
+            value_type = sv.mapping_value_type;
+        } else if (p.getNodeTag(obj_node) == .array_access) {
+            const base_access = try self.mappingSlotExprFromArrayAccess(obj_node, loc) orelse return null;
+            const mapping_type = base_access.value_type orelse {
+                try self.addError("nested mapping requires mapping value type", loc, .unsupported_feature);
+                return null;
+            };
+            const nested_value = self.mappingValueTypeName(mapping_type) orelse {
+                try self.addError("nested mapping requires mapping value type", loc, .unsupported_feature);
+                return null;
+            };
+            base_slot_expr = base_access.slot_expr;
+            value_type = nested_value;
+        } else {
+            return null;
+        }
+
+        const base_value_type = value_type orelse {
+            try self.addError("mapping value type missing", loc, .unsupported_feature);
+            return null;
+        };
+
+        const key_count: usize = if (is_set) if (args.len > 0) args.len - 1 else 0 else args.len;
+        if (key_count == 0) {
+            try self.addError("mapping access requires key", loc, .unsupported_feature);
+            return null;
+        }
+        if (is_set and args.len < 2) {
+            try self.addError("mapping.set expects key and value", loc, .unsupported_feature);
+            return null;
+        }
+
+        const access = try self.mappingSlotExprForKeys(base_slot_expr, base_value_type, args[0..key_count], loc) orelse return null;
+        const final_type = access.value_type orelse {
+            try self.addError("mapping value type missing", loc, .unsupported_feature);
+            return null;
+        };
+        if (self.mappingValueTypeName(final_type) != null) {
+            try self.addError("mapping access requires additional key", loc, .unsupported_feature);
+            return null;
+        }
+        if (self.isStructTypeName(final_type)) {
+            try self.addError("mapping method does not support struct values", loc, .unsupported_feature);
+            return null;
+        }
+
+        const size_bits = storageTypeSizeBits(final_type);
+
+        if (is_get) {
+            if (size_bits < 256) {
+                return try self.genPackedReadDynamic(access.slot_expr, size_bits, 0);
+            }
+            return try self.builder.builtinCall("sload", &.{access.slot_expr});
+        }
+
+        if (is_contains) {
+            const load_expr = if (size_bits < 256)
+                try self.genPackedReadDynamic(access.slot_expr, size_bits, 0)
+            else
+                try self.builder.builtinCall("sload", &.{access.slot_expr});
+            const inner = try self.builder.builtinCall("iszero", &.{load_expr});
+            return try self.builder.builtinCall("iszero", &.{inner});
+        }
+
+        const value_expr = args[key_count];
+        const store_value = if (size_bits < 256)
+            try self.builder.builtinCall("and", &.{
+                value_expr,
+                ast.Expression.lit(ast.Literal.number((@as(ast.U256, 1) << @intCast(size_bits)) - 1)),
+            })
+        else
+            value_expr;
+        return try self.builder.builtinCall("sstore", &.{ access.slot_expr, store_value });
+    }
+
     fn translateCall(self: *Self, index: ZigAst.Node.Index) TransformProcessError!ast.Expression {
         const p = &self.zig_parser.?;
 
@@ -2018,6 +2223,10 @@ pub const Transformer = struct {
                 }
             }
             try args.append(self.allocator, try self.translateExpression(param_node));
+        }
+
+        if (try self.translateMappingMethod(call_info.ast.fn_expr, args.items, self.nodeLocation(index))) |expr| {
+            return expr;
         }
 
         // Check if it's an EVM builtin
@@ -2283,9 +2492,38 @@ pub const Transformer = struct {
         const data = p.ast.nodeData(index);
         const node_and_token = data.node_and_token;
 
-        const obj_src = p.getNodeSource(node_and_token[0]);
+        const obj_node = node_and_token[0];
+        const obj_src = p.getNodeSource(obj_node);
         const field_token = node_and_token[1];
         const field_name = p.getIdentifier(field_token);
+
+        if (p.getNodeTag(obj_node) == .array_access) {
+            if (try self.mappingSlotExprFromArrayAccess(obj_node, self.nodeLocation(index))) |access| {
+                const value_type = access.value_type orelse {
+                    try self.addError("mapping value type missing", self.nodeLocation(index), .unsupported_feature);
+                    return ast.Expression.lit(ast.Literal.number(0));
+                };
+                if (!self.isStructTypeName(value_type)) {
+                    try self.addError("mapping value is not a struct", self.nodeLocation(index), .unsupported_feature);
+                    return ast.Expression.lit(ast.Literal.number(0));
+                }
+                const field_info = self.structStorageFieldInfo(value_type, field_name) orelse {
+                    try self.addError("unknown struct field", self.nodeLocation(index), .unsupported_feature);
+                    return ast.Expression.lit(ast.Literal.number(0));
+                };
+                const field_slot = if (field_info.slot_offset == 0)
+                    access.slot_expr
+                else
+                    try self.builder.builtinCall("add", &.{
+                        access.slot_expr,
+                        ast.Expression.lit(ast.Literal.number(field_info.slot_offset)),
+                    });
+                if (field_info.size_bits < 256 or field_info.offset_bits != 0) {
+                    return try self.genPackedReadDynamic(field_slot, field_info.size_bits, field_info.offset_bits);
+                }
+                return try self.builder.builtinCall("sload", &.{field_slot});
+            }
+        }
 
         // Check if accessing storage
         if (std.mem.eql(u8, obj_src, "self")) {
@@ -2338,6 +2576,27 @@ pub const Transformer = struct {
         const base_node = data[0];
         const index_node = data[1];
         const base_tag = p.getNodeTag(base_node);
+        const loc = self.nodeLocation(index);
+
+        if (try self.mappingSlotExprFromArrayAccess(index, loc)) |access| {
+            const value_type = access.value_type orelse {
+                try self.addError("mapping value type missing", loc, .unsupported_feature);
+                return ast.Expression.lit(ast.Literal.number(0));
+            };
+            if (self.mappingValueTypeName(value_type) != null) {
+                try self.addError("mapping access requires additional key", loc, .unsupported_feature);
+                return ast.Expression.lit(ast.Literal.number(0));
+            }
+            if (self.isStructTypeName(value_type)) {
+                try self.addError("mapping value is a struct; access fields", loc, .unsupported_feature);
+                return ast.Expression.lit(ast.Literal.number(0));
+            }
+            const size_bits = storageTypeSizeBits(value_type);
+            if (size_bits < 256) {
+                return try self.genPackedReadDynamic(access.slot_expr, size_bits, 0);
+            }
+            return try self.builder.builtinCall("sload", &.{access.slot_expr});
+        }
 
         if (base_tag == .field_access) {
             const base_data = p.ast.nodeData(base_node).node_and_token;
@@ -2347,12 +2606,8 @@ pub const Transformer = struct {
                 if (self.storageVarFor(field_name)) |sv| {
                     const idx_expr = try self.translateExpression(index_node);
                     if (sv.is_mapping) {
-                        const helper = try self.ensureMappingSlotHelper();
-                        const slot_expr = try self.builder.call(helper, &.{
-                            idx_expr,
-                            ast.Expression.lit(ast.Literal.number(sv.slot)),
-                        });
-                        return try self.builder.builtinCall("sload", &.{slot_expr});
+                        try self.addError("mapping access requires key", loc, .unsupported_feature);
+                        return ast.Expression.lit(ast.Literal.number(0));
                     }
                     const addr = try self.indexedStorageSlot(sv.slot, idx_expr);
                     return try self.builder.builtinCall("sload", &.{addr});
@@ -2362,12 +2617,8 @@ pub const Transformer = struct {
                 if (self.storageVarForNested(base_name, field_name)) |sv| {
                     const idx_expr = try self.translateExpression(index_node);
                     if (sv.is_mapping) {
-                        const helper = try self.ensureMappingSlotHelper();
-                        const slot_expr = try self.builder.call(helper, &.{
-                            idx_expr,
-                            ast.Expression.lit(ast.Literal.number(sv.slot)),
-                        });
-                        return try self.builder.builtinCall("sload", &.{slot_expr});
+                        try self.addError("mapping access requires key", loc, .unsupported_feature);
+                        return ast.Expression.lit(ast.Literal.number(0));
                     }
                     const addr = try self.indexedStorageSlot(sv.slot, idx_expr);
                     return try self.builder.builtinCall("sload", &.{addr});
@@ -2425,6 +2676,32 @@ pub const Transformer = struct {
         const base_node = data[0];
         const index_node = data[1];
         const base_tag = p.getNodeTag(base_node);
+        const loc = self.nodeLocation(target);
+
+        if (try self.mappingSlotExprFromArrayAccess(target, loc)) |access| {
+            const value_type = access.value_type orelse {
+                try self.addError("mapping value type missing", loc, .unsupported_feature);
+                return null;
+            };
+            if (self.mappingValueTypeName(value_type) != null) {
+                try self.addError("mapping access requires additional key", loc, .unsupported_feature);
+                return null;
+            }
+            if (self.isStructTypeName(value_type)) {
+                try self.addError("mapping value is a struct; assign fields", loc, .unsupported_feature);
+                return null;
+            }
+            const size_bits = storageTypeSizeBits(value_type);
+            const store_value = if (size_bits < 256)
+                try self.builder.builtinCall("and", &.{
+                    value,
+                    ast.Expression.lit(ast.Literal.number((@as(ast.U256, 1) << @intCast(size_bits)) - 1)),
+                })
+            else
+                value;
+            const store = try self.builder.builtinCall("sstore", &.{ access.slot_expr, store_value });
+            return ast.Statement.expr(store);
+        }
 
         if (base_tag == .field_access) {
             const base_data = p.ast.nodeData(base_node).node_and_token;
@@ -2434,13 +2711,8 @@ pub const Transformer = struct {
                 if (self.storageVarFor(field_name)) |sv| {
                     const idx_expr = try self.translateExpression(index_node);
                     if (sv.is_mapping) {
-                        const helper = try self.ensureMappingSlotHelper();
-                        const slot_expr = try self.builder.call(helper, &.{
-                            idx_expr,
-                            ast.Expression.lit(ast.Literal.number(sv.slot)),
-                        });
-                        const store = try self.builder.builtinCall("sstore", &.{ slot_expr, value });
-                        return ast.Statement.expr(store);
+                        try self.addError("mapping assignment requires key", loc, .unsupported_feature);
+                        return null;
                     }
                     const addr = try self.indexedStorageSlot(sv.slot, idx_expr);
                     const store = try self.builder.builtinCall("sstore", &.{ addr, value });
@@ -2451,13 +2723,8 @@ pub const Transformer = struct {
                 if (self.storageVarForNested(base_name, field_name)) |sv| {
                     const idx_expr = try self.translateExpression(index_node);
                     if (sv.is_mapping) {
-                        const helper = try self.ensureMappingSlotHelper();
-                        const slot_expr = try self.builder.call(helper, &.{
-                            idx_expr,
-                            ast.Expression.lit(ast.Literal.number(sv.slot)),
-                        });
-                        const store = try self.builder.builtinCall("sstore", &.{ slot_expr, value });
-                        return ast.Statement.expr(store);
+                        try self.addError("mapping assignment requires key", loc, .unsupported_feature);
+                        return null;
                     }
                     const addr = try self.indexedStorageSlot(sv.slot, idx_expr);
                     const store = try self.builder.builtinCall("sstore", &.{ addr, value });
@@ -2574,6 +2841,208 @@ pub const Transformer = struct {
         return null;
     }
 
+    const MappingAccess = struct {
+        slot_expr: ast.Expression,
+        value_type: ?[]const u8,
+    };
+
+    fn mappingStorageVarForNode(self: *Self, node: ZigAst.Node.Index) ?StorageVar {
+        const p = &self.zig_parser.?;
+        const tag = p.getNodeTag(node);
+        switch (tag) {
+            .identifier => {
+                const name = p.getNodeSource(node);
+                if (self.storageVarByName(name)) |sv| {
+                    if (sv.is_mapping) return sv;
+                }
+            },
+            .field_access => {
+                const data = p.ast.nodeData(node).node_and_token;
+                const obj_src = p.getNodeSource(data[0]);
+                const field_name = p.getIdentifier(data[1]);
+                if (std.mem.eql(u8, obj_src, "self")) {
+                    if (self.storageVarByName(field_name)) |sv| {
+                        if (sv.is_mapping) return sv;
+                    }
+                } else if (std.mem.startsWith(u8, obj_src, "self.")) {
+                    const base_name = obj_src["self.".len..];
+                    if (self.storageVarForNested(base_name, field_name)) |sv| {
+                        if (sv.is_mapping) return sv;
+                    }
+                }
+            },
+            else => {},
+        }
+        return null;
+    }
+
+    fn mappingSlotExprForKeys(
+        self: *Self,
+        base_slot_expr: ast.Expression,
+        value_type: ?[]const u8,
+        key_exprs: []const ast.Expression,
+        loc: ast.SourceLocation,
+    ) TransformProcessError!?MappingAccess {
+        if (key_exprs.len == 0) {
+            try self.addError("mapping access requires at least one key", loc, .unsupported_feature);
+            return null;
+        }
+
+        var slot_expr = base_slot_expr;
+        var current_value_type = value_type;
+        const helper = try self.ensureMappingSlotHelper();
+
+        for (key_exprs, 0..) |key_expr, i| {
+            slot_expr = try self.builder.call(helper, &.{ key_expr, slot_expr });
+            if (i + 1 < key_exprs.len) {
+                const current = current_value_type orelse {
+                    try self.addError("nested mapping requires mapping value type", loc, .unsupported_feature);
+                    return null;
+                };
+                const next = self.mappingValueTypeName(current) orelse {
+                    try self.addError("nested mapping requires mapping value type", loc, .unsupported_feature);
+                    return null;
+                };
+                current_value_type = next;
+            }
+        }
+
+        return MappingAccess{ .slot_expr = slot_expr, .value_type = current_value_type };
+    }
+
+    fn mappingSlotExprFromArrayAccess(self: *Self, node: ZigAst.Node.Index, loc: ast.SourceLocation) TransformProcessError!?MappingAccess {
+        const p = &self.zig_parser.?;
+        if (p.getNodeTag(node) != .array_access) return null;
+        const data = p.ast.nodeData(node).node_and_node;
+        const base_node = data[0];
+        const index_node = data[1];
+
+        const base_tag = p.getNodeTag(base_node);
+        var base_slot_expr: ast.Expression = undefined;
+        var value_type: ?[]const u8 = null;
+
+        switch (base_tag) {
+            .field_access, .identifier => {
+                const sv = self.mappingStorageVarForNode(base_node) orelse return null;
+                base_slot_expr = ast.Expression.lit(ast.Literal.number(sv.slot));
+                value_type = sv.mapping_value_type;
+            },
+            .array_access => {
+                const base_access = try self.mappingSlotExprFromArrayAccess(base_node, loc) orelse return null;
+                const mapping_type = base_access.value_type orelse {
+                    try self.addError("nested mapping requires mapping value type", loc, .unsupported_feature);
+                    return null;
+                };
+                const nested_value = self.mappingValueTypeName(mapping_type) orelse {
+                    try self.addError("nested mapping requires mapping value type", loc, .unsupported_feature);
+                    return null;
+                };
+                base_slot_expr = base_access.slot_expr;
+                value_type = nested_value;
+            },
+            else => return null,
+        }
+
+        const idx_expr = try self.translateExpression(index_node);
+        const helper = try self.ensureMappingSlotHelper();
+        const slot_expr = try self.builder.call(helper, &.{ idx_expr, base_slot_expr });
+        return MappingAccess{ .slot_expr = slot_expr, .value_type = value_type };
+    }
+
+    const StructFieldInfo = struct {
+        slot_offset: evm_types.U256,
+        size_bits: u16,
+        offset_bits: u16,
+    };
+
+    fn structStorageFieldInfo(self: *Self, struct_name: []const u8, field_name: []const u8) ?StructFieldInfo {
+        const fields = self.struct_defs.get(struct_name) orelse return null;
+
+        var layout_fields: std.ArrayList(evm_storage.StructField) = .empty;
+        defer layout_fields.deinit(self.allocator);
+
+        for (fields) |field| {
+            layout_fields.append(self.allocator, .{ .name = field.name, .type_name = field.type_name }) catch return null;
+        }
+
+        var packer = evm_storage.StoragePacker.init(self.allocator);
+        const slots = packer.analyzeStruct(layout_fields.items) catch return null;
+        defer {
+            for (slots) |slot_info| {
+                self.allocator.free(slot_info.fields);
+            }
+            self.allocator.free(slots);
+        }
+
+        for (slots) |slot_info| {
+            for (slot_info.fields) |field| {
+                if (std.mem.eql(u8, field.name, field_name)) {
+                    return .{
+                        .slot_offset = slot_info.slot,
+                        .size_bits = field.size_bits,
+                        .offset_bits = field.offset_bits,
+                    };
+                }
+            }
+        }
+        return null;
+    }
+
+    fn genPackedReadDynamic(
+        self: *Self,
+        slot_expr: ast.Expression,
+        size_bits: u16,
+        offset_bits: u16,
+    ) TransformProcessError!ast.Expression {
+        const sload_expr = try self.builder.builtinCall("sload", &.{slot_expr});
+        const mask: ast.U256 = (@as(ast.U256, 1) << @intCast(size_bits)) - 1;
+
+        if (offset_bits == 0) {
+            return try self.builder.builtinCall("and", &.{
+                sload_expr,
+                ast.Expression.lit(ast.Literal.number(mask)),
+            });
+        }
+
+        const shifted = try self.builder.builtinCall("shr", &.{
+            ast.Expression.lit(ast.Literal.number(@as(ast.U256, offset_bits))),
+            sload_expr,
+        });
+        return try self.builder.builtinCall("and", &.{
+            shifted,
+            ast.Expression.lit(ast.Literal.number(mask)),
+        });
+    }
+
+    fn genPackedWriteDynamic(
+        self: *Self,
+        slot_expr: ast.Expression,
+        size_bits: u16,
+        offset_bits: u16,
+        value: ast.Expression,
+        stmts: *std.ArrayList(ast.Statement),
+    ) TransformProcessError!void {
+        const mask: ast.U256 = (@as(ast.U256, 1) << @intCast(size_bits)) - 1;
+        const clear_mask: ast.U256 = ~(mask << @intCast(offset_bits));
+
+        const sload_expr = try self.builder.builtinCall("sload", &.{slot_expr});
+        const cleared = try self.builder.builtinCall("and", &.{
+            sload_expr,
+            ast.Expression.lit(ast.Literal.number(clear_mask)),
+        });
+        const masked_value = try self.builder.builtinCall("and", &.{
+            value,
+            ast.Expression.lit(ast.Literal.number(mask)),
+        });
+        const shifted_value = try self.builder.builtinCall("shl", &.{
+            ast.Expression.lit(ast.Literal.number(@as(ast.U256, offset_bits))),
+            masked_value,
+        });
+        const merged = try self.builder.builtinCall("or", &.{ cleared, shifted_value });
+        const sstore_call = try self.builder.builtinCall("sstore", &.{ slot_expr, merged });
+        try stmts.append(self.allocator, ast.Statement.expr(sstore_call));
+    }
+
     fn indexedStorageSlot(self: *Self, base: ast.U256, idx_expr: ast.Expression) TransformProcessError!ast.Expression {
         const offset = try self.builder.builtinCall("mul", &.{
             idx_expr,
@@ -2607,7 +3076,7 @@ pub const Transformer = struct {
         if (std.mem.eql(u8, type_name, "u32")) return 32;
         if (std.mem.eql(u8, type_name, "u64")) return 64;
         if (std.mem.eql(u8, type_name, "u128")) return 128;
-        if (std.mem.eql(u8, type_name, "u256")) return 256;
+        if (std.mem.eql(u8, type_name, "u256") or std.mem.eql(u8, type_name, "U256") or std.mem.eql(u8, type_name, "evm.U256") or std.mem.eql(u8, type_name, "evm.u256")) return 256;
         if (std.mem.eql(u8, type_name, "Address") or std.mem.eql(u8, type_name, "evm.Address") or std.mem.eql(u8, type_name, "[20]u8")) return 160;
         return 256;
     }
@@ -2639,12 +3108,14 @@ pub const Transformer = struct {
                 const full_name = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ base_name, field.name });
                 try self.temp_strings.append(self.allocator, full_name);
                 const is_mapping = self.isMappingTypeName(field_type);
+                const mapping_value_type = if (is_mapping) self.mappingValueTypeName(field_type) else null;
                 try self.storage_vars.append(self.allocator, .{
                     .name = full_name,
                     .slot = base_slot + slot_info.slot,
                     .size_bits = field.size_bits,
                     .offset_bits = field.offset_bits,
                     .is_mapping = is_mapping,
+                    .mapping_value_type = mapping_value_type,
                 });
             }
         }
@@ -2691,12 +3162,14 @@ pub const Transformer = struct {
             }
 
             const is_mapping = self.isMappingTypeName(field.type_name);
+            const mapping_value_type = if (is_mapping) self.mappingValueTypeName(field.type_name) else null;
             try self.storage_vars.append(self.allocator, .{
                 .name = field.name,
                 .slot = current_slot,
                 .size_bits = field_bits,
                 .offset_bits = current_offset,
                 .is_mapping = is_mapping,
+                .mapping_value_type = mapping_value_type,
             });
 
             current_offset += field_bits;
