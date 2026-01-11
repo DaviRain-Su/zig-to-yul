@@ -334,6 +334,69 @@ pub fn Array(comptime Element: type) type {
         pub const ElementType = Element;
         const Self = @This();
 
+        pub const Ref = struct {
+            base: U256,
+            index: U256,
+            slot: U256,
+
+            pub fn get(self: Ref) Element {
+                _ = self;
+                return undefined;
+            }
+
+            pub fn set(self: Ref, value: Element) void {
+                _ = self;
+                _ = value;
+            }
+
+            pub fn getIndex(self: Ref) U256 {
+                return self.index;
+            }
+
+            pub fn getSlot(self: Ref) U256 {
+                return self.slot;
+            }
+        };
+
+        pub const Iterator = struct {
+            array: *Self,
+            index: U256,
+            total_len: U256,
+
+            pub const Item = struct {
+                index: U256,
+                value: Element,
+            };
+
+            pub fn next(self: *Iterator) ?Item {
+                if (self.index >= self.total_len) {
+                    return null;
+                }
+                const idx = self.index;
+                self.index += 1;
+                return .{ .index = idx, .value = self.array.get(idx) };
+            }
+
+            pub fn reset(self: *Iterator) void {
+                self.index = 0;
+                self.total_len = self.array.len();
+            }
+
+            pub fn len(self: *Iterator) U256 {
+                return self.total_len;
+            }
+
+            pub fn forEach(self: *Iterator, func: anytype) void {
+                while (self.next()) |item| {
+                    _ = func(item);
+                }
+            }
+        };
+
+        pub fn iterator(self: *Self) Iterator {
+            return .{ .array = self, .index = 0, .total_len = self.len() };
+        }
+
         pub fn len(self: *Self) U256 {
             _ = self;
             return 0;
@@ -361,6 +424,18 @@ pub fn Array(comptime Element: type) type {
             _ = value;
         }
 
+        pub fn getPtr(self: *Self, index: U256) Ref {
+            _ = self;
+            _ = index;
+            return undefined;
+        }
+
+        pub fn valuePtrAt(self: *Self, index: U256) Ref {
+            _ = self;
+            _ = index;
+            return undefined;
+        }
+
         pub fn push(self: *Self, value: Element) void {
             _ = self;
             _ = value;
@@ -377,7 +452,34 @@ pub fn Array(comptime Element: type) type {
             return undefined;
         }
 
+        pub fn swapRemove(self: *Self, index: U256) Element {
+            _ = self;
+            _ = index;
+            return undefined;
+        }
+
+        pub fn removeStable(self: *Self, index: U256) Element {
+            _ = self;
+            _ = index;
+            return undefined;
+        }
+
+        pub fn insert(self: *Self, index: U256, value: Element) void {
+            _ = self;
+            _ = index;
+            _ = value;
+        }
+
+        pub fn resize(self: *Self, new_len: U256) void {
+            _ = self;
+            _ = new_len;
+        }
+
         pub fn clear(self: *Self) void {
+            _ = self;
+        }
+
+        pub fn clearAndZero(self: *Self) void {
             _ = self;
         }
     };
@@ -760,8 +862,23 @@ test "array api" {
     _ = arr.count();
     _ = arr.get(0);
     arr.set(0, 1);
+    _ = arr.getPtr(0);
+    _ = arr.valuePtrAt(0);
     arr.push(1);
     _ = arr.pop();
     _ = arr.remove(0);
+    _ = arr.swapRemove(0);
+    _ = arr.removeStable(0);
+    arr.insert(0, 1);
+    arr.resize(0);
     arr.clear();
+    arr.clearAndZero();
+
+    var it = arr.iterator();
+    _ = it.len();
+    _ = it.next();
+    it.reset();
+    it.forEach(struct {
+        fn visit(_: Arr.Iterator.Item) void {}
+    }.visit);
 }
