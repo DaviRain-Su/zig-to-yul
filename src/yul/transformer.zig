@@ -3502,7 +3502,7 @@ pub const Transformer = struct {
                 try self.addError("array.get expects index", loc, .unsupported_feature);
                 return null;
             }
-            const helper = try self.ensureArrayGetHelper(info.value_type);
+            const helper = try self.ensureArrayGetHelper(info.value_type, loc);
             return try self.builder.call(helper, &.{ base_expr, args[0] });
         }
 
@@ -3511,7 +3511,7 @@ pub const Transformer = struct {
                 try self.addError("array.set expects index and value", loc, .unsupported_feature);
                 return null;
             }
-            const helper = try self.ensureArraySetHelper(info.value_type);
+            const helper = try self.ensureArraySetHelper(info.value_type, loc);
             return try self.builder.call(helper, &.{ base_expr, args[0], args[1] });
         }
 
@@ -3544,7 +3544,7 @@ pub const Transformer = struct {
                 try self.addError("array.push expects value", loc, .unsupported_feature);
                 return null;
             }
-            const helper = try self.ensureArrayPushHelper(info.value_type);
+            const helper = try self.ensureArrayPushHelper(info.value_type, loc);
             return try self.builder.call(helper, &.{ base_expr, args[0] });
         }
 
@@ -3553,7 +3553,7 @@ pub const Transformer = struct {
                 try self.addError("array.pop expects no arguments", loc, .unsupported_feature);
                 return null;
             }
-            const helper = try self.ensureArrayPopHelper(info.value_type);
+            const helper = try self.ensureArrayPopHelper(info.value_type, loc);
             return try self.builder.call(helper, &.{base_expr});
         }
 
@@ -3562,7 +3562,7 @@ pub const Transformer = struct {
                 try self.addError("array.remove expects index", loc, .unsupported_feature);
                 return null;
             }
-            const helper = try self.ensureArrayRemoveHelper(info.value_type);
+            const helper = try self.ensureArrayRemoveHelper(info.value_type, loc);
             return try self.builder.call(helper, &.{ base_expr, args[0] });
         }
 
@@ -3571,7 +3571,7 @@ pub const Transformer = struct {
                 try self.addError("array.removeStable expects index", loc, .unsupported_feature);
                 return null;
             }
-            const helper = try self.ensureArrayRemoveStableHelper(info.value_type);
+            const helper = try self.ensureArrayRemoveStableHelper(info.value_type, loc);
             return try self.builder.call(helper, &.{ base_expr, args[0] });
         }
 
@@ -3580,7 +3580,7 @@ pub const Transformer = struct {
                 try self.addError("array.insert expects index and value", loc, .unsupported_feature);
                 return null;
             }
-            const helper = try self.ensureArrayInsertHelper(info.value_type);
+            const helper = try self.ensureArrayInsertHelper(info.value_type, loc);
             return try self.builder.call(helper, &.{ base_expr, args[0], args[1] });
         }
 
@@ -3688,7 +3688,7 @@ pub const Transformer = struct {
                 try self.addError("array.get expects index", loc, .unsupported_feature);
                 return null;
             }
-            const helper = try self.ensureArrayGetHelper(value_type);
+            const helper = try self.ensureArrayGetHelper(value_type, loc);
             return try self.builder.call(helper, &.{ base_slot_expr, args[0] });
         }
 
@@ -3697,7 +3697,7 @@ pub const Transformer = struct {
                 try self.addError("array.set expects index and value", loc, .unsupported_feature);
                 return null;
             }
-            const helper = try self.ensureArraySetHelper(value_type);
+            const helper = try self.ensureArraySetHelper(value_type, loc);
             return try self.builder.call(helper, &.{ base_slot_expr, args[0], args[1] });
         }
 
@@ -3730,7 +3730,7 @@ pub const Transformer = struct {
                 try self.addError("array.push expects value", loc, .unsupported_feature);
                 return null;
             }
-            const helper = try self.ensureArrayPushHelper(value_type);
+            const helper = try self.ensureArrayPushHelper(value_type, loc);
             return try self.builder.call(helper, &.{ base_slot_expr, args[0] });
         }
 
@@ -3739,7 +3739,7 @@ pub const Transformer = struct {
                 try self.addError("array.pop expects no arguments", loc, .unsupported_feature);
                 return null;
             }
-            const helper = try self.ensureArrayPopHelper(value_type);
+            const helper = try self.ensureArrayPopHelper(value_type, loc);
             return try self.builder.call(helper, &.{base_slot_expr});
         }
 
@@ -3748,7 +3748,7 @@ pub const Transformer = struct {
                 try self.addError("array.remove expects index", loc, .unsupported_feature);
                 return null;
             }
-            const helper = try self.ensureArrayRemoveHelper(value_type);
+            const helper = try self.ensureArrayRemoveHelper(value_type, loc);
             return try self.builder.call(helper, &.{ base_slot_expr, args[0] });
         }
 
@@ -3757,7 +3757,7 @@ pub const Transformer = struct {
                 try self.addError("array.removeStable expects index", loc, .unsupported_feature);
                 return null;
             }
-            const helper = try self.ensureArrayRemoveStableHelper(value_type);
+            const helper = try self.ensureArrayRemoveStableHelper(value_type, loc);
             return try self.builder.call(helper, &.{ base_slot_expr, args[0] });
         }
 
@@ -3766,7 +3766,7 @@ pub const Transformer = struct {
                 try self.addError("array.insert expects index and value", loc, .unsupported_feature);
                 return null;
             }
-            const helper = try self.ensureArrayInsertHelper(value_type);
+            const helper = try self.ensureArrayInsertHelper(value_type, loc);
             return try self.builder.call(helper, &.{ base_slot_expr, args[0], args[1] });
         }
 
@@ -3852,7 +3852,7 @@ pub const Transformer = struct {
                             try self.addError("array element mapping requires arr[index].get(key)", loc, .unsupported_feature);
                             return ast.Expression.lit(ast.Literal.number(0));
                         }
-                        const helper = try self.ensureArrayGetHelper(elem_type);
+                        const helper = try self.ensureArrayGetHelper(elem_type, loc);
                         return try self.builder.call(helper, &.{ ast.Expression.lit(ast.Literal.number(sv.slot)), idx_expr });
                     }
                     const addr = try self.indexedStorageSlot(sv.slot, idx_expr);
@@ -3875,7 +3875,7 @@ pub const Transformer = struct {
                             try self.addError("array element mapping requires arr[index].get(key)", loc, .unsupported_feature);
                             return ast.Expression.lit(ast.Literal.number(0));
                         }
-                        const helper = try self.ensureArrayGetHelper(elem_type);
+                        const helper = try self.ensureArrayGetHelper(elem_type, loc);
                         return try self.builder.call(helper, &.{ ast.Expression.lit(ast.Literal.number(sv.slot)), idx_expr });
                     }
                     const addr = try self.indexedStorageSlot(sv.slot, idx_expr);
@@ -3983,7 +3983,7 @@ pub const Transformer = struct {
                             try self.addError("array element type missing; declare evm.Array(T)", loc, .unsupported_feature);
                             return null;
                         };
-                        const helper = try self.ensureArraySetHelper(elem_type);
+                        const helper = try self.ensureArraySetHelper(elem_type, loc);
                         const call_expr = try self.builder.call(helper, &.{ ast.Expression.lit(ast.Literal.number(sv.slot)), idx_expr, value });
                         return ast.Statement.expr(call_expr);
                     }
@@ -4004,7 +4004,7 @@ pub const Transformer = struct {
                             try self.addError("array element type missing; declare evm.Array(T)", loc, .unsupported_feature);
                             return null;
                         };
-                        const helper = try self.ensureArraySetHelper(elem_type);
+                        const helper = try self.ensureArraySetHelper(elem_type, loc);
                         const call_expr = try self.builder.call(helper, &.{ ast.Expression.lit(ast.Literal.number(sv.slot)), idx_expr, value });
                         return ast.Statement.expr(call_expr);
                     }
@@ -4696,7 +4696,7 @@ pub const Transformer = struct {
         try stmts.append(self.allocator, if_stmt);
     }
 
-    fn ensureArrayGetHelper(self: *Self, value_type: []const u8) ![]const u8 {
+    fn ensureArrayGetHelper(self: *Self, value_type: []const u8, loc: ast.SourceLocation) ![]const u8 {
         const key_name = try std.fmt.allocPrint(self.allocator, "array_get:{s}", .{value_type});
         defer self.allocator.free(key_name);
         if (self.math_helpers.get(key_name)) |helper| return helper;
@@ -4716,7 +4716,7 @@ pub const Transformer = struct {
         try self.appendRevertIf(&stmts, fail);
 
         const slot_expr = try self.arrayElementSlotExpr(ast.Expression.id("base"), ast.Expression.id("index"), value_type);
-        const value_expr = try self.arrayLoadValueExpr(slot_expr, value_type, .{ .start = 0, .end = 0 });
+        const value_expr = try self.arrayLoadValueExpr(slot_expr, value_type, loc);
         const assign = try self.builder.assign(&.{"result"}, value_expr);
         try stmts.append(self.allocator, assign);
 
@@ -4871,7 +4871,7 @@ pub const Transformer = struct {
         return helper_name;
     }
 
-    fn ensureArraySetHelper(self: *Self, value_type: []const u8) ![]const u8 {
+    fn ensureArraySetHelper(self: *Self, value_type: []const u8, loc: ast.SourceLocation) ![]const u8 {
         const key_name = try std.fmt.allocPrint(self.allocator, "array_set:{s}", .{value_type});
         defer self.allocator.free(key_name);
         if (self.math_helpers.get(key_name)) |helper| return helper;
@@ -4891,7 +4891,7 @@ pub const Transformer = struct {
         try self.appendRevertIf(&stmts, fail);
 
         const slot_expr = try self.arrayElementSlotExpr(ast.Expression.id("base"), ast.Expression.id("index"), value_type);
-        const store_stmt = try self.arrayStoreValueStmt(slot_expr, value_type, ast.Expression.id("value"), .{ .start = 0, .end = 0 });
+        const store_stmt = try self.arrayStoreValueStmt(slot_expr, value_type, ast.Expression.id("value"), loc);
         try stmts.append(self.allocator, store_stmt);
 
         const assign = try self.builder.assign(&.{"result"}, ast.Expression.lit(ast.Literal.number(0)));
@@ -4904,7 +4904,7 @@ pub const Transformer = struct {
         return helper_name;
     }
 
-    fn ensureArrayPushHelper(self: *Self, value_type: []const u8) ![]const u8 {
+    fn ensureArrayPushHelper(self: *Self, value_type: []const u8, loc: ast.SourceLocation) ![]const u8 {
         const key_name = try std.fmt.allocPrint(self.allocator, "array_push:{s}", .{value_type});
         defer self.allocator.free(key_name);
         if (self.math_helpers.get(key_name)) |helper| return helper;
@@ -4920,7 +4920,7 @@ pub const Transformer = struct {
         try stmts.append(self.allocator, try self.builder.varDecl(&.{"len"}, len_expr));
 
         const slot_expr = try self.arrayElementSlotExpr(ast.Expression.id("base"), ast.Expression.id("len"), value_type);
-        const store_stmt = try self.arrayStoreValueStmt(slot_expr, value_type, ast.Expression.id("value"), .{ .start = 0, .end = 0 });
+        const store_stmt = try self.arrayStoreValueStmt(slot_expr, value_type, ast.Expression.id("value"), loc);
         try stmts.append(self.allocator, store_stmt);
 
         const next_len = try self.builder.builtinCall("add", &.{ ast.Expression.id("len"), ast.Expression.lit(ast.Literal.number(1)) });
@@ -4937,7 +4937,7 @@ pub const Transformer = struct {
         return helper_name;
     }
 
-    fn ensureArrayPopHelper(self: *Self, value_type: []const u8) ![]const u8 {
+    fn ensureArrayPopHelper(self: *Self, value_type: []const u8, loc: ast.SourceLocation) ![]const u8 {
         const key_name = try std.fmt.allocPrint(self.allocator, "array_pop:{s}", .{value_type});
         defer self.allocator.free(key_name);
         if (self.math_helpers.get(key_name)) |helper| return helper;
@@ -4961,7 +4961,7 @@ pub const Transformer = struct {
         try stmts.append(self.allocator, ast.Statement.expr(store_len));
 
         const slot_expr = try self.arrayElementSlotExpr(ast.Expression.id("base"), ast.Expression.id("new_len"), value_type);
-        const value_expr = try self.arrayLoadValueExpr(slot_expr, value_type, .{ .start = 0, .end = 0 });
+        const value_expr = try self.arrayLoadValueExpr(slot_expr, value_type, loc);
         const assign = try self.builder.assign(&.{"result"}, value_expr);
         try stmts.append(self.allocator, assign);
 
@@ -4972,7 +4972,7 @@ pub const Transformer = struct {
         return helper_name;
     }
 
-    fn ensureArrayRemoveHelper(self: *Self, value_type: []const u8) ![]const u8 {
+    fn ensureArrayRemoveHelper(self: *Self, value_type: []const u8, loc: ast.SourceLocation) ![]const u8 {
         const key_name = try std.fmt.allocPrint(self.allocator, "array_remove:{s}", .{value_type});
         defer self.allocator.free(key_name);
         if (self.math_helpers.get(key_name)) |helper| return helper;
@@ -4997,11 +4997,11 @@ pub const Transformer = struct {
         const remove_slot = try self.arrayElementSlotExpr(ast.Expression.id("base"), ast.Expression.id("index"), value_type);
         const last_slot = try self.arrayElementSlotExpr(ast.Expression.id("base"), ast.Expression.id("last_index"), value_type);
 
-        const removed_value = try self.arrayLoadValueExpr(remove_slot, value_type, .{ .start = 0, .end = 0 });
+        const removed_value = try self.arrayLoadValueExpr(remove_slot, value_type, loc);
         try stmts.append(self.allocator, try self.builder.varDecl(&.{"removed"}, removed_value));
 
-        const last_value = try self.arrayLoadValueExpr(last_slot, value_type, .{ .start = 0, .end = 0 });
-        const store_stmt = try self.arrayStoreValueStmt(remove_slot, value_type, last_value, .{ .start = 0, .end = 0 });
+        const last_value = try self.arrayLoadValueExpr(last_slot, value_type, loc);
+        const store_stmt = try self.arrayStoreValueStmt(remove_slot, value_type, last_value, loc);
         try stmts.append(self.allocator, store_stmt);
 
         const new_len = try self.builder.builtinCall("sub", &.{ ast.Expression.id("len"), ast.Expression.lit(ast.Literal.number(1)) });
@@ -5018,7 +5018,7 @@ pub const Transformer = struct {
         return helper_name;
     }
 
-    fn ensureArrayRemoveStableHelper(self: *Self, value_type: []const u8) ![]const u8 {
+    fn ensureArrayRemoveStableHelper(self: *Self, value_type: []const u8, loc: ast.SourceLocation) ![]const u8 {
         const key_name = try std.fmt.allocPrint(self.allocator, "array_remove_stable:{s}", .{value_type});
         defer self.allocator.free(key_name);
         if (self.math_helpers.get(key_name)) |helper| return helper;
@@ -5041,7 +5041,7 @@ pub const Transformer = struct {
         try stmts.append(self.allocator, try self.builder.varDecl(&.{"last_index"}, last_index));
 
         const remove_slot = try self.arrayElementSlotExpr(ast.Expression.id("base"), ast.Expression.id("index"), value_type);
-        const removed_value = try self.arrayLoadValueExpr(remove_slot, value_type, .{ .start = 0, .end = 0 });
+        const removed_value = try self.arrayLoadValueExpr(remove_slot, value_type, loc);
         try stmts.append(self.allocator, try self.builder.varDecl(&.{"removed"}, removed_value));
 
         var pre_stmts: std.ArrayList(ast.Statement) = .empty;
@@ -5061,9 +5061,9 @@ pub const Transformer = struct {
         defer body_stmts.deinit(self.allocator);
         const next_index = try self.builder.builtinCall("add", &.{ ast.Expression.id("i"), ast.Expression.lit(ast.Literal.number(1)) });
         const next_slot = try self.arrayElementSlotExpr(ast.Expression.id("base"), next_index, value_type);
-        const next_value = try self.arrayLoadValueExpr(next_slot, value_type, .{ .start = 0, .end = 0 });
+        const next_value = try self.arrayLoadValueExpr(next_slot, value_type, loc);
         const cur_slot = try self.arrayElementSlotExpr(ast.Expression.id("base"), ast.Expression.id("i"), value_type);
-        const store_stmt = try self.arrayStoreValueStmt(cur_slot, value_type, next_value, .{ .start = 0, .end = 0 });
+        const store_stmt = try self.arrayStoreValueStmt(cur_slot, value_type, next_value, loc);
         try body_stmts.append(self.allocator, store_stmt);
         const body_block = try self.builder.block(body_stmts.items);
 
@@ -5084,7 +5084,7 @@ pub const Transformer = struct {
         return helper_name;
     }
 
-    fn ensureArrayInsertHelper(self: *Self, value_type: []const u8) ![]const u8 {
+    fn ensureArrayInsertHelper(self: *Self, value_type: []const u8, loc: ast.SourceLocation) ![]const u8 {
         const key_name = try std.fmt.allocPrint(self.allocator, "array_insert:{s}", .{value_type});
         defer self.allocator.free(key_name);
         if (self.math_helpers.get(key_name)) |helper| return helper;
@@ -5123,9 +5123,9 @@ pub const Transformer = struct {
         defer body_stmts.deinit(self.allocator);
         const src_index = try self.builder.builtinCall("sub", &.{ ast.Expression.id("i"), ast.Expression.lit(ast.Literal.number(1)) });
         const src_slot = try self.arrayElementSlotExpr(ast.Expression.id("base"), src_index, value_type);
-        const src_value = try self.arrayLoadValueExpr(src_slot, value_type, .{ .start = 0, .end = 0 });
+        const src_value = try self.arrayLoadValueExpr(src_slot, value_type, loc);
         const dst_slot = try self.arrayElementSlotExpr(ast.Expression.id("base"), ast.Expression.id("i"), value_type);
-        const store_stmt = try self.arrayStoreValueStmt(dst_slot, value_type, src_value, .{ .start = 0, .end = 0 });
+        const store_stmt = try self.arrayStoreValueStmt(dst_slot, value_type, src_value, loc);
         try body_stmts.append(self.allocator, store_stmt);
         const body_block = try self.builder.block(body_stmts.items);
 
@@ -5133,7 +5133,7 @@ pub const Transformer = struct {
         try stmts.append(self.allocator, loop_stmt);
 
         const insert_slot = try self.arrayElementSlotExpr(ast.Expression.id("base"), ast.Expression.id("index"), value_type);
-        const insert_stmt = try self.arrayStoreValueStmt(insert_slot, value_type, ast.Expression.id("value"), .{ .start = 0, .end = 0 });
+        const insert_stmt = try self.arrayStoreValueStmt(insert_slot, value_type, ast.Expression.id("value"), loc);
         try stmts.append(self.allocator, insert_stmt);
 
         const assign = try self.builder.assign(&.{"result"}, ast.Expression.lit(ast.Literal.number(0)));
