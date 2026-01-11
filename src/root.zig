@@ -23,6 +23,8 @@ pub const evm = struct {
     pub const Address = types.Address;
     pub const Mapping = types.Mapping;
     pub const Set = types.Set;
+    pub const Deque = types.Deque;
+    pub const Queue = types.Queue;
     pub const Array = types.Array;
     pub const EvmType = types.EvmType;
 };

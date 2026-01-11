@@ -74,6 +74,8 @@ pub const Transformer = struct {
         array_elem_type: ?[]const u8,
         is_set: bool,
         set_elem_type: ?[]const u8,
+        is_deque: bool,
+        deque_elem_type: ?[]const u8,
     };
 
     pub const StructFieldDef = struct {
@@ -569,6 +571,43 @@ pub const Transformer = struct {
 
     fn setElemTypeName(self: *Self, type_name: []const u8) ?[]const u8 {
         const info = self.parseSetType(type_name) orelse return null;
+        return info.elem;
+    }
+
+    fn isDequeTypeName(self: *Self, type_name: []const u8) bool {
+        return self.parseDequeType(type_name) != null;
+    }
+
+    const DequeTypeInfo = struct {
+        elem: []const u8,
+    };
+
+    fn parseDequeType(self: *Self, type_name: []const u8) ?DequeTypeInfo {
+        _ = self;
+        const trimmed = std.mem.trim(u8, type_name, " \t\r\n");
+        const prefix: []const u8 = blk: {
+            if (std.mem.startsWith(u8, trimmed, "evm.Deque(")) {
+                break :blk "evm.Deque(";
+            } else if (std.mem.startsWith(u8, trimmed, "Deque(")) {
+                break :blk "Deque(";
+            } else if (std.mem.startsWith(u8, trimmed, "evm.types.Deque(")) {
+                break :blk "evm.types.Deque(";
+            } else if (std.mem.startsWith(u8, trimmed, "evm.Queue(")) {
+                break :blk "evm.Queue(";
+            } else if (std.mem.startsWith(u8, trimmed, "Queue(")) {
+                break :blk "Queue(";
+            } else if (std.mem.startsWith(u8, trimmed, "evm.types.Queue(")) {
+                break :blk "evm.types.Queue(";
+            }
+            return null;
+        };
+        const end = if (std.mem.endsWith(u8, trimmed, ")")) trimmed.len - 1 else return null;
+        const inner = std.mem.trim(u8, trimmed[prefix.len..end], " \t\r\n");
+        return if (inner.len > 0) .{ .elem = inner } else null;
+    }
+
+    fn dequeElemTypeName(self: *Self, type_name: []const u8) ?[]const u8 {
+        const info = self.parseDequeType(type_name) orelse return null;
         return info.elem;
     }
 
@@ -3091,6 +3130,9 @@ pub const Transformer = struct {
         if (try self.translateSetMethod(call_info.ast.fn_expr, args.items, self.nodeLocation(index))) |expr| {
             return expr;
         }
+        if (try self.translateDequeMethod(call_info.ast.fn_expr, args.items, self.nodeLocation(index))) |expr| {
+            return expr;
+        }
         if (try self.translateArrayMethod(call_info.ast.fn_expr, args.items, self.nodeLocation(index))) |expr| {
             return expr;
         }
@@ -3949,6 +3991,114 @@ pub const Transformer = struct {
         return null;
     }
 
+    fn translateDequeMethod(
+        self: *Self,
+        fn_expr: ZigAst.Node.Index,
+        args: []const ast.Expression,
+        loc: ast.SourceLocation,
+    ) TransformProcessError!?ast.Expression {
+        const p = &self.zig_parser.?;
+        if (p.getNodeTag(fn_expr) != .field_access) return null;
+
+        const data = p.ast.nodeData(fn_expr).node_and_token;
+        const obj_node = data[0];
+        const method_name = p.getIdentifier(data[1]);
+
+        const is_len = std.mem.eql(u8, method_name, "len");
+        const is_is_empty = std.mem.eql(u8, method_name, "isEmpty");
+        const is_count = std.mem.eql(u8, method_name, "count");
+        const is_push_back = std.mem.eql(u8, method_name, "pushBack") or std.mem.eql(u8, method_name, "push");
+        const is_push_front = std.mem.eql(u8, method_name, "pushFront");
+        const is_pop_back = std.mem.eql(u8, method_name, "popBack");
+        const is_pop_front = std.mem.eql(u8, method_name, "popFront") or std.mem.eql(u8, method_name, "pop");
+        const is_peek_back = std.mem.eql(u8, method_name, "peekBack");
+        const is_peek_front = std.mem.eql(u8, method_name, "peekFront") or std.mem.eql(u8, method_name, "peek");
+        const is_clear = std.mem.eql(u8, method_name, "clear");
+        if (!is_len and !is_is_empty and !is_count and !is_push_back and !is_push_front and !is_pop_back and !is_pop_front and !is_peek_back and !is_peek_front and !is_clear) return null;
+
+        const sv = self.dequeStorageVarForNode(obj_node) orelse return null;
+        const value_type = sv.deque_elem_type orelse {
+            try self.addError("deque element type missing; declare evm.Deque(T)", loc, .unsupported_feature);
+            return null;
+        };
+        if (self.isMappingTypeName(value_type) or self.isArrayTypeName(value_type) or self.isSetTypeName(value_type) or self.isDequeTypeName(value_type)) {
+            try self.addError("deque element type must be scalar", loc, .unsupported_feature);
+            return null;
+        }
+
+        const base_slot_expr = ast.Expression.lit(ast.Literal.number(sv.slot));
+        const head_slot = base_slot_expr;
+        const tail_slot = try self.builder.builtinCall("add", &.{ base_slot_expr, ast.Expression.lit(ast.Literal.number(1)) });
+
+        if (is_len or is_count) {
+            if (args.len != 0) {
+                try self.addError("deque.len expects no arguments", loc, .unsupported_feature);
+                return null;
+            }
+            const head = try self.builder.builtinCall("sload", &.{head_slot});
+            const tail = try self.builder.builtinCall("sload", &.{tail_slot});
+            return try self.builder.builtinCall("sub", &.{ tail, head });
+        }
+
+        if (is_is_empty) {
+            if (args.len != 0) {
+                try self.addError("deque.isEmpty expects no arguments", loc, .unsupported_feature);
+                return null;
+            }
+            const head = try self.builder.builtinCall("sload", &.{head_slot});
+            const tail = try self.builder.builtinCall("sload", &.{tail_slot});
+            const eq_expr = try self.builder.builtinCall("eq", &.{ head, tail });
+            return eq_expr;
+        }
+
+        if (is_clear) {
+            if (args.len != 0) {
+                try self.addError("deque.clear expects no arguments", loc, .unsupported_feature);
+                return null;
+            }
+            const helper = try self.ensureDequeClearHelper();
+            return try self.builder.call(helper, &.{ head_slot, tail_slot });
+        }
+
+        if (is_push_back or is_push_front) {
+            if (args.len != 1) {
+                try self.addError("deque.push expects value", loc, .unsupported_feature);
+                return null;
+            }
+            const helper = if (is_push_front)
+                try self.ensureDequePushFrontHelper(value_type, loc)
+            else
+                try self.ensureDequePushBackHelper(value_type, loc);
+            return try self.builder.call(helper, &.{ head_slot, tail_slot, args[0] });
+        }
+
+        if (is_pop_back or is_pop_front) {
+            if (args.len != 0) {
+                try self.addError("deque.pop expects no arguments", loc, .unsupported_feature);
+                return null;
+            }
+            const helper = if (is_pop_front)
+                try self.ensureDequePopFrontHelper(value_type, loc)
+            else
+                try self.ensureDequePopBackHelper(value_type, loc);
+            return try self.builder.call(helper, &.{ head_slot, tail_slot });
+        }
+
+        if (is_peek_back or is_peek_front) {
+            if (args.len != 0) {
+                try self.addError("deque.peek expects no arguments", loc, .unsupported_feature);
+                return null;
+            }
+            const helper = if (is_peek_front)
+                try self.ensureDequePeekFrontHelper(value_type, loc)
+            else
+                try self.ensureDequePeekBackHelper(value_type, loc);
+            return try self.builder.call(helper, &.{ head_slot, tail_slot });
+        }
+
+        return null;
+    }
+
     fn translateArrayAccess(self: *Self, index: ZigAst.Node.Index) TransformProcessError!ast.Expression {
         const p = &self.zig_parser.?;
         const data = p.ast.nodeData(index).node_and_node;
@@ -4546,6 +4696,36 @@ pub const Transformer = struct {
         return null;
     }
 
+    fn dequeStorageVarForNode(self: *Self, node: ZigAst.Node.Index) ?StorageVar {
+        const p = &self.zig_parser.?;
+        const tag = p.getNodeTag(node);
+        switch (tag) {
+            .identifier => {
+                const name = p.getNodeSource(node);
+                if (self.storageVarByName(name)) |sv| {
+                    if (sv.is_deque) return sv;
+                }
+            },
+            .field_access => {
+                const data = p.ast.nodeData(node).node_and_token;
+                const obj_src = p.getNodeSource(data[0]);
+                const field_name = p.getIdentifier(data[1]);
+                if (std.mem.eql(u8, obj_src, "self")) {
+                    if (self.storageVarByName(field_name)) |sv| {
+                        if (sv.is_deque) return sv;
+                    }
+                } else if (std.mem.startsWith(u8, obj_src, "self.")) {
+                    const base_name = obj_src["self.".len..];
+                    if (self.storageVarForNested(base_name, field_name)) |sv| {
+                        if (sv.is_deque) return sv;
+                    }
+                }
+            },
+            else => {},
+        }
+        return null;
+    }
+
     const MappingAccess = struct {
         slot_expr: ast.Expression,
         base_slot_expr: ast.Expression,
@@ -4795,6 +4975,18 @@ pub const Transformer = struct {
         try self.extra_functions.append(self.allocator, func);
 
         return helper_name;
+    }
+
+    fn dequeElementSlotExpr(
+        self: *Self,
+        base_slot_expr: ast.Expression,
+        index_expr: ast.Expression,
+    ) TransformProcessError!ast.Expression {
+        const data_base = try self.builder.builtinCall("add", &.{
+            base_slot_expr,
+            ast.Expression.lit(ast.Literal.number(2)),
+        });
+        return try self.mappingSlotExprForKey(data_base, index_expr, "u256");
     }
 
     fn arrayElementSlotExpr(
@@ -5814,6 +6006,262 @@ pub const Transformer = struct {
 
         const body = try self.builder.block(stmts.items);
         const func = try self.builder.funcDef(helper_name, &.{ "base", "values_base" }, &.{"result"}, body);
+        try self.extra_functions.append(self.allocator, func);
+
+        return helper_name;
+    }
+
+    fn ensureDequePushBackHelper(self: *Self, value_type: []const u8, loc: ast.SourceLocation) ![]const u8 {
+        const key_name = try std.fmt.allocPrint(self.allocator, "deque_push_back:{s}", .{value_type});
+        defer self.allocator.free(key_name);
+        if (self.math_helpers.get(key_name)) |helper| return helper;
+
+        const helper_name = try self.mappingStructHelperName("__zig2yul$deq_pb$", value_type);
+        const key = try self.allocator.dupe(u8, key_name);
+        try self.math_helpers.put(key, helper_name);
+
+        var stmts: std.ArrayList(ast.Statement) = .empty;
+        defer stmts.deinit(self.allocator);
+
+        const tail_expr = try self.builder.builtinCall("sload", &.{ast.Expression.id("tail_slot")});
+        try stmts.append(self.allocator, try self.builder.varDecl(&.{"tail"}, tail_expr));
+
+        const slot_expr = try self.dequeElementSlotExpr(ast.Expression.id("base"), ast.Expression.id("tail"));
+        const store_stmt = try self.arrayStoreValueStmt(slot_expr, value_type, ast.Expression.id("value"), loc);
+        try stmts.append(self.allocator, store_stmt);
+
+        const next_tail = try self.builder.builtinCall("add", &.{ ast.Expression.id("tail"), ast.Expression.lit(ast.Literal.number(1)) });
+        const store_tail = try self.builder.builtinCall("sstore", &.{ ast.Expression.id("tail_slot"), next_tail });
+        try stmts.append(self.allocator, ast.Statement.expr(store_tail));
+
+        const assign = try self.builder.assign(&.{"result"}, ast.Expression.lit(ast.Literal.number(0)));
+        try stmts.append(self.allocator, assign);
+
+        const body = try self.builder.block(stmts.items);
+        const func = try self.builder.funcDef(helper_name, &.{ "base", "tail_slot", "value" }, &.{"result"}, body);
+        try self.extra_functions.append(self.allocator, func);
+
+        return helper_name;
+    }
+
+    fn ensureDequePushFrontHelper(self: *Self, value_type: []const u8, loc: ast.SourceLocation) ![]const u8 {
+        const key_name = try std.fmt.allocPrint(self.allocator, "deque_push_front:{s}", .{value_type});
+        defer self.allocator.free(key_name);
+        if (self.math_helpers.get(key_name)) |helper| return helper;
+
+        const helper_name = try self.mappingStructHelperName("__zig2yul$deq_pf$", value_type);
+        const key = try self.allocator.dupe(u8, key_name);
+        try self.math_helpers.put(key, helper_name);
+
+        var stmts: std.ArrayList(ast.Statement) = .empty;
+        defer stmts.deinit(self.allocator);
+
+        const head_expr = try self.builder.builtinCall("sload", &.{ast.Expression.id("head_slot")});
+        try stmts.append(self.allocator, try self.builder.varDecl(&.{"head"}, head_expr));
+        const tail_expr = try self.builder.builtinCall("sload", &.{ast.Expression.id("tail_slot")});
+        try stmts.append(self.allocator, try self.builder.varDecl(&.{"tail"}, tail_expr));
+
+        const is_empty = try self.builder.builtinCall("eq", &.{ ast.Expression.id("head"), ast.Expression.id("tail") });
+        const not_empty = try self.builder.builtinCall("iszero", &.{is_empty});
+        const head_zero = try self.builder.builtinCall("iszero", &.{ast.Expression.id("head")});
+        const should_revert = try self.builder.builtinCall("and", &.{ not_empty, head_zero });
+        try self.appendRevertIf(&stmts, should_revert);
+
+        var empty_stmts: std.ArrayList(ast.Statement) = .empty;
+        defer empty_stmts.deinit(self.allocator);
+        const empty_slot = try self.dequeElementSlotExpr(ast.Expression.id("base"), ast.Expression.id("head"));
+        const empty_store = try self.arrayStoreValueStmt(empty_slot, value_type, ast.Expression.id("value"), loc);
+        try empty_stmts.append(self.allocator, empty_store);
+        const next_tail = try self.builder.builtinCall("add", &.{ ast.Expression.id("tail"), ast.Expression.lit(ast.Literal.number(1)) });
+        const store_tail = try self.builder.builtinCall("sstore", &.{ ast.Expression.id("tail_slot"), next_tail });
+        try empty_stmts.append(self.allocator, ast.Statement.expr(store_tail));
+        const assign_empty = try self.builder.assign(&.{"result"}, ast.Expression.lit(ast.Literal.number(0)));
+        try empty_stmts.append(self.allocator, assign_empty);
+        const empty_block = try self.builder.block(empty_stmts.items);
+        try stmts.append(self.allocator, self.builder.ifStmt(is_empty, empty_block));
+
+        var non_stmts: std.ArrayList(ast.Statement) = .empty;
+        defer non_stmts.deinit(self.allocator);
+        const new_head = try self.builder.builtinCall("sub", &.{ ast.Expression.id("head"), ast.Expression.lit(ast.Literal.number(1)) });
+        try non_stmts.append(self.allocator, try self.builder.varDecl(&.{"new_head"}, new_head));
+        const slot_expr = try self.dequeElementSlotExpr(ast.Expression.id("base"), ast.Expression.id("new_head"));
+        const store_stmt = try self.arrayStoreValueStmt(slot_expr, value_type, ast.Expression.id("value"), loc);
+        try non_stmts.append(self.allocator, store_stmt);
+        const store_head = try self.builder.builtinCall("sstore", &.{ ast.Expression.id("head_slot"), ast.Expression.id("new_head") });
+        try non_stmts.append(self.allocator, ast.Statement.expr(store_head));
+        const assign = try self.builder.assign(&.{"result"}, ast.Expression.lit(ast.Literal.number(0)));
+        try non_stmts.append(self.allocator, assign);
+        const non_block = try self.builder.block(non_stmts.items);
+        try stmts.append(self.allocator, self.builder.ifStmt(not_empty, non_block));
+
+        const body = try self.builder.block(stmts.items);
+        const func = try self.builder.funcDef(helper_name, &.{ "base", "head_slot", "tail_slot", "value" }, &.{"result"}, body);
+        try self.extra_functions.append(self.allocator, func);
+
+        return helper_name;
+    }
+
+    fn ensureDequePopFrontHelper(self: *Self, value_type: []const u8, loc: ast.SourceLocation) ![]const u8 {
+        const key_name = try std.fmt.allocPrint(self.allocator, "deque_pop_front:{s}", .{value_type});
+        defer self.allocator.free(key_name);
+        if (self.math_helpers.get(key_name)) |helper| return helper;
+
+        const helper_name = try self.mappingStructHelperName("__zig2yul$deq_pof$", value_type);
+        const key = try self.allocator.dupe(u8, key_name);
+        try self.math_helpers.put(key, helper_name);
+
+        var stmts: std.ArrayList(ast.Statement) = .empty;
+        defer stmts.deinit(self.allocator);
+
+        const head_expr = try self.builder.builtinCall("sload", &.{ast.Expression.id("head_slot")});
+        try stmts.append(self.allocator, try self.builder.varDecl(&.{"head"}, head_expr));
+        const tail_expr = try self.builder.builtinCall("sload", &.{ast.Expression.id("tail_slot")});
+        try stmts.append(self.allocator, try self.builder.varDecl(&.{"tail"}, tail_expr));
+
+        const is_empty = try self.builder.builtinCall("eq", &.{ ast.Expression.id("head"), ast.Expression.id("tail") });
+        try self.appendRevertIf(&stmts, is_empty);
+
+        const slot_expr = try self.dequeElementSlotExpr(ast.Expression.id("base"), ast.Expression.id("head"));
+        const value_expr = try self.arrayLoadValueExpr(slot_expr, value_type, loc);
+        const clear_expr = try self.builder.builtinCall("sstore", &.{ slot_expr, ast.Expression.lit(ast.Literal.number(0)) });
+        try stmts.append(self.allocator, ast.Statement.expr(clear_expr));
+        const new_head = try self.builder.builtinCall("add", &.{ ast.Expression.id("head"), ast.Expression.lit(ast.Literal.number(1)) });
+        const store_head = try self.builder.builtinCall("sstore", &.{ ast.Expression.id("head_slot"), new_head });
+        try stmts.append(self.allocator, ast.Statement.expr(store_head));
+        const assign = try self.builder.assign(&.{"result"}, value_expr);
+        try stmts.append(self.allocator, assign);
+
+        const body = try self.builder.block(stmts.items);
+        const func = try self.builder.funcDef(helper_name, &.{ "base", "head_slot", "tail_slot" }, &.{"result"}, body);
+        try self.extra_functions.append(self.allocator, func);
+
+        return helper_name;
+    }
+
+    fn ensureDequePopBackHelper(self: *Self, value_type: []const u8, loc: ast.SourceLocation) ![]const u8 {
+        const key_name = try std.fmt.allocPrint(self.allocator, "deque_pop_back:{s}", .{value_type});
+        defer self.allocator.free(key_name);
+        if (self.math_helpers.get(key_name)) |helper| return helper;
+
+        const helper_name = try self.mappingStructHelperName("__zig2yul$deq_pob$", value_type);
+        const key = try self.allocator.dupe(u8, key_name);
+        try self.math_helpers.put(key, helper_name);
+
+        var stmts: std.ArrayList(ast.Statement) = .empty;
+        defer stmts.deinit(self.allocator);
+
+        const head_expr = try self.builder.builtinCall("sload", &.{ast.Expression.id("head_slot")});
+        try stmts.append(self.allocator, try self.builder.varDecl(&.{"head"}, head_expr));
+        const tail_expr = try self.builder.builtinCall("sload", &.{ast.Expression.id("tail_slot")});
+        try stmts.append(self.allocator, try self.builder.varDecl(&.{"tail"}, tail_expr));
+
+        const is_empty = try self.builder.builtinCall("eq", &.{ ast.Expression.id("head"), ast.Expression.id("tail") });
+        try self.appendRevertIf(&stmts, is_empty);
+
+        const new_tail = try self.builder.builtinCall("sub", &.{ ast.Expression.id("tail"), ast.Expression.lit(ast.Literal.number(1)) });
+        try stmts.append(self.allocator, try self.builder.varDecl(&.{"new_tail"}, new_tail));
+        const slot_expr = try self.dequeElementSlotExpr(ast.Expression.id("base"), ast.Expression.id("new_tail"));
+        const value_expr = try self.arrayLoadValueExpr(slot_expr, value_type, loc);
+        const clear_expr = try self.builder.builtinCall("sstore", &.{ slot_expr, ast.Expression.lit(ast.Literal.number(0)) });
+        try stmts.append(self.allocator, ast.Statement.expr(clear_expr));
+        const store_tail = try self.builder.builtinCall("sstore", &.{ ast.Expression.id("tail_slot"), ast.Expression.id("new_tail") });
+        try stmts.append(self.allocator, ast.Statement.expr(store_tail));
+        const assign = try self.builder.assign(&.{"result"}, value_expr);
+        try stmts.append(self.allocator, assign);
+
+        const body = try self.builder.block(stmts.items);
+        const func = try self.builder.funcDef(helper_name, &.{ "base", "head_slot", "tail_slot" }, &.{"result"}, body);
+        try self.extra_functions.append(self.allocator, func);
+
+        return helper_name;
+    }
+
+    fn ensureDequePeekFrontHelper(self: *Self, value_type: []const u8, loc: ast.SourceLocation) ![]const u8 {
+        const key_name = try std.fmt.allocPrint(self.allocator, "deque_peek_front:{s}", .{value_type});
+        defer self.allocator.free(key_name);
+        if (self.math_helpers.get(key_name)) |helper| return helper;
+
+        const helper_name = try self.mappingStructHelperName("__zig2yul$deq_pef$", value_type);
+        const key = try self.allocator.dupe(u8, key_name);
+        try self.math_helpers.put(key, helper_name);
+
+        var stmts: std.ArrayList(ast.Statement) = .empty;
+        defer stmts.deinit(self.allocator);
+
+        const head_expr = try self.builder.builtinCall("sload", &.{ast.Expression.id("head_slot")});
+        try stmts.append(self.allocator, try self.builder.varDecl(&.{"head"}, head_expr));
+        const tail_expr = try self.builder.builtinCall("sload", &.{ast.Expression.id("tail_slot")});
+        try stmts.append(self.allocator, try self.builder.varDecl(&.{"tail"}, tail_expr));
+
+        const is_empty = try self.builder.builtinCall("eq", &.{ ast.Expression.id("head"), ast.Expression.id("tail") });
+        try self.appendRevertIf(&stmts, is_empty);
+
+        const slot_expr = try self.dequeElementSlotExpr(ast.Expression.id("base"), ast.Expression.id("head"));
+        const value_expr = try self.arrayLoadValueExpr(slot_expr, value_type, loc);
+        const assign = try self.builder.assign(&.{"result"}, value_expr);
+        try stmts.append(self.allocator, assign);
+
+        const body = try self.builder.block(stmts.items);
+        const func = try self.builder.funcDef(helper_name, &.{ "base", "head_slot", "tail_slot" }, &.{"result"}, body);
+        try self.extra_functions.append(self.allocator, func);
+
+        return helper_name;
+    }
+
+    fn ensureDequePeekBackHelper(self: *Self, value_type: []const u8, loc: ast.SourceLocation) ![]const u8 {
+        const key_name = try std.fmt.allocPrint(self.allocator, "deque_peek_back:{s}", .{value_type});
+        defer self.allocator.free(key_name);
+        if (self.math_helpers.get(key_name)) |helper| return helper;
+
+        const helper_name = try self.mappingStructHelperName("__zig2yul$deq_peb$", value_type);
+        const key = try self.allocator.dupe(u8, key_name);
+        try self.math_helpers.put(key, helper_name);
+
+        var stmts: std.ArrayList(ast.Statement) = .empty;
+        defer stmts.deinit(self.allocator);
+
+        const head_expr = try self.builder.builtinCall("sload", &.{ast.Expression.id("head_slot")});
+        try stmts.append(self.allocator, try self.builder.varDecl(&.{"head"}, head_expr));
+        const tail_expr = try self.builder.builtinCall("sload", &.{ast.Expression.id("tail_slot")});
+        try stmts.append(self.allocator, try self.builder.varDecl(&.{"tail"}, tail_expr));
+
+        const is_empty = try self.builder.builtinCall("eq", &.{ ast.Expression.id("head"), ast.Expression.id("tail") });
+        try self.appendRevertIf(&stmts, is_empty);
+
+        const new_tail = try self.builder.builtinCall("sub", &.{ ast.Expression.id("tail"), ast.Expression.lit(ast.Literal.number(1)) });
+        try stmts.append(self.allocator, try self.builder.varDecl(&.{"new_tail"}, new_tail));
+        const slot_expr = try self.dequeElementSlotExpr(ast.Expression.id("base"), ast.Expression.id("new_tail"));
+        const value_expr = try self.arrayLoadValueExpr(slot_expr, value_type, loc);
+        const assign = try self.builder.assign(&.{"result"}, value_expr);
+        try stmts.append(self.allocator, assign);
+
+        const body = try self.builder.block(stmts.items);
+        const func = try self.builder.funcDef(helper_name, &.{ "base", "head_slot", "tail_slot" }, &.{"result"}, body);
+        try self.extra_functions.append(self.allocator, func);
+
+        return helper_name;
+    }
+
+    fn ensureDequeClearHelper(self: *Self) ![]const u8 {
+        const key_name = "deque_clear";
+        if (self.math_helpers.get(key_name)) |helper| return helper;
+
+        const helper_name = try std.fmt.allocPrint(self.allocator, "__zig2yul$deq_clear", .{});
+        const key = try self.allocator.dupe(u8, key_name);
+        try self.math_helpers.put(key, helper_name);
+
+        var stmts: std.ArrayList(ast.Statement) = .empty;
+        defer stmts.deinit(self.allocator);
+
+        const store_head = try self.builder.builtinCall("sstore", &.{ ast.Expression.id("head_slot"), ast.Expression.lit(ast.Literal.number(0)) });
+        try stmts.append(self.allocator, ast.Statement.expr(store_head));
+        const store_tail = try self.builder.builtinCall("sstore", &.{ ast.Expression.id("tail_slot"), ast.Expression.lit(ast.Literal.number(0)) });
+        try stmts.append(self.allocator, ast.Statement.expr(store_tail));
+        const assign = try self.builder.assign(&.{"result"}, ast.Expression.lit(ast.Literal.number(0)));
+        try stmts.append(self.allocator, assign);
+
+        const body = try self.builder.block(stmts.items);
+        const func = try self.builder.funcDef(helper_name, &.{ "head_slot", "tail_slot" }, &.{"result"}, body);
         try self.extra_functions.append(self.allocator, func);
 
         return helper_name;
@@ -7681,6 +8129,7 @@ pub const Transformer = struct {
         if (std.mem.startsWith(u8, trimmed, "evm.Array(") or std.mem.startsWith(u8, trimmed, "Array(") or std.mem.startsWith(u8, trimmed, "evm.types.Array(")) return 256;
         if (std.mem.startsWith(u8, trimmed, "evm.Mapping(") or std.mem.startsWith(u8, trimmed, "Mapping(") or std.mem.startsWith(u8, trimmed, "evm.types.Mapping(")) return 256;
         if (std.mem.startsWith(u8, trimmed, "evm.Set(") or std.mem.startsWith(u8, trimmed, "Set(") or std.mem.startsWith(u8, trimmed, "evm.types.Set(")) return 256;
+        if (std.mem.startsWith(u8, trimmed, "evm.Deque(") or std.mem.startsWith(u8, trimmed, "Deque(") or std.mem.startsWith(u8, trimmed, "evm.types.Deque(") or std.mem.startsWith(u8, trimmed, "evm.Queue(") or std.mem.startsWith(u8, trimmed, "Queue(") or std.mem.startsWith(u8, trimmed, "evm.types.Queue(")) return 256;
         if (std.mem.eql(u8, type_name, "bool")) return 8;
         if (std.mem.eql(u8, type_name, "u8")) return 8;
         if (std.mem.eql(u8, type_name, "u16")) return 16;
@@ -7727,6 +8176,8 @@ pub const Transformer = struct {
                 const array_elem_type = if (is_array) self.arrayElemTypeName(field_type) else null;
                 const is_set = self.isSetTypeName(field_type);
                 const set_elem_type = if (is_set) self.setElemTypeName(field_type) else null;
+                const is_deque = self.isDequeTypeName(field_type);
+                const deque_elem_type = if (is_deque) self.dequeElemTypeName(field_type) else null;
                 try self.storage_vars.append(self.allocator, .{
                     .name = full_name,
                     .slot = base_slot + base_slot_index,
@@ -7739,10 +8190,16 @@ pub const Transformer = struct {
                     .array_elem_type = array_elem_type,
                     .is_set = is_set,
                     .set_elem_type = set_elem_type,
+                    .is_deque = is_deque,
+                    .deque_elem_type = deque_elem_type,
                 });
                 if (is_set) {
                     slot_shift += 1;
                     if (base_slot_index + 1 > max_slot) max_slot = base_slot_index + 1;
+                }
+                if (is_deque) {
+                    slot_shift += 2;
+                    if (base_slot_index + 2 > max_slot) max_slot = base_slot_index + 2;
                 }
             }
         }
@@ -7784,8 +8241,10 @@ pub const Transformer = struct {
 
             const is_set = self.isSetTypeName(field.type_name);
             const set_elem_type = if (is_set) self.setElemTypeName(field.type_name) else null;
+            const is_deque = self.isDequeTypeName(field.type_name);
+            const deque_elem_type = if (is_deque) self.dequeElemTypeName(field.type_name) else null;
 
-            if (is_set) {
+            if (is_set or is_deque) {
                 if (current_offset != 0) {
                     current_slot += 1;
                     current_offset = 0;
@@ -7800,10 +8259,12 @@ pub const Transformer = struct {
                     .mapping_value_type = null,
                     .is_array = false,
                     .array_elem_type = null,
-                    .is_set = true,
+                    .is_set = is_set,
                     .set_elem_type = set_elem_type,
+                    .is_deque = is_deque,
+                    .deque_elem_type = deque_elem_type,
                 });
-                current_slot += 2;
+                current_slot += if (is_deque) 3 else 2;
                 current_offset = 0;
                 continue;
             }
@@ -7831,6 +8292,8 @@ pub const Transformer = struct {
                 .array_elem_type = array_elem_type,
                 .is_set = false,
                 .set_elem_type = null,
+                .is_deque = false,
+                .deque_elem_type = null,
             });
 
             current_offset += field_bits;

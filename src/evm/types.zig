@@ -384,6 +384,80 @@ pub fn Set(comptime Element: type) type {
     };
 }
 
+/// Defines a Solidity-style double-ended queue type for contracts.
+pub fn Deque(comptime Element: type) type {
+    return struct {
+        pub const ElementType = Element;
+        const Self = @This();
+
+        pub fn len(self: *Self) U256 {
+            _ = self;
+            return 0;
+        }
+
+        pub fn isEmpty(self: *Self) bool {
+            _ = self;
+            return true;
+        }
+
+        pub fn count(self: *Self) U256 {
+            _ = self;
+            return 0;
+        }
+
+        pub fn pushBack(self: *Self, value: Element) void {
+            _ = self;
+            _ = value;
+        }
+
+        pub fn pushFront(self: *Self, value: Element) void {
+            _ = self;
+            _ = value;
+        }
+
+        pub fn popBack(self: *Self) Element {
+            _ = self;
+            return undefined;
+        }
+
+        pub fn popFront(self: *Self) Element {
+            _ = self;
+            return undefined;
+        }
+
+        pub fn peekBack(self: *Self) Element {
+            _ = self;
+            return undefined;
+        }
+
+        pub fn peekFront(self: *Self) Element {
+            _ = self;
+            return undefined;
+        }
+
+        pub fn clear(self: *Self) void {
+            _ = self;
+        }
+
+        pub fn push(self: *Self, value: Element) void {
+            self.pushBack(value);
+        }
+
+        pub fn pop(self: *Self) Element {
+            return self.popFront();
+        }
+
+        pub fn peek(self: *Self) Element {
+            return self.peekFront();
+        }
+    };
+}
+
+/// Defines a Solidity-style queue type for contracts.
+pub fn Queue(comptime Element: type) type {
+    return Deque(Element);
+}
+
 /// Defines a Solidity-style dynamic array type for contracts.
 pub fn Array(comptime Element: type) type {
     return struct {
@@ -1034,6 +1108,31 @@ test "set api" {
     _ = set.valueAt(0);
     _ = set.values();
     set.clear();
+}
+
+test "deque api" {
+    const Deq = Deque(U256);
+    var deque: Deq = .{};
+
+    _ = deque.len();
+    _ = deque.isEmpty();
+    _ = deque.count();
+    deque.pushBack(1);
+    deque.pushFront(2);
+    _ = deque.popBack();
+    _ = deque.popFront();
+    _ = deque.peekBack();
+    _ = deque.peekFront();
+    deque.clear();
+    deque.push(1);
+    _ = deque.pop();
+    _ = deque.peek();
+
+    const Q = Queue(U256);
+    var queue: Q = .{};
+    queue.push(1);
+    _ = queue.pop();
+    _ = queue.peek();
 }
 
 test "array api" {
