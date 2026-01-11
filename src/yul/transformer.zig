@@ -2108,7 +2108,9 @@ pub const Transformer = struct {
         const is_contains = std.mem.eql(u8, method_name, "contains");
         const is_remove = std.mem.eql(u8, method_name, "remove");
         const is_len = std.mem.eql(u8, method_name, "len");
-        if (!is_get and !is_set and !is_contains and !is_remove and !is_len) return null;
+        const is_key_at = std.mem.eql(u8, method_name, "keyAt");
+        const is_value_at = std.mem.eql(u8, method_name, "valueAt");
+        if (!is_get and !is_set and !is_contains and !is_remove and !is_len and !is_key_at and !is_value_at) return null;
 
         var base_slot_expr: ast.Expression = undefined;
         var value_type: ?[]const u8 = null;
@@ -2143,6 +2145,42 @@ pub const Transformer = struct {
                 return null;
             }
             return try self.builder.builtinCall("sload", &.{base_slot_expr});
+        }
+
+        if (is_key_at or is_value_at) {
+            if (args.len != 1) {
+                try self.addError("mapping keyAt/valueAt expects one index", loc, .unsupported_feature);
+                return null;
+            }
+            if (self.mappingValueTypeName(base_value_type) != null) {
+                try self.addError("mapping keyAt/valueAt not supported for nested mappings", loc, .unsupported_feature);
+                return null;
+            }
+            const key_slot = try self.builder.builtinCall("add", &.{
+                try self.builder.builtinCall("add", &.{
+                    base_slot_expr,
+                    ast.Expression.lit(ast.Literal.number(2)),
+                }),
+                args[0],
+            });
+            const key_expr = try self.builder.builtinCall("sload", &.{key_slot});
+            if (is_key_at) return key_expr;
+
+            if (self.isStructTypeName(base_value_type)) {
+                const fields = self.struct_defs.get(base_value_type) orelse {
+                    try self.addError("unknown struct type in mapping", loc, .unsupported_feature);
+                    return null;
+                };
+                const helper = try self.ensureMappingStructGetHelper(base_value_type, fields);
+                const slot_expr = try self.builder.call(try self.ensureMappingSlotHelper(), &.{ key_expr, base_slot_expr });
+                return try self.builder.call(helper, &.{slot_expr});
+            }
+            const size_bits = storageTypeSizeBits(base_value_type);
+            const slot_expr = try self.builder.call(try self.ensureMappingSlotHelper(), &.{ key_expr, base_slot_expr });
+            if (size_bits < 256) {
+                return try self.genPackedReadDynamic(slot_expr, size_bits, 0);
+            }
+            return try self.builder.builtinCall("sload", &.{slot_expr});
         }
 
         const key_count: usize = if (is_set) if (args.len > 0) args.len - 1 else 0 else args.len;
@@ -2188,13 +2226,44 @@ pub const Transformer = struct {
         }
 
         if (is_remove) {
+            if (key_count > 1) {
+                if (self.isStructTypeName(final_type)) {
+                    const fields = self.struct_defs.get(final_type) orelse {
+                        try self.addError("unknown struct type in mapping", loc, .unsupported_feature);
+                        return null;
+                    };
+                    const helper = try self.ensureMappingStructClearHelper(final_type, fields);
+                    return try self.builder.call(helper, &.{access.slot_expr});
+                }
+                return try self.builder.builtinCall("sstore", &.{ access.slot_expr, ast.Expression.lit(ast.Literal.number(0)) });
+            }
             const helper = try self.ensureMappingRemoveHelper(final_type);
-            return try self.builder.call(helper, &.{ access.slot_expr, base_slot_expr });
+            return try self.builder.call(helper, &.{ access.slot_expr, base_slot_expr, args[0] });
         }
 
         const value_expr = args[key_count];
+        if (key_count > 1) {
+            if (self.isStructTypeName(final_type)) {
+                const fields = self.struct_defs.get(final_type) orelse {
+                    try self.addError("unknown struct type in mapping", loc, .unsupported_feature);
+                    return null;
+                };
+                const helper = try self.ensureMappingStructSetHelper(final_type, fields);
+                return try self.builder.call(helper, &.{ access.slot_expr, value_expr });
+            }
+            const size_bits = storageTypeSizeBits(final_type);
+            const store_value = if (size_bits < 256)
+                try self.builder.builtinCall("and", &.{
+                    value_expr,
+                    ast.Expression.lit(ast.Literal.number((@as(ast.U256, 1) << @intCast(size_bits)) - 1)),
+                })
+            else
+                value_expr;
+            return try self.builder.builtinCall("sstore", &.{ access.slot_expr, store_value });
+        }
+
         const helper = try self.ensureMappingSetHelper(final_type);
-        return try self.builder.call(helper, &.{ access.slot_expr, base_slot_expr, value_expr });
+        return try self.builder.call(helper, &.{ access.slot_expr, base_slot_expr, args[0], value_expr });
     }
 
     fn translateCall(self: *Self, index: ZigAst.Node.Index) TransformProcessError!ast.Expression {
@@ -3166,6 +3235,72 @@ pub const Transformer = struct {
         const dec = try self.builder.builtinCall("and", &.{ prev_nonzero, new_zero });
 
         const len_expr = try self.builder.builtinCall("sload", &.{ast.Expression.id("base")});
+
+        const idx_base = try self.builder.builtinCall("add", &.{ ast.Expression.id("base"), ast.Expression.lit(ast.Literal.number(1)) });
+        const key_slot_base = try self.builder.builtinCall("add", &.{ ast.Expression.id("base"), ast.Expression.lit(ast.Literal.number(2)) });
+        const mapping_helper = try self.ensureMappingSlotHelper();
+        const idx_slot = try self.builder.call(mapping_helper, &.{ ast.Expression.id("key"), idx_base });
+
+        const add_key_block = blk: {
+            var block_stmts: std.ArrayList(ast.Statement) = .empty;
+            defer block_stmts.deinit(self.allocator);
+
+            const index_plus = try self.builder.builtinCall("add", &.{ len_expr, ast.Expression.lit(ast.Literal.number(1)) });
+            const store_index = try self.builder.builtinCall("sstore", &.{ idx_slot, index_plus });
+            try block_stmts.append(self.allocator, ast.Statement.expr(store_index));
+
+            const key_slot = try self.builder.builtinCall("add", &.{ key_slot_base, len_expr });
+            const store_key = try self.builder.builtinCall("sstore", &.{ key_slot, ast.Expression.id("key") });
+            try block_stmts.append(self.allocator, ast.Statement.expr(store_key));
+
+            const block = try self.builder.block(block_stmts.items);
+            break :blk self.builder.ifStmt(inc, block);
+        };
+        try stmts.append(self.allocator, add_key_block);
+
+        const remove_block = blk: {
+            var block_stmts: std.ArrayList(ast.Statement) = .empty;
+            defer block_stmts.deinit(self.allocator);
+
+            const idx_val = try self.builder.builtinCall("sload", &.{idx_slot});
+            const idx = try self.builder.builtinCall("sub", &.{ idx_val, ast.Expression.lit(ast.Literal.number(1)) });
+            const last_index = try self.builder.builtinCall("sub", &.{ len_expr, ast.Expression.lit(ast.Literal.number(1)) });
+            const different = try self.builder.builtinCall("iszero", &.{
+                try self.builder.builtinCall("eq", &.{ idx, last_index }),
+            });
+
+            const swap_block = blk_swap: {
+                var swap_stmts: std.ArrayList(ast.Statement) = .empty;
+                defer swap_stmts.deinit(self.allocator);
+
+                const last_key_slot = try self.builder.builtinCall("add", &.{ key_slot_base, last_index });
+                const last_key = try self.builder.builtinCall("sload", &.{last_key_slot});
+                const target_slot = try self.builder.builtinCall("add", &.{ key_slot_base, idx });
+                const store_key = try self.builder.builtinCall("sstore", &.{ target_slot, last_key });
+                try swap_stmts.append(self.allocator, ast.Statement.expr(store_key));
+
+                const last_idx_slot = try self.builder.call(mapping_helper, &.{ last_key, idx_base });
+                const new_idx_val = try self.builder.builtinCall("add", &.{ idx, ast.Expression.lit(ast.Literal.number(1)) });
+                const store_idx = try self.builder.builtinCall("sstore", &.{ last_idx_slot, new_idx_val });
+                try swap_stmts.append(self.allocator, ast.Statement.expr(store_idx));
+
+                const block = try self.builder.block(swap_stmts.items);
+                break :blk_swap self.builder.ifStmt(different, block);
+            };
+            try block_stmts.append(self.allocator, swap_block);
+
+            const last_key_slot = try self.builder.builtinCall("add", &.{ key_slot_base, last_index });
+            const clear_last = try self.builder.builtinCall("sstore", &.{ last_key_slot, ast.Expression.lit(ast.Literal.number(0)) });
+            try block_stmts.append(self.allocator, ast.Statement.expr(clear_last));
+
+            const clear_idx = try self.builder.builtinCall("sstore", &.{ idx_slot, ast.Expression.lit(ast.Literal.number(0)) });
+            try block_stmts.append(self.allocator, ast.Statement.expr(clear_idx));
+
+            const block = try self.builder.block(block_stmts.items);
+            break :blk self.builder.ifStmt(dec, block);
+        };
+        try stmts.append(self.allocator, remove_block);
+
         const len_plus = try self.builder.builtinCall("add", &.{ len_expr, inc });
         const len_final = try self.builder.builtinCall("sub", &.{ len_plus, dec });
         const store_len = try self.builder.builtinCall("sstore", &.{ ast.Expression.id("base"), len_final });
@@ -3193,7 +3328,7 @@ pub const Transformer = struct {
         }
 
         const body = try self.builder.block(stmts.items);
-        const func = try self.builder.funcDef(helper_name, &.{ "slot", "base", "value" }, &.{}, body);
+        const func = try self.builder.funcDef(helper_name, &.{ "slot", "base", "key", "value" }, &.{}, body);
         try self.extra_functions.append(self.allocator, func);
 
         return helper_name;
@@ -3216,6 +3351,55 @@ pub const Transformer = struct {
 
         const len_expr = try self.builder.builtinCall("sload", &.{ast.Expression.id("base")});
         const dec = prev_nonzero;
+
+        const idx_base = try self.builder.builtinCall("add", &.{ ast.Expression.id("base"), ast.Expression.lit(ast.Literal.number(1)) });
+        const key_slot_base = try self.builder.builtinCall("add", &.{ ast.Expression.id("base"), ast.Expression.lit(ast.Literal.number(2)) });
+        const mapping_helper = try self.ensureMappingSlotHelper();
+        const idx_slot = try self.builder.call(mapping_helper, &.{ ast.Expression.id("key"), idx_base });
+
+        const remove_block = blk: {
+            var block_stmts: std.ArrayList(ast.Statement) = .empty;
+            defer block_stmts.deinit(self.allocator);
+
+            const idx_val = try self.builder.builtinCall("sload", &.{idx_slot});
+            const idx = try self.builder.builtinCall("sub", &.{ idx_val, ast.Expression.lit(ast.Literal.number(1)) });
+            const last_index = try self.builder.builtinCall("sub", &.{ len_expr, ast.Expression.lit(ast.Literal.number(1)) });
+            const different = try self.builder.builtinCall("iszero", &.{
+                try self.builder.builtinCall("eq", &.{ idx, last_index }),
+            });
+
+            const swap_block = blk_swap: {
+                var swap_stmts: std.ArrayList(ast.Statement) = .empty;
+                defer swap_stmts.deinit(self.allocator);
+
+                const last_key_slot = try self.builder.builtinCall("add", &.{ key_slot_base, last_index });
+                const last_key = try self.builder.builtinCall("sload", &.{last_key_slot});
+                const target_slot = try self.builder.builtinCall("add", &.{ key_slot_base, idx });
+                const store_key = try self.builder.builtinCall("sstore", &.{ target_slot, last_key });
+                try swap_stmts.append(self.allocator, ast.Statement.expr(store_key));
+
+                const last_idx_slot = try self.builder.call(mapping_helper, &.{ last_key, idx_base });
+                const new_idx_val = try self.builder.builtinCall("add", &.{ idx, ast.Expression.lit(ast.Literal.number(1)) });
+                const store_idx = try self.builder.builtinCall("sstore", &.{ last_idx_slot, new_idx_val });
+                try swap_stmts.append(self.allocator, ast.Statement.expr(store_idx));
+
+                const block = try self.builder.block(swap_stmts.items);
+                break :blk_swap self.builder.ifStmt(different, block);
+            };
+            try block_stmts.append(self.allocator, swap_block);
+
+            const last_key_slot = try self.builder.builtinCall("add", &.{ key_slot_base, last_index });
+            const clear_last = try self.builder.builtinCall("sstore", &.{ last_key_slot, ast.Expression.lit(ast.Literal.number(0)) });
+            try block_stmts.append(self.allocator, ast.Statement.expr(clear_last));
+
+            const clear_idx = try self.builder.builtinCall("sstore", &.{ idx_slot, ast.Expression.lit(ast.Literal.number(0)) });
+            try block_stmts.append(self.allocator, ast.Statement.expr(clear_idx));
+
+            const block = try self.builder.block(block_stmts.items);
+            break :blk self.builder.ifStmt(dec, block);
+        };
+        try stmts.append(self.allocator, remove_block);
+
         const len_final = try self.builder.builtinCall("sub", &.{ len_expr, dec });
         const store_len = try self.builder.builtinCall("sstore", &.{ ast.Expression.id("base"), len_final });
         try stmts.append(self.allocator, ast.Statement.expr(store_len));
@@ -3234,7 +3418,7 @@ pub const Transformer = struct {
         }
 
         const body = try self.builder.block(stmts.items);
-        const func = try self.builder.funcDef(helper_name, &.{ "slot", "base" }, &.{}, body);
+        const func = try self.builder.funcDef(helper_name, &.{ "slot", "base", "key" }, &.{}, body);
         try self.extra_functions.append(self.allocator, func);
 
         return helper_name;

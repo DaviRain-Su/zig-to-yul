@@ -49,6 +49,18 @@ pub fn Mapping(comptime Key: type, comptime Value: type) type {
             _ = self;
             return 0;
         }
+
+        pub fn keyAt(self: *@This(), index: U256) Key {
+            _ = self;
+            _ = index;
+            return undefined;
+        }
+
+        pub fn valueAt(self: *@This(), index: U256) Value {
+            _ = self;
+            _ = index;
+            return undefined;
+        }
     };
 }
 
