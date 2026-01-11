@@ -2154,9 +2154,48 @@ pub const Transformer = struct {
             try self.addError("mapping access requires additional key", loc, .unsupported_feature);
             return null;
         }
+
         if (self.isStructTypeName(final_type)) {
-            try self.addError("mapping method does not support struct values", loc, .unsupported_feature);
-            return null;
+            const fields = self.struct_defs.get(final_type) orelse {
+                try self.addError("unknown struct type in mapping", loc, .unsupported_feature);
+                return null;
+            };
+            if (is_get) {
+                const helper = try self.ensureMappingStructGetHelper(final_type, fields);
+                return try self.builder.call(helper, &.{access.slot_expr});
+            }
+            if (is_contains) {
+                var combined: ?ast.Expression = null;
+                for (fields) |field| {
+                    const info = self.structStorageFieldInfo(final_type, field.name) orelse {
+                        try self.addError("unknown struct field", loc, .unsupported_feature);
+                        return null;
+                    };
+                    const field_slot = if (info.slot_offset == 0)
+                        access.slot_expr
+                    else
+                        try self.builder.builtinCall("add", &.{
+                            access.slot_expr,
+                            ast.Expression.lit(ast.Literal.number(info.slot_offset)),
+                        });
+                    const field_expr = if (info.size_bits < 256 or info.offset_bits != 0)
+                        try self.genPackedReadDynamic(field_slot, info.size_bits, info.offset_bits)
+                    else
+                        try self.builder.builtinCall("sload", &.{field_slot});
+                    if (combined) |current| {
+                        combined = try self.builder.builtinCall("or", &.{ current, field_expr });
+                    } else {
+                        combined = field_expr;
+                    }
+                }
+                const payload = combined orelse ast.Expression.lit(ast.Literal.number(0));
+                const inner = try self.builder.builtinCall("iszero", &.{payload});
+                return try self.builder.builtinCall("iszero", &.{inner});
+            }
+
+            const value_expr = args[key_count];
+            const helper = try self.ensureMappingStructSetHelper(final_type, fields);
+            return try self.builder.call(helper, &.{ access.slot_expr, value_expr });
         }
 
         const size_bits = storageTypeSizeBits(final_type);
@@ -3041,6 +3080,116 @@ pub const Transformer = struct {
         const merged = try self.builder.builtinCall("or", &.{ cleared, shifted_value });
         const sstore_call = try self.builder.builtinCall("sstore", &.{ slot_expr, merged });
         try stmts.append(self.allocator, ast.Statement.expr(sstore_call));
+    }
+
+    fn mappingStructHelperName(self: *Self, prefix: []const u8, type_name: []const u8) ![]const u8 {
+        var buf: [160]u8 = undefined;
+        var len: usize = 0;
+        @memcpy(buf[0..prefix.len], prefix);
+        len = prefix.len;
+        for (type_name) |c| {
+            const out = if (std.ascii.isAlphanumeric(c) or c == '_') c else '$';
+            if (len >= buf.len) break;
+            buf[len] = out;
+            len += 1;
+        }
+        return try std.fmt.allocPrint(self.allocator, "{s}", .{buf[0..len]});
+    }
+
+    fn ensureMappingStructGetHelper(self: *Self, struct_name: []const u8, fields: []const StructFieldDef) ![]const u8 {
+        const key_name = try std.fmt.allocPrint(self.allocator, "mapping_get:{s}", .{struct_name});
+        defer self.allocator.free(key_name);
+        if (self.math_helpers.get(key_name)) |helper| return helper;
+
+        const helper_name = try self.mappingStructHelperName("__zig2yul$map_get$", struct_name);
+        const key = try self.allocator.dupe(u8, key_name);
+        try self.math_helpers.put(key, helper_name);
+
+        var stmts: std.ArrayList(ast.Statement) = .empty;
+        defer stmts.deinit(self.allocator);
+
+        const ptr_assign = try self.builder.assign(&.{"ptr"}, try self.builder.builtinCall("mload", &.{
+            ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0x40))),
+        }));
+        try stmts.append(self.allocator, ptr_assign);
+
+        for (fields, 0..) |field, i| {
+            const info = self.structStorageFieldInfo(struct_name, field.name) orelse continue;
+            const field_slot = if (info.slot_offset == 0)
+                ast.Expression.id("slot")
+            else
+                try self.builder.builtinCall("add", &.{
+                    ast.Expression.id("slot"),
+                    ast.Expression.lit(ast.Literal.number(info.slot_offset)),
+                });
+            const value_expr = if (info.size_bits < 256 or info.offset_bits != 0)
+                try self.genPackedReadDynamic(field_slot, info.size_bits, info.offset_bits)
+            else
+                try self.builder.builtinCall("sload", &.{field_slot});
+            const mem_addr = try self.builder.builtinCall("add", &.{
+                ast.Expression.id("ptr"),
+                ast.Expression.lit(ast.Literal.number(@as(ast.U256, @intCast(i * 32)))),
+            });
+            const store = try self.builder.builtinCall("mstore", &.{ mem_addr, value_expr });
+            try stmts.append(self.allocator, ast.Statement.expr(store));
+        }
+
+        const total_size: ast.U256 = @intCast(fields.len * 32);
+        const update_ptr = try self.builder.builtinCall("mstore", &.{
+            ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0x40))),
+            try self.builder.builtinCall("add", &.{
+                ast.Expression.id("ptr"),
+                ast.Expression.lit(ast.Literal.number(total_size)),
+            }),
+        });
+        try stmts.append(self.allocator, ast.Statement.expr(update_ptr));
+
+        const body = try self.builder.block(stmts.items);
+        const func = try self.builder.funcDef(helper_name, &.{"slot"}, &.{"ptr"}, body);
+        try self.extra_functions.append(self.allocator, func);
+
+        return helper_name;
+    }
+
+    fn ensureMappingStructSetHelper(self: *Self, struct_name: []const u8, fields: []const StructFieldDef) ![]const u8 {
+        const key_name = try std.fmt.allocPrint(self.allocator, "mapping_set:{s}", .{struct_name});
+        defer self.allocator.free(key_name);
+        if (self.math_helpers.get(key_name)) |helper| return helper;
+
+        const helper_name = try self.mappingStructHelperName("__zig2yul$map_set$", struct_name);
+        const key = try self.allocator.dupe(u8, key_name);
+        try self.math_helpers.put(key, helper_name);
+
+        var stmts: std.ArrayList(ast.Statement) = .empty;
+        defer stmts.deinit(self.allocator);
+
+        for (fields, 0..) |field, i| {
+            const info = self.structStorageFieldInfo(struct_name, field.name) orelse continue;
+            const mem_addr = try self.builder.builtinCall("add", &.{
+                ast.Expression.id("ptr"),
+                ast.Expression.lit(ast.Literal.number(@as(ast.U256, @intCast(i * 32)))),
+            });
+            const value_expr = try self.builder.builtinCall("mload", &.{mem_addr});
+            const field_slot = if (info.slot_offset == 0)
+                ast.Expression.id("slot")
+            else
+                try self.builder.builtinCall("add", &.{
+                    ast.Expression.id("slot"),
+                    ast.Expression.lit(ast.Literal.number(info.slot_offset)),
+                });
+            if (info.size_bits < 256 or info.offset_bits != 0) {
+                try self.genPackedWriteDynamic(field_slot, info.size_bits, info.offset_bits, value_expr, &stmts);
+            } else {
+                const store = try self.builder.builtinCall("sstore", &.{ field_slot, value_expr });
+                try stmts.append(self.allocator, ast.Statement.expr(store));
+            }
+        }
+
+        const body = try self.builder.block(stmts.items);
+        const func = try self.builder.funcDef(helper_name, &.{ "slot", "ptr" }, &.{}, body);
+        try self.extra_functions.append(self.allocator, func);
+
+        return helper_name;
     }
 
     fn indexedStorageSlot(self: *Self, base: ast.U256, idx_expr: ast.Expression) TransformProcessError!ast.Expression {
