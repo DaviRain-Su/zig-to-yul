@@ -15,6 +15,10 @@ const evm_storage = @import("../evm/storage.zig");
 const builtins = @import("../evm/builtins.zig");
 const transformer_types = @import("transformer/types.zig");
 const transformer_storage = @import("transformer/storage.zig");
+const transformer_expression = @import("transformer/expression.zig");
+const transformer_statement = @import("transformer/statement.zig");
+const transformer_dispatch = @import("transformer/dispatch.zig");
+const transformer_struct = @import("transformer/struct.zig");
 
 const MappingRefTypeInfo = struct {
     key_type: []const u8,
@@ -362,7 +366,7 @@ pub const Transformer = struct {
         }
     }
 
-    fn addError(self: *Self, message: []const u8, location: ast.SourceLocation, kind: TransformError.ErrorKind) !void {
+    pub fn addError(self: *Self, message: []const u8, location: ast.SourceLocation, kind: TransformError.ErrorKind) !void {
         try self.errors.append(self.allocator, .{
             .message = message,
             .location = location,
@@ -370,7 +374,7 @@ pub const Transformer = struct {
         });
     }
 
-    fn nodeLocation(self: *Self, index: ZigAst.Node.Index) ast.SourceLocation {
+    pub fn nodeLocation(self: *Self, index: ZigAst.Node.Index) ast.SourceLocation {
         const p = &self.zig_parser.?;
         const first_token = p.ast.firstToken(index);
         const last_token = p.ast.lastToken(index);
@@ -381,7 +385,7 @@ pub const Transformer = struct {
         return .{ .start = first_loc.start, .end = last_loc.start + last_len, .source_index = 0 };
     }
 
-    fn exprWithLocation(self: *Self, expr: ast.Expression, loc: ast.SourceLocation) ast.Expression {
+    pub fn exprWithLocation(self: *Self, expr: ast.Expression, loc: ast.SourceLocation) ast.Expression {
         _ = self;
         var out = expr;
         switch (out) {
@@ -393,7 +397,7 @@ pub const Transformer = struct {
         return out;
     }
 
-    fn stmtWithLocation(self: *Self, stmt: ast.Statement, loc: ast.SourceLocation) ast.Statement {
+    pub fn stmtWithLocation(self: *Self, stmt: ast.Statement, loc: ast.SourceLocation) ast.Statement {
         _ = self;
         var out = stmt;
         switch (out) {
@@ -885,9 +889,8 @@ pub const Transformer = struct {
     }
 
     fn isDynamicValueType(self: *Self, type_name: []const u8) bool {
-        _ = self;
         const abi = mapZigTypeToAbi(type_name);
-        return isDynamicAbiType(abi);
+        return self.isDynamicAbiType(abi);
     }
 
     fn dynamicWordCountExpr(self: *Self, value_type: []const u8, len_expr: ast.Expression) TransformProcessError!ast.Expression {
@@ -903,14 +906,14 @@ pub const Transformer = struct {
         return len_expr;
     }
 
-    fn structHasDynamicField(self: *Self, fields: []const StructFieldDef) bool {
+    pub fn structHasDynamicField(self: *Self, fields: []const StructFieldDef) bool {
         for (fields) |field| {
             if (self.struct_defs.get(field.type_name)) |nested| {
                 if (self.structHasDynamicField(nested)) return true;
                 continue;
             }
             const abi = mapZigTypeToAbi(field.type_name);
-            if (isDynamicAbiType(abi)) return true;
+            if (self.isDynamicAbiType(abi)) return true;
         }
         return false;
     }
@@ -1113,7 +1116,7 @@ pub const Transformer = struct {
                     } else {
                         const abi = mapZigTypeToAbi(ret_src);
                         return_abi = try self.allocator.dupe(u8, abi);
-                        return_is_dynamic = isDynamicAbiType(abi);
+                        return_is_dynamic = self.isDynamicAbiType(abi);
                         return_typed_buf[0] = ast.TypedName.withType("result", self.yulTypeNameForZig(ret_src));
                         return_typed = return_typed_buf[0..1];
                     }
@@ -1170,11 +1173,13 @@ pub const Transformer = struct {
         return mapZigTypeToAbi(zig_type);
     }
 
-    fn isDynamicAbiType(abi: []const u8) bool {
+    pub fn isDynamicAbiType(self: *Self, abi: []const u8) bool {
+        _ = self;
         return transformer_types.isDynamicAbiType(abi);
     }
 
-    fn isDynamicArrayAbiType(abi: []const u8) bool {
+    pub fn isDynamicArrayAbiType(self: *Self, abi: []const u8) bool {
+        _ = self;
         return transformer_types.isDynamicArrayAbiType(abi);
     }
 
@@ -1209,86 +1214,14 @@ pub const Transformer = struct {
     }
 
     fn processBlock(self: *Self, index: ZigAst.Node.Index, stmts: *std.ArrayList(ast.Statement)) TransformProcessError!void {
-        const p = &self.zig_parser.?;
-        var buf: [2]ZigAst.Node.Index = undefined;
-        if (p.ast.blockStatements(&buf, index)) |statements| {
-            for (statements) |stmt_idx| {
-                try self.processStatement(stmt_idx, stmts);
-            }
-            return;
-        }
-        try self.processStatement(index, stmts);
+        return transformer_statement.processBlock(self, index, stmts);
     }
 
-    fn processStatement(self: *Self, index: ZigAst.Node.Index, stmts: *std.ArrayList(ast.Statement)) TransformProcessError!void {
-        const p = &self.zig_parser.?;
-        const tag = p.getNodeTag(index);
-        switch (tag) {
-            .simple_var_decl, .local_var_decl => {
-                try self.processLocalVarDecl(index, stmts);
-            },
-            .assign => {
-                try self.processAssign(index, stmts);
-            },
-            .assign_add => {
-                try self.processAssignAdd(index, stmts);
-            },
-            .assign_sub => {
-                try self.processAssignSub(index, stmts);
-            },
-            .assign_mul => {
-                try self.processAssignMul(index, stmts);
-            },
-            .assign_div => {
-                try self.processAssignDiv(index, stmts);
-            },
-            .assign_mod => {
-                try self.processAssignMod(index, stmts);
-            },
-            .assign_shl => {
-                try self.processAssignShl(index, stmts);
-            },
-            .assign_shr => {
-                try self.processAssignShr(index, stmts);
-            },
-            .assign_bit_and => {
-                try self.processAssignBitAnd(index, stmts);
-            },
-            .assign_bit_or => {
-                try self.processAssignBitOr(index, stmts);
-            },
-            .assign_bit_xor => {
-                try self.processAssignBitXor(index, stmts);
-            },
-            .@"return" => {
-                try self.processReturn(index, stmts);
-            },
-            .@"if", .if_simple => {
-                try self.processIf(index, stmts);
-            },
-            .@"while", .while_simple, .while_cont => {
-                try self.processWhile(index, stmts);
-            },
-            .@"for", .for_simple => {
-                try self.processFor(index, stmts);
-            },
-            .@"switch", .switch_comma => {
-                try self.processSwitch(index, stmts);
-            },
-            .@"break" => {
-                try self.processBreak(index, stmts);
-            },
-            .@"continue" => {
-                try self.processContinue(index, stmts);
-            },
-            else => {
-                const expr = try self.translateExpression(index);
-                try stmts.append(self.allocator, self.stmtWithLocation(ast.Statement.expr(expr), self.nodeLocation(index)));
-            },
-        }
+    pub fn processStatement(self: *Self, index: ZigAst.Node.Index, stmts: *std.ArrayList(ast.Statement)) TransformProcessError!void {
+        return transformer_statement.processStatement(self, index, stmts);
     }
 
-    fn processLocalVarDecl(self: *Self, index: ZigAst.Node.Index, stmts: *std.ArrayList(ast.Statement)) TransformProcessError!void {
+    pub fn processLocalVarDecl(self: *Self, index: ZigAst.Node.Index, stmts: *std.ArrayList(ast.Statement)) TransformProcessError!void {
         const p = &self.zig_parser.?;
 
         if (p.getVarDecl(index)) |var_decl| {
@@ -1361,7 +1294,7 @@ pub const Transformer = struct {
         }
     }
 
-    fn processAssign(self: *Self, index: ZigAst.Node.Index, stmts: *std.ArrayList(ast.Statement)) TransformProcessError!void {
+    pub fn processAssign(self: *Self, index: ZigAst.Node.Index, stmts: *std.ArrayList(ast.Statement)) TransformProcessError!void {
         const p = &self.zig_parser.?;
         const data = p.ast.nodeData(index);
         const nodes = data.node_and_node;
@@ -1628,47 +1561,47 @@ pub const Transformer = struct {
         try stmts.append(self.allocator, self.stmtWithLocation(stmt, self.nodeLocation(index)));
     }
 
-    fn processAssignAdd(self: *Self, index: ZigAst.Node.Index, stmts: *std.ArrayList(ast.Statement)) TransformProcessError!void {
+    pub fn processAssignAdd(self: *Self, index: ZigAst.Node.Index, stmts: *std.ArrayList(ast.Statement)) TransformProcessError!void {
         try self.processAssignBinary(index, stmts, "add");
     }
 
-    fn processAssignSub(self: *Self, index: ZigAst.Node.Index, stmts: *std.ArrayList(ast.Statement)) TransformProcessError!void {
+    pub fn processAssignSub(self: *Self, index: ZigAst.Node.Index, stmts: *std.ArrayList(ast.Statement)) TransformProcessError!void {
         try self.processAssignBinary(index, stmts, "sub");
     }
 
-    fn processAssignMul(self: *Self, index: ZigAst.Node.Index, stmts: *std.ArrayList(ast.Statement)) TransformProcessError!void {
+    pub fn processAssignMul(self: *Self, index: ZigAst.Node.Index, stmts: *std.ArrayList(ast.Statement)) TransformProcessError!void {
         try self.processAssignBinary(index, stmts, "mul");
     }
 
-    fn processAssignDiv(self: *Self, index: ZigAst.Node.Index, stmts: *std.ArrayList(ast.Statement)) TransformProcessError!void {
+    pub fn processAssignDiv(self: *Self, index: ZigAst.Node.Index, stmts: *std.ArrayList(ast.Statement)) TransformProcessError!void {
         try self.processAssignBinary(index, stmts, "div");
     }
 
-    fn processAssignMod(self: *Self, index: ZigAst.Node.Index, stmts: *std.ArrayList(ast.Statement)) TransformProcessError!void {
+    pub fn processAssignMod(self: *Self, index: ZigAst.Node.Index, stmts: *std.ArrayList(ast.Statement)) TransformProcessError!void {
         try self.processAssignBinary(index, stmts, "mod");
     }
 
-    fn processAssignShl(self: *Self, index: ZigAst.Node.Index, stmts: *std.ArrayList(ast.Statement)) TransformProcessError!void {
+    pub fn processAssignShl(self: *Self, index: ZigAst.Node.Index, stmts: *std.ArrayList(ast.Statement)) TransformProcessError!void {
         try self.processAssignBinary(index, stmts, "shl");
     }
 
-    fn processAssignShr(self: *Self, index: ZigAst.Node.Index, stmts: *std.ArrayList(ast.Statement)) TransformProcessError!void {
+    pub fn processAssignShr(self: *Self, index: ZigAst.Node.Index, stmts: *std.ArrayList(ast.Statement)) TransformProcessError!void {
         try self.processAssignBinary(index, stmts, "shr");
     }
 
-    fn processAssignBitAnd(self: *Self, index: ZigAst.Node.Index, stmts: *std.ArrayList(ast.Statement)) TransformProcessError!void {
+    pub fn processAssignBitAnd(self: *Self, index: ZigAst.Node.Index, stmts: *std.ArrayList(ast.Statement)) TransformProcessError!void {
         try self.processAssignBinary(index, stmts, "and");
     }
 
-    fn processAssignBitOr(self: *Self, index: ZigAst.Node.Index, stmts: *std.ArrayList(ast.Statement)) TransformProcessError!void {
+    pub fn processAssignBitOr(self: *Self, index: ZigAst.Node.Index, stmts: *std.ArrayList(ast.Statement)) TransformProcessError!void {
         try self.processAssignBinary(index, stmts, "or");
     }
 
-    fn processAssignBitXor(self: *Self, index: ZigAst.Node.Index, stmts: *std.ArrayList(ast.Statement)) TransformProcessError!void {
+    pub fn processAssignBitXor(self: *Self, index: ZigAst.Node.Index, stmts: *std.ArrayList(ast.Statement)) TransformProcessError!void {
         try self.processAssignBinary(index, stmts, "xor");
     }
 
-    fn processReturn(self: *Self, index: ZigAst.Node.Index, stmts: *std.ArrayList(ast.Statement)) TransformProcessError!void {
+    pub fn processReturn(self: *Self, index: ZigAst.Node.Index, stmts: *std.ArrayList(ast.Statement)) TransformProcessError!void {
         const p = &self.zig_parser.?;
         const data = p.ast.nodeData(index);
         const opt_node = data.opt_node;
@@ -1685,7 +1618,7 @@ pub const Transformer = struct {
         try stmts.append(self.allocator, self.stmtWithLocation(ast.Statement.leaveStmt(), self.nodeLocation(index)));
     }
 
-    fn processIf(self: *Self, index: ZigAst.Node.Index, stmts: *std.ArrayList(ast.Statement)) TransformProcessError!void {
+    pub fn processIf(self: *Self, index: ZigAst.Node.Index, stmts: *std.ArrayList(ast.Statement)) TransformProcessError!void {
         const p = &self.zig_parser.?;
         const if_info = p.ast.fullIf(index) orelse return;
 
@@ -1732,7 +1665,7 @@ pub const Transformer = struct {
         }
     }
 
-    fn processWhile(self: *Self, index: ZigAst.Node.Index, stmts: *std.ArrayList(ast.Statement)) TransformProcessError!void {
+    pub fn processWhile(self: *Self, index: ZigAst.Node.Index, stmts: *std.ArrayList(ast.Statement)) TransformProcessError!void {
         const p = &self.zig_parser.?;
         const while_info = p.ast.fullWhile(index) orelse return;
 
@@ -1803,7 +1736,7 @@ pub const Transformer = struct {
         try stmts.append(self.allocator, self.stmtWithLocation(else_stmt, self.nodeLocation(index)));
     }
 
-    fn processFor(self: *Self, index: ZigAst.Node.Index, stmts: *std.ArrayList(ast.Statement)) TransformProcessError!void {
+    pub fn processFor(self: *Self, index: ZigAst.Node.Index, stmts: *std.ArrayList(ast.Statement)) TransformProcessError!void {
         const p = &self.zig_parser.?;
         const for_info = p.ast.fullFor(index) orelse return;
 
@@ -2180,7 +2113,7 @@ pub const Transformer = struct {
         return out;
     }
 
-    fn processSwitch(self: *Self, index: ZigAst.Node.Index, stmts: *std.ArrayList(ast.Statement)) TransformProcessError!void {
+    pub fn processSwitch(self: *Self, index: ZigAst.Node.Index, stmts: *std.ArrayList(ast.Statement)) TransformProcessError!void {
         const p = &self.zig_parser.?;
         const switch_info = p.ast.fullSwitch(index) orelse return;
 
@@ -2343,210 +2276,39 @@ pub const Transformer = struct {
     }
 
     fn translateSwitchValue(self: *Self, index: ZigAst.Node.Index) TransformProcessError!?ast.Literal {
-        const p = &self.zig_parser.?;
-        const tag = p.getNodeTag(index);
-        switch (tag) {
-            .number_literal => {
-                const src = p.getNodeSource(index);
-                const num = parseNumber(src) catch |err| {
-                    try self.reportExprError("Invalid number literal", index, err);
-                    return null;
-                };
-                const is_hex = src.len > 2 and src[0] == '0' and (src[1] == 'x' or src[1] == 'X');
-                return if (is_hex) ast.Literal.hexNumber(num) else ast.Literal.number(num);
-            },
-            .identifier => {
-                const name = p.getNodeSource(index);
-                if (std.mem.eql(u8, name, "true")) {
-                    return ast.Literal.boolean(true);
-                }
-                if (std.mem.eql(u8, name, "false")) {
-                    return ast.Literal.boolean(false);
-                }
-            },
-            else => {},
-        }
-
-        try self.addError("switch case value must be a literal", self.nodeLocation(index), .unsupported_feature);
-        return null;
+        return transformer_expression.translateSwitchValue(self, index);
     }
 
     fn isLiteralSwitchValue(self: *Self, index: ZigAst.Node.Index) bool {
-        const p = &self.zig_parser.?;
-        const tag = p.getNodeTag(index);
-        switch (tag) {
-            .number_literal => return true,
-            .identifier => {
-                const name = p.getNodeSource(index);
-                return std.mem.eql(u8, name, "true") or std.mem.eql(u8, name, "false");
-            },
-            else => return false,
-        }
+        return transformer_expression.isLiteralSwitchValue(self, index);
     }
 
     fn processBreak(self: *Self, index: ZigAst.Node.Index, stmts: *std.ArrayList(ast.Statement)) TransformProcessError!void {
-        const p = &self.zig_parser.?;
-        const data = p.ast.nodeData(index).opt_token_and_opt_node;
-        if (data[0] != .none or data[1].unwrap() != null) {
-            try self.addError("break with label/value is not supported", self.nodeLocation(index), .unsupported_feature);
-            return;
-        }
-        if (self.currentLoopBreakFlag()) |flag| {
-            const set_break = try self.builder.assign(&.{flag}, ast.Expression.lit(ast.Literal.number(@as(ast.U256, 1))));
-            try stmts.append(self.allocator, self.stmtWithLocation(set_break, self.nodeLocation(index)));
-        }
-        try stmts.append(self.allocator, self.stmtWithLocation(ast.Statement.breakStmt(), self.nodeLocation(index)));
+        return transformer_statement.processBreak(self, index, stmts);
     }
 
     fn processContinue(self: *Self, index: ZigAst.Node.Index, stmts: *std.ArrayList(ast.Statement)) TransformProcessError!void {
-        const p = &self.zig_parser.?;
-        const data = p.ast.nodeData(index).opt_token_and_opt_node;
-        if (data[0] != .none or data[1].unwrap() != null) {
-            try self.addError("continue with label/value is not supported", self.nodeLocation(index), .unsupported_feature);
-            return;
-        }
-        try stmts.append(self.allocator, self.stmtWithLocation(ast.Statement.continueStmt(), self.nodeLocation(index)));
+        return transformer_statement.processContinue(self, index, stmts);
     }
 
-    fn translateExpression(self: *Self, index: ZigAst.Node.Index) TransformProcessError!ast.Expression {
-        const p = &self.zig_parser.?;
-        const tag = p.getNodeTag(index);
-
-        const loc = self.nodeLocation(index);
-        const expr = switch (tag) {
-            .number_literal => blk: {
-                const src = p.getNodeSource(index);
-                // Support decimal, hex (0x), binary (0b), and underscores
-                const num = parseNumber(src) catch |err| {
-                    self.reportExprError("Invalid number literal", index, err) catch {};
-                    break :blk ast.Expression.lit(ast.Literal.number(0));
-                };
-                // Preserve hex format if source starts with 0x
-                const is_hex = src.len > 2 and src[0] == '0' and (src[1] == 'x' or src[1] == 'X');
-                break :blk ast.Expression.lit(if (is_hex) ast.Literal.hexNumber(num) else ast.Literal.number(num));
-            },
-            .identifier => blk: {
-                const name = p.getNodeSource(index);
-                if (std.mem.eql(u8, name, "true")) {
-                    break :blk ast.Expression.lit(ast.Literal.boolean(true));
-                } else if (std.mem.eql(u8, name, "false")) {
-                    break :blk ast.Expression.lit(ast.Literal.boolean(false));
-                }
-                break :blk ast.Expression.id(name);
-            },
-            .grouped_expression => blk: {
-                const data = p.ast.nodeData(index).node_and_token;
-                break :blk try self.translateExpression(data[0]);
-            },
-            .add => try self.translateBinaryOp(index, "add"),
-            .sub => try self.translateBinaryOp(index, "sub"),
-            .mul => try self.translateBinaryOp(index, "mul"),
-            .div => try self.translateBinaryOp(index, "div"),
-            .mod => try self.translateBinaryOp(index, "mod"),
-            .shl => try self.translateBinaryOp(index, "shl"),
-            .shr => try self.translateBinaryOp(index, "shr"),
-            .bit_and => try self.translateBinaryOp(index, "and"),
-            .bit_or => try self.translateBinaryOp(index, "or"),
-            .bit_xor => try self.translateBinaryOp(index, "xor"),
-            .bool_and => try self.translateBinaryOp(index, "and"),
-            .bool_or => try self.translateBinaryOp(index, "or"),
-            .equal_equal => try self.translateBinaryOp(index, "eq"),
-            .bang_equal => try self.translateInequality(index),
-            .less_than => try self.translateBinaryOp(index, "lt"),
-            .greater_than => try self.translateBinaryOp(index, "gt"),
-            .less_or_equal => try self.translateComparisonNegated(index, "gt"),
-            .greater_or_equal => try self.translateComparisonNegated(index, "lt"),
-            .bool_not => try self.translateUnaryIsZero(index),
-            .bit_not => try self.translateUnaryOp(index, "not"),
-            .negation, .negation_wrap => try self.translateUnaryNegation(index),
-            .builtin_call,
-            .builtin_call_comma,
-            .builtin_call_two,
-            .builtin_call_two_comma,
-            => try self.translateBuiltinCall(index),
-            .call, .call_one => try self.translateCall(index),
-            .field_access => try self.translateFieldAccess(index),
-            .array_access => try self.translateArrayAccess(index),
-            .struct_init_one,
-            .struct_init_one_comma,
-            .struct_init_dot_two,
-            .struct_init_dot_two_comma,
-            .struct_init_dot,
-            .struct_init_dot_comma,
-            .struct_init,
-            .struct_init_comma,
-            => try self.translateStructInit(index),
-            .array_init_one,
-            .array_init_one_comma,
-            .array_init_dot_two,
-            .array_init_dot_two_comma,
-            .array_init_dot,
-            .array_init_dot_comma,
-            .array_init,
-            .array_init_comma,
-            => try self.translateStructInitWithType(index, null),
-            else => blk: {
-                self.reportUnsupportedExpr(index) catch {};
-                break :blk ast.Expression.lit(ast.Literal.number(0));
-            },
-        };
-        return self.exprWithLocation(expr, loc);
+    pub fn translateExpression(self: *Self, index: ZigAst.Node.Index) TransformProcessError!ast.Expression {
+        return transformer_expression.translateExpression(self, index);
     }
 
     /// Parse Zig number literal (supports decimal, hex, binary, octal, underscores)
     fn parseNumber(src: []const u8) !evm_types.U256 {
-        // Remove underscores
-        var clean: [256]u8 = undefined;
-        var clean_len: usize = 0;
-        for (src) |c| {
-            if (c != '_') {
-                if (clean_len >= clean.len) return error.NumberTooLong;
-                clean[clean_len] = c;
-                clean_len += 1;
-            }
-        }
-        const num_str = clean[0..clean_len];
-
-        if (num_str.len == 0) return error.EmptyNumber;
-
-        // Detect base
-        if (num_str.len > 2 and num_str[0] == '0') {
-            if (num_str[1] == 'x' or num_str[1] == 'X') {
-                return std.fmt.parseInt(evm_types.U256, num_str[2..], 16);
-            } else if (num_str[1] == 'b' or num_str[1] == 'B') {
-                return std.fmt.parseInt(evm_types.U256, num_str[2..], 2);
-            } else if (num_str[1] == 'o' or num_str[1] == 'O') {
-                return std.fmt.parseInt(evm_types.U256, num_str[2..], 8);
-            }
-        }
-
-        return std.fmt.parseInt(evm_types.U256, num_str, 10);
+        return transformer_expression.parseNumber(src);
     }
 
-    fn reportExprError(self: *Self, msg: []const u8, index: ZigAst.Node.Index, err: anyerror) !void {
-        const p = &self.zig_parser.?;
-        const token = p.getMainToken(index);
-        const loc = p.ast.tokens.get(token);
-        // Include error name in message
-        const full_msg = std.fmt.allocPrint(self.allocator, "{s}: {s}", .{ msg, @errorName(err) }) catch msg;
-        if (full_msg.ptr != msg.ptr) {
-            try self.temp_strings.append(self.allocator, full_msg);
-        }
-        try self.addError(full_msg, .{ .start = loc.start, .end = loc.start + 1 }, .type_error);
+    pub fn reportExprError(self: *Self, msg: []const u8, index: ZigAst.Node.Index, err: anyerror) !void {
+        return transformer_expression.reportExprError(self, msg, index, err);
     }
 
-    fn reportUnsupportedExpr(self: *Self, index: ZigAst.Node.Index) !void {
-        const p = &self.zig_parser.?;
-        const tag = p.getNodeTag(index);
-        const token = p.getMainToken(index);
-        const loc = p.ast.tokens.get(token);
-        // Create error message with tag name
-        const msg = std.fmt.allocPrint(self.allocator, "Unsupported expression: {s}", .{@tagName(tag)}) catch "Unsupported expression";
-        try self.temp_strings.append(self.allocator, msg);
-        try self.addError(msg, .{ .start = loc.start, .end = loc.start + 1 }, .unsupported_feature);
+    pub fn reportUnsupportedExpr(self: *Self, index: ZigAst.Node.Index) !void {
+        return transformer_expression.reportUnsupportedExpr(self, index);
     }
 
-    fn translateBinaryOp(self: *Self, index: ZigAst.Node.Index, op: []const u8) TransformProcessError!ast.Expression {
+    pub fn translateBinaryOp(self: *Self, index: ZigAst.Node.Index, op: []const u8) TransformProcessError!ast.Expression {
         const p = &self.zig_parser.?;
         const data = p.ast.nodeData(index);
         const nodes = data.node_and_node;
@@ -2557,17 +2319,17 @@ pub const Transformer = struct {
         return try self.builder.builtinCall(op, &.{ left, right });
     }
 
-    fn translateInequality(self: *Self, index: ZigAst.Node.Index) TransformProcessError!ast.Expression {
+    pub fn translateInequality(self: *Self, index: ZigAst.Node.Index) TransformProcessError!ast.Expression {
         const eq = try self.translateBinaryOp(index, "eq");
         return try self.builder.builtinCall("iszero", &.{eq});
     }
 
-    fn translateComparisonNegated(self: *Self, index: ZigAst.Node.Index, op: []const u8) TransformProcessError!ast.Expression {
+    pub fn translateComparisonNegated(self: *Self, index: ZigAst.Node.Index, op: []const u8) TransformProcessError!ast.Expression {
         const cmp = try self.translateBinaryOp(index, op);
         return try self.builder.builtinCall("iszero", &.{cmp});
     }
 
-    fn translateUnaryIsZero(self: *Self, index: ZigAst.Node.Index) TransformProcessError!ast.Expression {
+    pub fn translateUnaryIsZero(self: *Self, index: ZigAst.Node.Index) TransformProcessError!ast.Expression {
         const p = &self.zig_parser.?;
         const data = p.ast.nodeData(index);
         const child = data.node;
@@ -2575,7 +2337,7 @@ pub const Transformer = struct {
         return try self.builder.builtinCall("iszero", &.{expr});
     }
 
-    fn translateUnaryOp(self: *Self, index: ZigAst.Node.Index, op: []const u8) TransformProcessError!ast.Expression {
+    pub fn translateUnaryOp(self: *Self, index: ZigAst.Node.Index, op: []const u8) TransformProcessError!ast.Expression {
         const p = &self.zig_parser.?;
         const data = p.ast.nodeData(index);
         const child = data.node;
@@ -2583,7 +2345,7 @@ pub const Transformer = struct {
         return try self.builder.builtinCall(op, &.{expr});
     }
 
-    fn translateUnaryNegation(self: *Self, index: ZigAst.Node.Index) TransformProcessError!ast.Expression {
+    pub fn translateUnaryNegation(self: *Self, index: ZigAst.Node.Index) TransformProcessError!ast.Expression {
         const p = &self.zig_parser.?;
         const data = p.ast.nodeData(index);
         const child = data.node;
@@ -2594,7 +2356,7 @@ pub const Transformer = struct {
         });
     }
 
-    fn translateBuiltinCall(self: *Self, index: ZigAst.Node.Index) TransformProcessError!ast.Expression {
+    pub fn translateBuiltinCall(self: *Self, index: ZigAst.Node.Index) TransformProcessError!ast.Expression {
         const p = &self.zig_parser.?;
         const tag = p.getNodeTag(index);
 
@@ -3332,7 +3094,7 @@ pub const Transformer = struct {
         return try self.builder.call(helper, &.{ access.slot_expr, access.base_slot_expr, args[0], value_expr });
     }
 
-    fn translateCall(self: *Self, index: ZigAst.Node.Index) TransformProcessError!ast.Expression {
+    pub fn translateCall(self: *Self, index: ZigAst.Node.Index) TransformProcessError!ast.Expression {
         const p = &self.zig_parser.?;
 
         // Use fullCall to properly extract function and arguments
@@ -3667,7 +3429,7 @@ pub const Transformer = struct {
         return helper_name;
     }
 
-    fn translateFieldAccess(self: *Self, index: ZigAst.Node.Index) TransformProcessError!ast.Expression {
+    pub fn translateFieldAccess(self: *Self, index: ZigAst.Node.Index) TransformProcessError!ast.Expression {
         const p = &self.zig_parser.?;
         const data = p.ast.nodeData(index);
         const node_and_token = data.node_and_token;
@@ -4815,7 +4577,7 @@ pub const Transformer = struct {
         return null;
     }
 
-    fn translateArrayAccess(self: *Self, index: ZigAst.Node.Index) TransformProcessError!ast.Expression {
+    pub fn translateArrayAccess(self: *Self, index: ZigAst.Node.Index) TransformProcessError!ast.Expression {
         const p = &self.zig_parser.?;
         const data = p.ast.nodeData(index).node_and_node;
         const base_node = data[0];
@@ -9864,290 +9626,56 @@ pub const Transformer = struct {
         return try self.builder.builtinCall("add", &.{ base, offset });
     }
 
-    fn translateStructInit(self: *Self, index: ZigAst.Node.Index) TransformProcessError!ast.Expression {
-        return self.translateStructInitWithType(index, null);
+    pub fn translateStructInit(self: *Self, index: ZigAst.Node.Index) TransformProcessError!ast.Expression {
+        return transformer_struct.translateStructInit(self, index);
     }
 
-    fn translateStructInitWithType(
+    pub fn translateStructInitWithType(
         self: *Self,
         index: ZigAst.Node.Index,
         type_override: ?[]const u8,
     ) TransformProcessError!ast.Expression {
-        const p = &self.zig_parser.?;
-        const tag = p.getNodeTag(index);
-
-        var named_values: std.ArrayList(struct { name: []const u8, expr: ast.Expression }) = .empty;
-        defer named_values.deinit(self.allocator);
-        var positional_values: std.ArrayList(ast.Expression) = .empty;
-        defer positional_values.deinit(self.allocator);
-
-        var type_name: ?[]const u8 = null;
-        if (self.isStructInitTag(tag)) {
-            var buf: [2]ZigAst.Node.Index = undefined;
-            const struct_init = p.ast.fullStructInit(&buf, index) orelse return ast.Expression.lit(ast.Literal.number(0));
-            type_name = if (struct_init.ast.type_expr.unwrap()) |type_node|
-                p.getNodeSource(type_node)
-            else
-                type_override;
-
-            for (struct_init.ast.fields) |field_node| {
-                if (self.structInitFieldName(field_node)) |name| {
-                    var duplicate = false;
-                    for (named_values.items) |entry| {
-                        if (std.mem.eql(u8, entry.name, name)) {
-                            duplicate = true;
-                            break;
-                        }
-                    }
-                    if (duplicate) {
-                        try self.addError("duplicate field in struct literal", self.nodeLocation(field_node), .unsupported_feature);
-                        continue;
-                    }
-                    if (p.getNodeTag(field_node) == .assign) {
-                        const nodes = p.ast.nodeData(field_node).node_and_node;
-                        try named_values.append(self.allocator, .{
-                            .name = name,
-                            .expr = try self.translateExpression(nodes[1]),
-                        });
-                    } else {
-                        try named_values.append(self.allocator, .{
-                            .name = name,
-                            .expr = try self.translateExpression(field_node),
-                        });
-                    }
-                } else {
-                    try positional_values.append(self.allocator, try self.translateExpression(field_node));
-                }
-            }
-        } else if (self.isArrayInitTag(tag)) {
-            var buf1: [1]ZigAst.Node.Index = undefined;
-            var buf2: [2]ZigAst.Node.Index = undefined;
-            const array_init = switch (tag) {
-                .array_init_one, .array_init_one_comma => p.ast.arrayInitOne(&buf1, index),
-                .array_init_dot_two, .array_init_dot_two_comma => p.ast.arrayInitDotTwo(&buf2, index),
-                .array_init_dot, .array_init_dot_comma => p.ast.arrayInitDot(index),
-                .array_init, .array_init_comma => p.ast.arrayInit(index),
-                else => unreachable,
-            };
-            type_name = if (array_init.ast.type_expr.unwrap()) |type_node|
-                p.getNodeSource(type_node)
-            else
-                type_override;
-
-            for (array_init.ast.elements) |elem_node| {
-                try positional_values.append(self.allocator, try self.translateExpression(elem_node));
-            }
-        } else {
-            try self.addError("struct literal requires explicit type", self.nodeLocation(index), .unsupported_feature);
-            return ast.Expression.lit(ast.Literal.number(0));
-        }
-
-        const resolved_type = type_name orelse {
-            try self.addError("struct literal requires explicit type", self.nodeLocation(index), .unsupported_feature);
-            return ast.Expression.lit(ast.Literal.number(0));
-        };
-        const fields = self.struct_defs.get(resolved_type) orelse {
-            try self.addError("unknown struct type in literal", self.nodeLocation(index), .unsupported_feature);
-            return ast.Expression.lit(ast.Literal.number(0));
-        };
-
-        var values: std.ArrayList(ast.Expression) = .empty;
-        defer values.deinit(self.allocator);
-
-        var positional_index: usize = 0;
-        for (fields) |field| {
-            var found: ?ast.Expression = null;
-            for (named_values.items) |entry| {
-                if (std.mem.eql(u8, entry.name, field.name)) {
-                    found = entry.expr;
-                    break;
-                }
-            }
-            if (found) |expr| {
-                try values.append(self.allocator, expr);
-            } else if (positional_index < positional_values.items.len) {
-                try values.append(self.allocator, positional_values.items[positional_index]);
-                positional_index += 1;
-            } else {
-                try values.append(self.allocator, ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0))));
-            }
-        }
-        if (positional_index < positional_values.items.len) {
-            try self.addError("too many positional fields in struct literal", self.nodeLocation(index), .unsupported_feature);
-        }
-
-        const helper = try self.ensureStructInitHelper(resolved_type, fields);
-        return try self.builder.call(helper, values.items);
+        return transformer_struct.translateStructInitWithType(self, index, type_override);
     }
 
-    fn ensureStructInitHelper(self: *Self, type_name: []const u8, fields: []const StructFieldDef) ![]const u8 {
-        if (self.struct_init_helpers.get(type_name)) |helper| return helper;
-
-        const helper_name = try self.structInitHelperName(type_name);
-        const helper_key = try self.allocator.dupe(u8, type_name);
-        try self.struct_init_helpers.put(helper_key, helper_name);
-
-        var body_stmts: std.ArrayList(ast.Statement) = .empty;
-        defer body_stmts.deinit(self.allocator);
-
-        const ptr_assign = try self.builder.assign(&.{"ptr"}, try self.builder.builtinCall("mload", &.{
-            ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0x40))),
-        }));
-        try body_stmts.append(self.allocator, ptr_assign);
-
-        for (fields, 0..) |field, i| {
-            const offset: ast.U256 = @intCast(i * 32);
-            const addr = try self.builder.builtinCall("add", &.{
-                ast.Expression.id("ptr"),
-                ast.Expression.lit(ast.Literal.number(offset)),
-            });
-            const store = try self.builder.builtinCall("mstore", &.{ addr, ast.Expression.id(field.name) });
-            try body_stmts.append(self.allocator, ast.Statement.expr(store));
-        }
-
-        const total_size: ast.U256 = @intCast(fields.len * 32);
-        const update_ptr = try self.builder.builtinCall("mstore", &.{
-            ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0x40))),
-            try self.builder.builtinCall("add", &.{
-                ast.Expression.id("ptr"),
-                ast.Expression.lit(ast.Literal.number(total_size)),
-            }),
-        });
-        try body_stmts.append(self.allocator, ast.Statement.expr(update_ptr));
-
-        const param_names = try self.allocator.alloc([]const u8, fields.len);
-        defer self.allocator.free(param_names);
-        for (fields, 0..) |field, i| {
-            param_names[i] = field.name;
-        }
-        const body = try self.builder.block(body_stmts.items);
-        const func = try self.builder.funcDef(helper_name, param_names, &.{"ptr"}, body);
-        try self.extra_functions.append(self.allocator, func);
-
-        return helper_name;
+    pub fn ensureStructInitHelper(self: *Self, type_name: []const u8, fields: []const StructFieldDef) ![]const u8 {
+        return transformer_struct.ensureStructInitHelper(self, type_name, fields);
     }
 
     fn structInitFieldValue(self: *Self, struct_init: ZigAst.full.StructInit, field_name: []const u8) TransformProcessError!?ast.Expression {
-        const p = &self.zig_parser.?;
-        for (struct_init.ast.fields) |field_node| {
-            if (self.structInitFieldName(field_node)) |name| {
-                if (std.mem.eql(u8, name, field_name)) {
-                    if (p.getNodeTag(field_node) == .assign) {
-                        const nodes = p.ast.nodeData(field_node).node_and_node;
-                        return try self.translateExpression(nodes[1]);
-                    }
-                    return try self.translateExpression(field_node);
-                }
-            }
-        }
-        return null;
+        return transformer_struct.structInitFieldValue(self, struct_init, field_name);
     }
 
-    fn structInitFieldName(self: *Self, field_node: ZigAst.Node.Index) ?[]const u8 {
-        const p = &self.zig_parser.?;
-        if (p.getNodeTag(field_node) == .assign) {
-            const nodes = p.ast.nodeData(field_node).node_and_node;
-            if (p.getNodeTag(nodes[0]) == .field_access) {
-                const fa = p.ast.nodeData(nodes[0]).node_and_token;
-                return p.getIdentifier(fa[1]);
-            }
-        }
-        var tok = p.ast.firstToken(field_node);
-        var steps: usize = 0;
-        while (tok > 0 and steps < 16) : (steps += 1) {
-            const tag = p.getTokenTag(tok);
-            if (tag == .identifier and tok > 0 and p.getTokenTag(tok - 1) == .period) {
-                return p.getTokenSlice(tok);
-            }
-            tok -= 1;
-        }
-        return null;
+    pub fn structInitFieldName(self: *Self, field_node: ZigAst.Node.Index) ?[]const u8 {
+        return transformer_struct.structInitFieldName(self, field_node);
     }
 
     fn structFieldOffset(self: *Self, fields: []const StructFieldDef, field_name: []const u8) ?ast.U256 {
-        _ = self;
-        for (fields, 0..) |field, i| {
-            if (std.mem.eql(u8, field.name, field_name)) {
-                return @intCast(i * 32);
-            }
-        }
-        return null;
+        return transformer_struct.structFieldOffset(self, fields, field_name);
     }
 
     fn structFieldType(self: *Self, fields: []const StructFieldDef, field_name: []const u8) ?[]const u8 {
-        _ = self;
-        for (fields) |field| {
-            if (std.mem.eql(u8, field.name, field_name)) {
-                return field.type_name;
-            }
-        }
-        return null;
+        return transformer_struct.structFieldType(self, fields, field_name);
     }
 
-    fn isStructInitTag(self: *Self, tag: ZigAst.Node.Tag) bool {
-        _ = self;
-        return switch (tag) {
-            .struct_init_one,
-            .struct_init_one_comma,
-            .struct_init_dot_two,
-            .struct_init_dot_two_comma,
-            .struct_init_dot,
-            .struct_init_dot_comma,
-            .struct_init,
-            .struct_init_comma,
-            => true,
-            else => false,
-        };
+    pub fn isStructInitTag(self: *Self, tag: ZigAst.Node.Tag) bool {
+        return transformer_struct.isStructInitTag(self, tag);
     }
 
-    fn isArrayInitTag(self: *Self, tag: ZigAst.Node.Tag) bool {
-        _ = self;
-        return switch (tag) {
-            .array_init_one,
-            .array_init_one_comma,
-            .array_init_dot_two,
-            .array_init_dot_two_comma,
-            .array_init_dot,
-            .array_init_dot_comma,
-            .array_init,
-            .array_init_comma,
-            => true,
-            else => false,
-        };
+    pub fn isArrayInitTag(self: *Self, tag: ZigAst.Node.Tag) bool {
+        return transformer_struct.isArrayInitTag(self, tag);
     }
 
     fn structInitTypeName(self: *Self, index: ZigAst.Node.Index) TransformProcessError!?[]const u8 {
-        const p = &self.zig_parser.?;
-        var buf: [2]ZigAst.Node.Index = undefined;
-        const struct_init = p.ast.fullStructInit(&buf, index) orelse return null;
-        const type_node = struct_init.ast.type_expr.unwrap() orelse return null;
-        return p.getNodeSource(type_node);
+        return transformer_struct.structInitTypeName(self, index);
     }
 
-    fn structInitHelperName(self: *Self, type_name: []const u8) ![]const u8 {
-        var buf: [128]u8 = undefined;
-        var len: usize = 0;
-        const prefix = "__zig2yul$init$";
-        @memcpy(buf[0..prefix.len], prefix);
-        len = prefix.len;
-        for (type_name) |c| {
-            const out = if (std.ascii.isAlphanumeric(c) or c == '_') c else '$';
-            if (len >= buf.len) break;
-            buf[len] = out;
-            len += 1;
-        }
-        return try std.fmt.allocPrint(self.allocator, "{s}", .{buf[0..len]});
+    pub fn structInitHelperName(self: *Self, type_name: []const u8) ![]const u8 {
+        return transformer_struct.structInitHelperName(self, type_name);
     }
 
     fn setLocalStructVar(self: *Self, name: []const u8, type_name: []const u8) !void {
-        if (self.local_struct_vars.getEntry(name)) |entry| {
-            self.allocator.free(entry.value_ptr.*);
-            entry.value_ptr.* = try self.allocator.dupe(u8, type_name);
-            return;
-        }
-        const key = try self.allocator.dupe(u8, name);
-        const val = try self.allocator.dupe(u8, type_name);
-        try self.local_struct_vars.put(key, val);
+        return transformer_struct.setLocalStructVar(self, name, type_name);
     }
 
     fn setLocalMappingRefVar(self: *Self, name: []const u8, info: MappingRefTypeInfo) !void {
@@ -10210,538 +9738,47 @@ pub const Transformer = struct {
     }
 
     fn setFunctionParamStructs(self: *Self, name: []const u8, items: []const []const u8) !void {
-        if (self.function_param_structs.getEntry(name)) |entry| {
-            for (entry.value_ptr.*) |s| {
-                if (s.len > 0) self.allocator.free(s);
-            }
-            self.allocator.free(entry.value_ptr.*);
-            self.allocator.free(entry.key_ptr.*);
-            _ = self.function_param_structs.remove(name);
-        }
-        const key = try self.allocator.dupe(u8, name);
-        const list = try self.allocator.alloc([]const u8, items.len);
-        for (items, 0..) |s, i| {
-            if (s.len > 0) {
-                list[i] = try self.allocator.dupe(u8, s);
-            } else {
-                list[i] = "";
-            }
-        }
-        try self.function_param_structs.put(key, list);
+        return transformer_dispatch.setFunctionParamStructs(self, name, items);
     }
 
     fn stripTypeQualifiers(src: []const u8) []const u8 {
-        var out = std.mem.trim(u8, src, " \t\r\n");
-        while (true) {
-            if (std.mem.startsWith(u8, out, "const ")) {
-                out = std.mem.trim(u8, out[6..], " \t\r\n");
-                continue;
-            }
-            if (std.mem.startsWith(u8, out, "volatile ")) {
-                out = std.mem.trim(u8, out[9..], " \t\r\n");
-                continue;
-            }
-            break;
-        }
-        return out;
+        return transformer_dispatch.stripTypeQualifiers(src);
     }
 
     fn parseArrayElemType(self: *Self, type_src: []const u8) ?[]const u8 {
-        _ = self;
-        var src = std.mem.trim(u8, type_src, " \t\r\n");
-        if (std.mem.startsWith(u8, src, "[]")) {
-            src = stripTypeQualifiers(src[2..]);
-            return if (src.len > 0) src else null;
-        }
-        if (std.mem.startsWith(u8, src, "[*]")) {
-            src = stripTypeQualifiers(src[3..]);
-            return if (src.len > 0) src else null;
-        }
-        if (std.mem.startsWith(u8, src, "[")) {
-            if (std.mem.indexOfScalar(u8, src, ']')) |idx| {
-                src = stripTypeQualifiers(src[idx + 1 ..]);
-                return if (src.len > 0) src else null;
-            }
-        }
-        return null;
+        return transformer_dispatch.parseArrayElemType(self, type_src);
     }
 
     fn arrayElemTypeForNode(self: *Self, node: ZigAst.Node.Index) ?[]const u8 {
-        const p = &self.zig_parser.?;
-        if (p.getNodeTag(node) == .identifier) {
-            const name = p.getNodeSource(node);
-            return self.local_array_elem_types.get(name);
-        }
-        return null;
+        return transformer_dispatch.arrayElemTypeForNode(self, node);
     }
 
     fn elementStrideBytes(self: *Self, type_name: []const u8) ast.U256 {
-        if (self.struct_defs.get(type_name)) |fields| {
-            return @intCast(fields.len * 32);
-        }
-        return 32;
+        return transformer_dispatch.elementStrideBytes(self, type_name);
     }
 
     /// Generate complete Yul AST
     fn generateYulAst(self: *Self) !ast.AST {
-        const name = self.current_contract orelse "Contract";
-
-        // Generate deployed code
-        var deployed_stmts: std.ArrayList(ast.Statement) = .empty;
-        defer deployed_stmts.deinit(self.allocator);
-
-        // Add function dispatcher
-        try self.generateDispatcher(&deployed_stmts);
-
-        // Add all functions
-        for (self.functions.items) |func| {
-            try deployed_stmts.append(self.allocator, func);
-        }
-        for (self.extra_functions.items) |func| {
-            try deployed_stmts.append(self.allocator, func);
-        }
-
-        // Create deployed object
-        const deployed_name = try std.fmt.allocPrint(self.allocator, "{s}_deployed", .{name});
-        try self.temp_strings.append(self.allocator, deployed_name); // Track for cleanup
-
-        const deployed_code = try self.builder.block(deployed_stmts.items);
-        const source_name = try self.dupTempString(name);
-        const deployed_debug = ast.ObjectDebugData{
-            .source_name = source_name,
-            .object_name = try self.dupTempString(deployed_name),
-        };
-        const deployed_obj = ast.Object.initWithDebug(
-            deployed_name,
-            deployed_code,
-            &.{},
-            &.{},
-            deployed_debug,
-        );
-
-        // Generate constructor code
-        var init_stmts: std.ArrayList(ast.Statement) = .empty;
-        defer init_stmts.deinit(self.allocator);
-
-        // datacopy(0, dataoffset("Name_deployed"), datasize("Name_deployed"))
-        const datacopy = ast.Statement.expr(try self.builder.builtinCall("datacopy", &.{
-            ast.Expression.lit(ast.Literal.number(0)),
-            try self.builder.builtinCall("dataoffset", &.{ast.Expression.lit(ast.Literal.string(deployed_name))}),
-            try self.builder.builtinCall("datasize", &.{ast.Expression.lit(ast.Literal.string(deployed_name))}),
-        }));
-        try init_stmts.append(self.allocator, datacopy);
-
-        // return(0, datasize("Name_deployed"))
-        const ret = ast.Statement.expr(try self.builder.builtinCall("return", &.{
-            ast.Expression.lit(ast.Literal.number(0)),
-            try self.builder.builtinCall("datasize", &.{ast.Expression.lit(ast.Literal.string(deployed_name))}),
-        }));
-        try init_stmts.append(self.allocator, ret);
-
-        const init_code = try self.builder.block(init_stmts.items);
-
-        // Need to allocate the deployed object slice
-        const sub_objects = try self.builder.dupeObjects(&.{deployed_obj});
-
-        const root_debug = ast.ObjectDebugData{
-            .source_name = source_name,
-            .object_name = source_name,
-        };
-        const root_obj = ast.Object.initWithDebug(name, init_code, sub_objects, &.{}, root_debug);
-
-        return ast.AST.init(root_obj);
+        return transformer_dispatch.generateYulAst(self);
     }
 
     fn generateDispatcher(self: *Self, stmts: *std.ArrayList(ast.Statement)) !void {
-        // Get function selector: shr(224, calldataload(0))
-        const selector = try self.builder.builtinCall("shr", &.{
-            ast.Expression.lit(ast.Literal.number(224)),
-            try self.builder.builtinCall("calldataload", &.{ast.Expression.lit(ast.Literal.number(0))}),
-        });
-
-        // Build cases for all public functions
-        var cases: std.ArrayList(ast.Case) = .empty;
-        defer cases.deinit(self.allocator);
-
-        for (self.function_infos.items) |fi| {
-            const case_body = try self.generateFunctionCase(fi);
-            const case = ast.Case.init(
-                ast.Literal.number(fi.selector),
-                case_body,
-            );
-            try cases.append(self.allocator, case);
-        }
-
-        // Add default revert case (custom error selector)
-        const invalid_selector = try FunctionInfo.calculateSelector(self.allocator, "InvalidSelector", &.{});
-        const store_selector = try self.builder.builtinCall("mstore", &.{
-            ast.Expression.lit(ast.Literal.number(0)),
-            ast.Expression.lit(ast.Literal.number(invalid_selector)),
-        });
-        const revert_call = try self.builder.builtinCall("revert", &.{
-            ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0x1c))),
-            ast.Expression.lit(ast.Literal.number(@as(ast.U256, 4))),
-        });
-        const default_body = try self.builder.block(&.{
-            ast.Statement.expr(store_selector),
-            ast.Statement.expr(revert_call),
-        });
-        try cases.append(self.allocator, ast.Case.default(default_body));
-
-        const switch_stmt = try self.builder.switchStmt(selector, cases.items);
-        try stmts.append(self.allocator, switch_stmt);
+        return transformer_dispatch.generateDispatcher(self, stmts);
     }
 
     /// Generate the body for a function dispatch case
     fn generateFunctionCase(self: *Self, fi: FunctionInfo) !ast.Block {
-        var case_stmts: std.ArrayList(ast.Statement) = .empty;
-        defer case_stmts.deinit(self.allocator);
-
-        // Decode parameters from calldata
-        // Each parameter is 32 bytes, starting at offset 4 (after selector)
-        var call_args: std.ArrayList(ast.Expression) = .empty;
-        defer call_args.deinit(self.allocator);
-
-        var needs_free_ptr = false;
-        for (fi.params, 0..) |_, i| {
-            if (fi.param_struct_lens[i] > 0 or isDynamicAbiType(fi.param_types[i])) {
-                needs_free_ptr = true;
-                break;
-            }
-        }
-
-        var free_name_opt: ?[]const u8 = null;
-        if (needs_free_ptr) {
-            const free_name = try self.makeTemp("free");
-            const free_expr = try self.builder.builtinCall("mload", &.{
-                ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0x40))),
-            });
-            try case_stmts.append(self.allocator, try self.builder.varDecl(&.{free_name}, free_expr));
-            free_name_opt = free_name;
-        }
-
-        var head_offset: ast.U256 = 4;
-        var i: usize = 0;
-        while (i < fi.params.len) {
-            const offset: evm_types.U256 = head_offset;
-            const abi_type = fi.param_types[i];
-            const struct_len = fi.param_struct_lens[i];
-            const struct_dynamic = fi.param_struct_dynamic[i];
-
-            if (struct_len == 0 and !isDynamicAbiType(abi_type)) {
-                var run_len: usize = 1;
-                while (i + run_len < fi.params.len) : (run_len += 1) {
-                    const next_abi = fi.param_types[i + run_len];
-                    if (fi.param_struct_lens[i + run_len] != 0) break;
-                    if (fi.param_struct_dynamic[i + run_len]) break;
-                    if (isDynamicAbiType(next_abi)) break;
-                }
-
-                if (run_len >= 3) {
-                    const copy_size: ast.U256 = @intCast(run_len * 32);
-                    const copy_call = try self.builder.builtinCall("calldatacopy", &.{
-                        ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0))),
-                        ast.Expression.lit(ast.Literal.number(offset)),
-                        ast.Expression.lit(ast.Literal.number(copy_size)),
-                    });
-                    try case_stmts.append(self.allocator, ast.Statement.expr(copy_call));
-
-                    var k: usize = 0;
-                    while (k < run_len) : (k += 1) {
-                        const param_name = fi.params[i + k];
-                        const param_abi = fi.param_types[i + k];
-                        const load_expr = try self.builder.builtinCall("mload", &.{
-                            ast.Expression.lit(ast.Literal.number(@as(ast.U256, @intCast(k * 32)))),
-                        });
-                        const value_expr = if (std.mem.eql(u8, param_abi, "address"))
-                            try self.builder.builtinCall("shr", &.{
-                                ast.Expression.lit(ast.Literal.number(@as(ast.U256, 96))),
-                                load_expr,
-                            })
-                        else
-                            load_expr;
-                        const var_decl = try self.builder.varDecl(&.{param_name}, value_expr);
-                        try case_stmts.append(self.allocator, var_decl);
-                        try call_args.append(self.allocator, ast.Expression.id(param_name));
-                    }
-
-                    head_offset += copy_size;
-                    i += run_len;
-                    continue;
-                }
-            }
-
-            const param_name = fi.params[i];
-            if (struct_len > 0 and !struct_dynamic) {
-                const struct_name = fi.param_struct_names[i];
-                if (self.struct_defs.get(struct_name)) |fields| {
-                    const head_expr = ast.Expression.lit(ast.Literal.number(offset));
-                    const struct_ptr = try self.decodeStructFromHead(fields, head_expr, &case_stmts, free_name_opt);
-                    const var_decl = try self.builder.varDecl(&.{param_name}, struct_ptr);
-                    try case_stmts.append(self.allocator, var_decl);
-                    try call_args.append(self.allocator, ast.Expression.id(param_name));
-                } else {
-                    const load_call = try self.builder.builtinCall("calldataload", &.{
-                        ast.Expression.lit(ast.Literal.number(offset)),
-                    });
-                    const var_decl = try self.builder.varDecl(&.{param_name}, load_call);
-                    try case_stmts.append(self.allocator, var_decl);
-                    try call_args.append(self.allocator, ast.Expression.id(param_name));
-                }
-                head_offset += @as(ast.U256, @intCast(struct_len * 32));
-            } else if (struct_len > 0 and struct_dynamic) {
-                const struct_name = fi.param_struct_names[i];
-                const fields_opt = self.struct_defs.get(struct_name);
-
-                const offset_name = try self.makeTemp("offset");
-                const head_name = try self.makeTemp("head");
-
-                const offset_expr = try self.builder.builtinCall("calldataload", &.{
-                    ast.Expression.lit(ast.Literal.number(offset)),
-                });
-                try case_stmts.append(self.allocator, try self.builder.varDecl(&.{offset_name}, offset_expr));
-
-                const head_expr = try self.builder.builtinCall("add", &.{
-                    ast.Expression.lit(ast.Literal.number(@as(ast.U256, 4))),
-                    ast.Expression.id(offset_name),
-                });
-                try case_stmts.append(self.allocator, try self.builder.varDecl(&.{head_name}, head_expr));
-
-                if (fields_opt) |fields| {
-                    const struct_ptr = try self.decodeStructFromHead(fields, ast.Expression.id(head_name), &case_stmts, free_name_opt);
-                    const var_decl = try self.builder.varDecl(&.{param_name}, struct_ptr);
-                    try case_stmts.append(self.allocator, var_decl);
-                    try call_args.append(self.allocator, ast.Expression.id(param_name));
-                } else {
-                    const load_call = try self.builder.builtinCall("calldataload", &.{
-                        ast.Expression.lit(ast.Literal.number(offset)),
-                    });
-                    const var_decl = try self.builder.varDecl(&.{param_name}, load_call);
-                    try case_stmts.append(self.allocator, var_decl);
-                    try call_args.append(self.allocator, ast.Expression.id(param_name));
-                }
-                head_offset += @as(ast.U256, 32);
-            } else if (isDynamicAbiType(abi_type)) {
-                const offset_name = try self.makeTemp("offset");
-                const head_name = try self.makeTemp("head");
-                const len_name = try self.makeTemp("len");
-                const mem_name = try self.makeTemp("mem");
-                const data_name = try self.makeTemp("data");
-                const size_name = try self.makeTemp("size");
-
-                const offset_expr = try self.builder.builtinCall("calldataload", &.{
-                    ast.Expression.lit(ast.Literal.number(offset)),
-                });
-                try case_stmts.append(self.allocator, try self.builder.varDecl(&.{offset_name}, offset_expr));
-
-                const head_expr = try self.builder.builtinCall("add", &.{
-                    ast.Expression.lit(ast.Literal.number(@as(ast.U256, 4))),
-                    ast.Expression.id(offset_name),
-                });
-                try case_stmts.append(self.allocator, try self.builder.varDecl(&.{head_name}, head_expr));
-
-                const len_expr = try self.builder.builtinCall("calldataload", &.{ast.Expression.id(head_name)});
-                try case_stmts.append(self.allocator, try self.builder.varDecl(&.{len_name}, len_expr));
-
-                const mem_expr = if (free_name_opt) |free_name|
-                    ast.Expression.id(free_name)
-                else
-                    try self.builder.builtinCall("mload", &.{
-                        ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0x40))),
-                    });
-                try case_stmts.append(self.allocator, try self.builder.varDecl(&.{mem_name}, mem_expr));
-
-                const store_len = try self.builder.builtinCall("mstore", &.{
-                    ast.Expression.id(mem_name),
-                    ast.Expression.id(len_name),
-                });
-                try case_stmts.append(self.allocator, ast.Statement.expr(store_len));
-
-                const data_expr = try self.builder.builtinCall("add", &.{
-                    ast.Expression.id(mem_name),
-                    ast.Expression.lit(ast.Literal.number(@as(ast.U256, 32))),
-                });
-                try case_stmts.append(self.allocator, try self.builder.varDecl(&.{data_name}, data_expr));
-
-                const size_expr = if (isDynamicArrayAbiType(abi_type))
-                    try self.builder.builtinCall("mul", &.{
-                        ast.Expression.id(len_name),
-                        ast.Expression.lit(ast.Literal.number(@as(ast.U256, 32))),
-                    })
-                else
-                    try self.builder.builtinCall("and", &.{
-                        try self.builder.builtinCall("add", &.{
-                            ast.Expression.id(len_name),
-                            ast.Expression.lit(ast.Literal.number(@as(ast.U256, 31))),
-                        }),
-                        try self.builder.builtinCall("not", &.{ast.Expression.lit(ast.Literal.number(@as(ast.U256, 31)))}),
-                    });
-                try case_stmts.append(self.allocator, try self.builder.varDecl(&.{size_name}, size_expr));
-
-                const data_start = try self.builder.builtinCall("add", &.{
-                    ast.Expression.id(head_name),
-                    ast.Expression.lit(ast.Literal.number(@as(ast.U256, 32))),
-                });
-                try self.appendMemoryCopyLoop(&case_stmts, ast.Expression.id(data_name), data_start, ast.Expression.id(size_name));
-
-                const update_free = try self.builder.builtinCall("mstore", &.{
-                    ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0x40))),
-                    try self.builder.builtinCall("add", &.{
-                        ast.Expression.id(data_name),
-                        ast.Expression.id(size_name),
-                    }),
-                });
-                try case_stmts.append(self.allocator, ast.Statement.expr(update_free));
-
-                const var_decl = try self.builder.varDecl(&.{param_name}, ast.Expression.id(mem_name));
-                try case_stmts.append(self.allocator, var_decl);
-                try call_args.append(self.allocator, ast.Expression.id(param_name));
-                head_offset += @as(ast.U256, 32);
-            } else {
-                const load_call = try self.builder.builtinCall("calldataload", &.{
-                    ast.Expression.lit(ast.Literal.number(offset)),
-                });
-                const value_expr = if (std.mem.eql(u8, abi_type, "address"))
-                    try self.builder.builtinCall("shr", &.{
-                        ast.Expression.lit(ast.Literal.number(@as(ast.U256, 96))),
-                        load_call,
-                    })
-                else
-                    load_call;
-                const var_decl = try self.builder.varDecl(&.{param_name}, value_expr);
-                try case_stmts.append(self.allocator, var_decl);
-                try call_args.append(self.allocator, ast.Expression.id(param_name));
-                head_offset += @as(ast.U256, 32);
-            }
-            i += 1;
-        }
-
-        const func_call = try self.builder.call(fi.name, call_args.items);
-
-        if (fi.has_return) {
-            // For functions with return value:
-            // let _result := funcName(args...)
-            // mstore(0, _result)
-            // return(0, 32)
-            const result_decl = try self.builder.varDecl(&.{"_result"}, func_call);
-            try case_stmts.append(self.allocator, result_decl);
-            if (fi.return_struct_len > 0) {
-                const base = ast.Expression.id("_result");
-                for (0..fi.return_struct_len) |idx| {
-                    const offset = ast.Expression.lit(ast.Literal.number(@as(ast.U256, @intCast(idx * 32))));
-                    const src = try self.builder.builtinCall("add", &.{ base, offset });
-                    const val = try self.builder.builtinCall("mload", &.{src});
-                    const store = try self.builder.builtinCall("mstore", &.{
-                        ast.Expression.lit(ast.Literal.number(@as(ast.U256, @intCast(idx * 32)))),
-                        val,
-                    });
-                    try case_stmts.append(self.allocator, ast.Statement.expr(store));
-                }
-                const size = ast.Expression.lit(ast.Literal.number(@as(ast.U256, @intCast(fi.return_struct_len * 32))));
-                const return_call = try self.builder.builtinCall("return", &.{
-                    ast.Expression.lit(ast.Literal.number(0)),
-                    size,
-                });
-                try case_stmts.append(self.allocator, ast.Statement.expr(return_call));
-            } else if (fi.return_is_dynamic) {
-                const ret_ptr = ast.Expression.id("_result");
-                const len_name = try self.makeTemp("ret_len");
-                const size_name = try self.makeTemp("ret_size");
-                const data_name = try self.makeTemp("ret_data");
-
-                const len_expr = try self.builder.builtinCall("mload", &.{ret_ptr});
-                try case_stmts.append(self.allocator, try self.builder.varDecl(&.{len_name}, len_expr));
-
-                const data_expr = try self.builder.builtinCall("add", &.{
-                    ret_ptr,
-                    ast.Expression.lit(ast.Literal.number(@as(ast.U256, 32))),
-                });
-                try case_stmts.append(self.allocator, try self.builder.varDecl(&.{data_name}, data_expr));
-
-                const size_expr = if (fi.return_abi) |abi| blk: {
-                    if (isDynamicArrayAbiType(abi)) {
-                        break :blk try self.builder.builtinCall("mul", &.{
-                            ast.Expression.id(len_name),
-                            ast.Expression.lit(ast.Literal.number(@as(ast.U256, 32))),
-                        });
-                    }
-                    break :blk try self.builder.builtinCall("and", &.{
-                        try self.builder.builtinCall("add", &.{
-                            ast.Expression.id(len_name),
-                            ast.Expression.lit(ast.Literal.number(@as(ast.U256, 31))),
-                        }),
-                        try self.builder.builtinCall("not", &.{ast.Expression.lit(ast.Literal.number(@as(ast.U256, 31)))}),
-                    });
-                } else try self.builder.builtinCall("and", &.{
-                    try self.builder.builtinCall("add", &.{
-                        ast.Expression.id(len_name),
-                        ast.Expression.lit(ast.Literal.number(@as(ast.U256, 31))),
-                    }),
-                    try self.builder.builtinCall("not", &.{ast.Expression.lit(ast.Literal.number(@as(ast.U256, 31)))}),
-                });
-                try case_stmts.append(self.allocator, try self.builder.varDecl(&.{size_name}, size_expr));
-
-                const store_offset = try self.builder.builtinCall("mstore", &.{
-                    ast.Expression.lit(ast.Literal.number(0)),
-                    ast.Expression.lit(ast.Literal.number(@as(ast.U256, 32))),
-                });
-                try case_stmts.append(self.allocator, ast.Statement.expr(store_offset));
-
-                const store_len = try self.builder.builtinCall("mstore", &.{
-                    ast.Expression.lit(ast.Literal.number(@as(ast.U256, 32))),
-                    ast.Expression.id(len_name),
-                });
-                try case_stmts.append(self.allocator, ast.Statement.expr(store_len));
-
-                const dest = ast.Expression.lit(ast.Literal.number(@as(ast.U256, 64)));
-                try self.appendMemoryCopyLoop(&case_stmts, dest, ast.Expression.id(data_name), ast.Expression.id(size_name));
-
-                const total = try self.builder.builtinCall("add", &.{
-                    ast.Expression.lit(ast.Literal.number(@as(ast.U256, 64))),
-                    ast.Expression.id(size_name),
-                });
-                const return_call = try self.builder.builtinCall("return", &.{
-                    ast.Expression.lit(ast.Literal.number(0)),
-                    total,
-                });
-                try case_stmts.append(self.allocator, ast.Statement.expr(return_call));
-            } else {
-                const mstore_call = try self.builder.builtinCall("mstore", &.{
-                    ast.Expression.lit(ast.Literal.number(0)),
-                    ast.Expression.id("_result"),
-                });
-                try case_stmts.append(self.allocator, ast.Statement.expr(mstore_call));
-
-                const return_call = try self.builder.builtinCall("return", &.{
-                    ast.Expression.lit(ast.Literal.number(0)),
-                    ast.Expression.lit(ast.Literal.number(32)),
-                });
-                try case_stmts.append(self.allocator, ast.Statement.expr(return_call));
-            }
-        } else {
-            // For void functions:
-            // funcName(args...)
-            // return(0, 0)
-            try case_stmts.append(self.allocator, ast.Statement.expr(func_call));
-
-            const return_call = try self.builder.builtinCall("return", &.{
-                ast.Expression.lit(ast.Literal.number(0)),
-                ast.Expression.lit(ast.Literal.number(0)),
-            });
-            try case_stmts.append(self.allocator, ast.Statement.expr(return_call));
-        }
-
-        return try self.builder.block(case_stmts.items);
+        return transformer_dispatch.generateFunctionCase(self, fi);
     }
 
-    fn makeTemp(self: *Self, label: []const u8) ![]const u8 {
+    pub fn makeTemp(self: *Self, label: []const u8) ![]const u8 {
         const name = try std.fmt.allocPrint(self.allocator, "$zig2yul${s}${d}", .{ label, self.temp_counter });
         self.temp_counter += 1;
         try self.temp_strings.append(self.allocator, name);
         return name;
     }
 
-    fn dupTempString(self: *Self, value: []const u8) ![]const u8 {
+    pub fn dupTempString(self: *Self, value: []const u8) ![]const u8 {
         const copy = try self.allocator.dupe(u8, value);
         try self.temp_strings.append(self.allocator, copy);
         return copy;
@@ -10755,12 +9792,12 @@ pub const Transformer = struct {
         _ = self.loop_break_flags.pop();
     }
 
-    fn currentLoopBreakFlag(self: *Self) ?[]const u8 {
+    pub fn currentLoopBreakFlag(self: *Self) ?[]const u8 {
         if (self.loop_break_flags.items.len == 0) return null;
         return self.loop_break_flags.items[self.loop_break_flags.items.len - 1];
     }
 
-    fn appendMemoryCopyLoop(
+    pub fn appendMemoryCopyLoop(
         self: *Self,
         stmts: *std.ArrayList(ast.Statement),
         dest: ast.Expression,
@@ -10830,170 +9867,22 @@ pub const Transformer = struct {
         try stmts.append(self.allocator, loop_stmt);
     }
 
-    fn decodeStructFromHead(
+    pub fn decodeStructFromHead(
         self: *Self,
         fields: []const StructFieldDef,
         head_expr: ast.Expression,
         stmts: *std.ArrayList(ast.Statement),
         free_name_opt: ?[]const u8,
     ) TransformProcessError!ast.Expression {
-        const mem_name = try self.makeTemp("struct_mem");
-        const mem_expr = if (free_name_opt) |free_name|
-            ast.Expression.id(free_name)
-        else
-            try self.builder.builtinCall("mload", &.{
-                ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0x40))),
-            });
-        try stmts.append(self.allocator, try self.builder.varDecl(&.{mem_name}, mem_expr));
-
-        const new_free = try self.builder.builtinCall("add", &.{
-            ast.Expression.id(mem_name),
-            ast.Expression.lit(ast.Literal.number(@as(ast.U256, @intCast(fields.len * 32)))),
-        });
-        const reserve = try self.builder.builtinCall("mstore", &.{
-            ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0x40))),
-            new_free,
-        });
-        try stmts.append(self.allocator, ast.Statement.expr(reserve));
-
-        if (free_name_opt) |free_name| {
-            const update_free = try self.builder.assign(&.{free_name}, new_free);
-            try stmts.append(self.allocator, update_free);
-        }
-
-        var head_offset: ast.U256 = 0;
-        for (fields, 0..) |field, idx| {
-            const field_slot = try self.builder.builtinCall("add", &.{
-                ast.Expression.id(mem_name),
-                ast.Expression.lit(ast.Literal.number(@as(ast.U256, @intCast(idx * 32)))),
-            });
-            const head_slot = try self.builder.builtinCall("add", &.{
-                head_expr,
-                ast.Expression.lit(ast.Literal.number(head_offset)),
-            });
-
-            if (self.struct_defs.get(field.type_name)) |nested| {
-                if (self.structHasDynamicField(nested)) {
-                    const rel_name = try self.makeTemp("field_off");
-                    const rel_expr = try self.builder.builtinCall("calldataload", &.{head_slot});
-                    try stmts.append(self.allocator, try self.builder.varDecl(&.{rel_name}, rel_expr));
-
-                    const nested_head = try self.builder.builtinCall("add", &.{
-                        head_expr,
-                        ast.Expression.id(rel_name),
-                    });
-                    const nested_ptr = try self.decodeStructFromHead(nested, nested_head, stmts, free_name_opt);
-                    const store_ptr = try self.builder.builtinCall("mstore", &.{ field_slot, nested_ptr });
-                    try stmts.append(self.allocator, ast.Statement.expr(store_ptr));
-                } else {
-                    const nested_ptr = try self.decodeStructFromHead(nested, head_slot, stmts, free_name_opt);
-                    const store_ptr = try self.builder.builtinCall("mstore", &.{ field_slot, nested_ptr });
-                    try stmts.append(self.allocator, ast.Statement.expr(store_ptr));
-                }
-            } else if (isDynamicAbiType(mapZigTypeToAbi(field.type_name))) {
-                const rel_name = try self.makeTemp("field_off");
-                const len_name = try self.makeTemp("field_len");
-                const data_name = try self.makeTemp("field_data");
-                const size_name = try self.makeTemp("field_size");
-                const field_mem = try self.makeTemp("field_mem");
-
-                const rel_expr = try self.builder.builtinCall("calldataload", &.{head_slot});
-                try stmts.append(self.allocator, try self.builder.varDecl(&.{rel_name}, rel_expr));
-
-                const field_head = try self.builder.builtinCall("add", &.{
-                    head_expr,
-                    ast.Expression.id(rel_name),
-                });
-                const len_expr = try self.builder.builtinCall("calldataload", &.{field_head});
-                try stmts.append(self.allocator, try self.builder.varDecl(&.{len_name}, len_expr));
-
-                const field_mem_expr = try self.builder.builtinCall("mload", &.{
-                    ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0x40))),
-                });
-                try stmts.append(self.allocator, try self.builder.varDecl(&.{field_mem}, field_mem_expr));
-
-                const store_len = try self.builder.builtinCall("mstore", &.{
-                    ast.Expression.id(field_mem),
-                    ast.Expression.id(len_name),
-                });
-                try stmts.append(self.allocator, ast.Statement.expr(store_len));
-
-                const data_expr = try self.builder.builtinCall("add", &.{
-                    ast.Expression.id(field_mem),
-                    ast.Expression.lit(ast.Literal.number(@as(ast.U256, 32))),
-                });
-                try stmts.append(self.allocator, try self.builder.varDecl(&.{data_name}, data_expr));
-
-                const size_expr = if (isDynamicArrayAbiType(mapZigTypeToAbi(field.type_name)))
-                    try self.builder.builtinCall("mul", &.{
-                        ast.Expression.id(len_name),
-                        ast.Expression.lit(ast.Literal.number(@as(ast.U256, 32))),
-                    })
-                else
-                    try self.builder.builtinCall("and", &.{
-                        try self.builder.builtinCall("add", &.{
-                            ast.Expression.id(len_name),
-                            ast.Expression.lit(ast.Literal.number(@as(ast.U256, 31))),
-                        }),
-                        try self.builder.builtinCall("not", &.{ast.Expression.lit(ast.Literal.number(@as(ast.U256, 31)))}),
-                    });
-                try stmts.append(self.allocator, try self.builder.varDecl(&.{size_name}, size_expr));
-
-                const data_start = try self.builder.builtinCall("add", &.{
-                    field_head,
-                    ast.Expression.lit(ast.Literal.number(@as(ast.U256, 32))),
-                });
-                try self.appendMemoryCopyLoop(stmts, ast.Expression.id(data_name), data_start, ast.Expression.id(size_name));
-
-                const update_free = try self.builder.builtinCall("mstore", &.{
-                    ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0x40))),
-                    try self.builder.builtinCall("add", &.{
-                        ast.Expression.id(data_name),
-                        ast.Expression.id(size_name),
-                    }),
-                });
-                try stmts.append(self.allocator, ast.Statement.expr(update_free));
-
-                const store_ptr = try self.builder.builtinCall("mstore", &.{
-                    field_slot,
-                    ast.Expression.id(field_mem),
-                });
-                try stmts.append(self.allocator, ast.Statement.expr(store_ptr));
-            } else {
-                const val = try self.builder.builtinCall("calldataload", &.{head_slot});
-                const field_abi = mapZigTypeToAbi(field.type_name);
-                const stored = if (std.mem.eql(u8, field_abi, "address"))
-                    try self.builder.builtinCall("shr", &.{
-                        ast.Expression.lit(ast.Literal.number(@as(ast.U256, 96))),
-                        val,
-                    })
-                else
-                    val;
-                const store = try self.builder.builtinCall("mstore", &.{ field_slot, stored });
-                try stmts.append(self.allocator, ast.Statement.expr(store));
-            }
-
-            head_offset += @as(ast.U256, @intCast(self.fieldHeadSlots(field) * 32));
-        }
-
-        return ast.Expression.id(mem_name);
+        return transformer_struct.decodeStructFromHead(self, fields, head_expr, stmts, free_name_opt);
     }
 
     fn fieldHeadSlots(self: *Self, field: StructFieldDef) usize {
-        if (self.struct_defs.get(field.type_name)) |nested| {
-            if (self.structHasDynamicField(nested)) return 1;
-            return self.structStaticSlots(nested);
-        }
-        if (isDynamicAbiType(mapZigTypeToAbi(field.type_name))) return 1;
-        return 1;
+        return transformer_struct.fieldHeadSlots(self, field);
     }
 
     fn structStaticSlots(self: *Self, fields: []const StructFieldDef) usize {
-        var total: usize = 0;
-        for (fields) |field| {
-            total += self.fieldHeadSlots(field);
-        }
-        return total;
+        return transformer_struct.structStaticSlots(self, fields);
     }
 
     pub fn hasErrors(self: *const Self) bool {
