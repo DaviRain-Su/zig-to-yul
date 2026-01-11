@@ -1042,6 +1042,10 @@ pub const Transformer = struct {
             const name = p.getIdentifier(name_token);
             const is_public = p.isPublic(index);
 
+            if (builtins.getBuiltin(name) != null) {
+                try self.addError("function name conflicts with Yul builtin; rename it", self.nodeLocation(index), .unsupported_feature);
+            }
+
             _ = try self.symbol_table.enterScope(.function);
 
             // Process parameters
