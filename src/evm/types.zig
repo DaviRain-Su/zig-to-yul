@@ -263,6 +263,12 @@ pub fn Mapping(comptime Key: type, comptime Value: type) type {
             pub fn len(self: *Iterator) U256 {
                 return self.total_len;
             }
+
+            pub fn forEach(self: *Iterator, func: anytype) void {
+                while (self.next()) |item| {
+                    _ = func(item);
+                }
+            }
         };
 
         pub const PtrIterator = struct {
@@ -295,6 +301,12 @@ pub fn Mapping(comptime Key: type, comptime Value: type) type {
 
             pub fn len(self: *PtrIterator) usize {
                 return self.keys.len;
+            }
+
+            pub fn forEach(self: *PtrIterator, func: anytype) void {
+                while (self.next()) |item| {
+                    _ = func(item);
+                }
             }
         };
 
@@ -624,11 +636,17 @@ test "mapping iterator api" {
     try std.testing.expectEqual(@as(U256, 0), it.len());
     try std.testing.expect(it.next() == null);
     it.reset();
+    it.forEach(struct {
+        fn visit(_: Map.Iterator.Item) void {}
+    }.visit);
 
     var ptr_it = mapping.iteratorPtr();
     try std.testing.expectEqual(@as(usize, 0), ptr_it.len());
     try std.testing.expect(ptr_it.next() == null);
     ptr_it.reset();
+    ptr_it.forEach(struct {
+        fn visit(_: Map.PtrIterator.Item) void {}
+    }.visit);
 
     _ = mapping.isEmpty();
     _ = mapping.count();

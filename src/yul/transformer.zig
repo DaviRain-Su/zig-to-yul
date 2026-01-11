@@ -7927,3 +7927,44 @@ test "var/const inference errors" {
     try std.testing.expect(saw_var);
     try std.testing.expect(saw_const);
 }
+
+test "transform mapping entry refs" {
+    const allocator = std.testing.allocator;
+    const printer = @import("printer.zig");
+    const source =
+        \\pub const Token = struct {
+        \\    balances: evm.Mapping(evm.Address, u256),
+        \\
+        \\    pub fn touch(self: *Token, owner: evm.Address) void {
+        \\        var ref = self.balances.getPtr(owner);
+        \\        _ = ref.get();
+        \\        ref.set(1);
+        \\        var ref2 = self.balances.getOrPutPtr(owner, 0);
+        \\        _ = ref2.wasInserted();
+        \\        _ = self.balances.removeOrNull(owner);
+        \\        const info = self.balances.removeOrNullInfo(owner);
+        \\        _ = info.removed();
+        \\    }
+        \\};
+    ;
+
+    const source_z = try allocator.dupeZ(u8, source);
+    defer allocator.free(source_z);
+
+    var transformer = Transformer.init(allocator);
+    defer transformer.deinit();
+
+    const yul_ast = transformer.transform(source_z) catch |err| {
+        for (transformer.errors.items) |e| {
+            std.debug.print("Transform error: {s}\n", .{e.message});
+        }
+        return err;
+    };
+    const output = try printer.format(allocator, yul_ast);
+    defer allocator.free(output);
+
+    try std.testing.expect(std.mem.indexOf(u8, output, "__zig2yul$map_ref") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "__zig2yul$map_gopp$") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "__zig2yul$map_remon$") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "__zig2yul$map_remoni$") != null);
+}
