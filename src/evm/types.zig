@@ -108,6 +108,102 @@ pub fn Mapping(comptime Key: type, comptime Value: type) type {
             return undefined;
         }
 
+        pub fn removeOrNull(self: *@This(), key: Key) Value {
+            _ = self;
+            _ = key;
+            return undefined;
+        }
+
+        pub fn isEmpty(self: *@This()) bool {
+            _ = self;
+            return true;
+        }
+
+        pub fn count(self: *@This()) U256 {
+            _ = self;
+            return 0;
+        }
+
+        pub fn ensureCapacity(self: *@This(), capacity: U256) void {
+            _ = self;
+            _ = capacity;
+        }
+
+        pub fn shrinkToFit(self: *@This()) void {
+            _ = self;
+        }
+
+        pub const Ref = struct {
+            base: U256,
+            key: Key,
+            slot: U256,
+            inserted: bool,
+
+            pub fn get(self: Ref) Value {
+                _ = self;
+                return undefined;
+            }
+
+            pub fn set(self: Ref, value: Value) void {
+                _ = self;
+                _ = value;
+            }
+
+            pub fn exists(self: Ref) bool {
+                _ = self;
+                return false;
+            }
+
+            pub fn wasInserted(self: Ref) bool {
+                return self.inserted;
+            }
+        };
+
+        pub fn getPtr(self: *@This(), key: Key) Ref {
+            _ = self;
+            _ = key;
+            return undefined;
+        }
+
+        pub fn getOrPutPtr(self: *@This(), key: Key, default_value: Value) Ref {
+            _ = self;
+            _ = key;
+            _ = default_value;
+            return undefined;
+        }
+
+        pub fn getOrPutPtrDefault(self: *@This(), key: Key) Ref {
+            _ = self;
+            _ = key;
+            return undefined;
+        }
+
+        pub fn putNoClobberPtr(self: *@This(), key: Key, value: Value) Ref {
+            _ = self;
+            _ = key;
+            _ = value;
+            return undefined;
+        }
+
+        pub fn fetchPutPtr(self: *@This(), key: Key, value: Value) Ref {
+            _ = self;
+            _ = key;
+            _ = value;
+            return undefined;
+        }
+
+        pub fn keyPtrAt(self: *@This(), index: U256) Key {
+            _ = self;
+            _ = index;
+            return undefined;
+        }
+
+        pub fn valuePtrAt(self: *@This(), index: U256) Ref {
+            _ = self;
+            _ = index;
+            return undefined;
+        }
+
         pub const Iterator = struct {
             mapping: *Self,
             index: U256,
@@ -506,4 +602,23 @@ test "mapping iterator api" {
     try std.testing.expectEqual(@as(usize, 0), ptr_it.len());
     try std.testing.expect(ptr_it.next() == null);
     ptr_it.reset();
+
+    _ = mapping.isEmpty();
+    _ = mapping.count();
+    mapping.ensureCapacity(10);
+    mapping.shrinkToFit();
+    _ = mapping.removeOrNull(0);
+
+    const ref = mapping.getPtr(0);
+    _ = ref.exists();
+    _ = ref.wasInserted();
+    ref.set(0);
+    _ = ref.get();
+
+    _ = mapping.getOrPutPtr(0, 1);
+    _ = mapping.getOrPutPtrDefault(0);
+    _ = mapping.putNoClobberPtr(0, 1);
+    _ = mapping.fetchPutPtr(0, 1);
+    _ = mapping.keyPtrAt(0);
+    _ = mapping.valuePtrAt(0);
 }

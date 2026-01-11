@@ -353,6 +353,27 @@ Notes:
 - Iteration order is not stable after removals (swap-with-last storage).
 - `iteratorPtr()` iterates over snapshot arrays from `keys()`/`values()`.
 
+### Mapping Entry References
+
+```zig
+pub fn bumpBalance(self: *Token, owner: evm.Address, delta: u256) void {
+    var ref = self.balances.getOrPutPtr(owner, 0);
+    const current = ref.get();
+    ref.set(current + delta);
+
+    if (ref.wasInserted()) {
+        // optional bookkeeping when a new entry is created
+    }
+}
+```
+
+Notes:
+- `getPtr`/`getOrPutPtr`/`fetchPutPtr`/`putNoClobberPtr` return a storage-backed ref with `get`/`set`/`exists`.
+- `valuePtrAt(index)` returns a ref for the entry at `index`.
+- `keyPtrAt(index)` is the same as `keyAt(index)` for fixed keys.
+- `removeOrNull` returns zero when the key is missing.
+- `ensureCapacity`/`shrinkToFit` are no-ops for mappings.
+
 ### EVM Built-in Functions
 
 ```zig
