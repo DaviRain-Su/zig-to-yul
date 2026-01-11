@@ -941,19 +941,31 @@ pub const Transformer = struct {
             var value: ?ast.Expression = null;
             if (var_decl.init_node.unwrap()) |init_idx| {
                 const init_tag = p.getNodeTag(init_idx);
-                if (self.isStructInitTag(init_tag) or self.isArrayInitTag(init_tag)) {
-                    if (type_override) |override_type| {
-                        value = try self.translateStructInitWithType(init_idx, override_type);
-                    } else {
-                        if (self.isStructInitTag(init_tag)) {
-                            if (try self.structInitTypeName(init_idx)) |type_name| {
-                                try self.setLocalStructVar(name, type_name);
+                if (type_override == null and init_tag == .identifier) {
+                    const init_name = p.getNodeSource(init_idx);
+                    if (std.mem.eql(u8, init_name, "undefined")) {
+                        const kind = if (var_decl.is_const) "const" else "var";
+                        const msg = try std.fmt.allocPrint(self.allocator, "{s} initializer 'undefined' cannot infer type; add explicit type", .{kind});
+                        try self.temp_strings.append(self.allocator, msg);
+                        try self.addError(msg, self.nodeLocation(init_idx), .type_error);
+                        value = ast.Expression.lit(ast.Literal.number(0));
+                    }
+                }
+                if (value == null) {
+                    if (self.isStructInitTag(init_tag) or self.isArrayInitTag(init_tag)) {
+                        if (type_override) |override_type| {
+                            value = try self.translateStructInitWithType(init_idx, override_type);
+                        } else {
+                            if (self.isStructInitTag(init_tag)) {
+                                if (try self.structInitTypeName(init_idx)) |type_name| {
+                                    try self.setLocalStructVar(name, type_name);
+                                }
                             }
+                            value = try self.translateExpression(init_idx);
                         }
+                    } else {
                         value = try self.translateExpression(init_idx);
                     }
-                } else {
-                    value = try self.translateExpression(init_idx);
                 }
                 if (type_override == null) {
                     if (try self.mappingRefTypeForCall(init_idx)) |ref_info| {
@@ -964,7 +976,10 @@ pub const Transformer = struct {
                     }
                 }
             } else if (type_override == null) {
-                try self.addError("variable requires type or initializer", self.nodeLocation(index), .type_error);
+                const kind = if (var_decl.is_const) "const" else "var";
+                const msg = try std.fmt.allocPrint(self.allocator, "{s} declaration requires explicit type or initializer", .{kind});
+                try self.temp_strings.append(self.allocator, msg);
+                try self.addError(msg, self.nodeLocation(index), .type_error);
             }
 
             const stmt = try self.builder.varDecl(&.{name}, value);
@@ -7872,4 +7887,43 @@ test "transform expression coverage" {
     try std.testing.expect(std.mem.indexOf(u8, output, "mload") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "pairs") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "__zig2yul$precompile$precompile_sha256") != null);
+}
+
+test "var/const inference errors" {
+    const allocator = std.testing.allocator;
+    const source =
+        \\pub const Counter = struct {
+        \\    value: u256,
+        \\
+        \\    pub fn fail(self: *Counter) void {
+        \\        var bad = undefined;
+        \\        const bad_const = undefined;
+        \\        _ = self;
+        \\    }
+        \\};
+    ;
+
+    const source_z = try allocator.dupeZ(u8, source);
+    defer allocator.free(source_z);
+
+    var transformer = Transformer.init(allocator);
+    defer transformer.deinit();
+
+    try std.testing.expectError(error.TransformError, transformer.transform(source_z));
+    const errors = transformer.getErrors();
+    try std.testing.expect(errors.len >= 2);
+
+    var saw_var = false;
+    var saw_const = false;
+    for (errors) |err| {
+        if (std.mem.indexOf(u8, err.message, "var initializer 'undefined' cannot infer type") != null) {
+            saw_var = true;
+        }
+        if (std.mem.indexOf(u8, err.message, "const initializer 'undefined' cannot infer type") != null) {
+            saw_const = true;
+        }
+    }
+
+    try std.testing.expect(saw_var);
+    try std.testing.expect(saw_const);
 }
