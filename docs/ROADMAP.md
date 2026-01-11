@@ -19,7 +19,7 @@
   - 端到端测试：插桩→采集→聚合→估算（已完成：z2y profile-test）
 
 - 6.5 SourceLocation
-  - AST/Transformer 完整标注
+  - AST/Transformer 完整标注（已完成）
   - printer/sourcemap 输出对齐（已完成）
   - Yul trace 注释输出（已完成）
 
@@ -37,8 +37,9 @@
 
 - CLI/SDK 主线（方向C）
   - CLI：build/deploy/call/profile/abi-gen（已完成）
-  - SDK：storage/abi/event/precompile（已完成基础导出）
-  - ABI 导出与 Solidity 交互（已完成 ABI JSON + z2y call）
+- SDK：storage/abi/event/precompile（已完成基础导出 + Array/Mapping 支持）
+- ABI 导出与 Solidity 交互（已完成 ABI JSON + z2y call）
+
   - RPC profiles（name→RPC+chainId）（已完成：profiles.json）
   - SDK Solidity 调用（已完成基础调用 + abi-gen）
   - EIP-1559 交易参数与签名
