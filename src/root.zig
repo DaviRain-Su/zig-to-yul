@@ -27,6 +27,7 @@ pub const evm = struct {
     pub const Queue = types.Queue;
     pub const Stack = types.Stack;
     pub const Option = types.Option;
+    pub const EnumMap = types.EnumMap;
     pub const BytesBuilder = types.BytesBuilder;
     pub const StringBuilder = types.StringBuilder;
     pub const Array = types.Array;

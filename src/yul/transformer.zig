@@ -35,7 +35,9 @@ pub const Transformer = struct {
     errors: std.ArrayList(TransformError),
     dialect: ast.Dialect,
     struct_defs: std.StringHashMap([]const StructFieldDef),
+    enum_defs: std.StringHashMap(EnumDef),
     struct_init_helpers: std.StringHashMap([]const u8),
+
     local_struct_vars: std.StringHashMap([]const u8),
     local_mapping_ref_vars: std.StringHashMap(MappingRefTypeInfo),
     local_mapping_remove_ref_vars: std.StringHashMap(MappingRemoveRefTypeInfo),
@@ -82,11 +84,26 @@ pub const Transformer = struct {
         option_elem_type: ?[]const u8,
         is_bytes_builder: bool,
         is_string_builder: bool,
+        is_enum_map: bool,
+        enum_key_type: ?[]const u8,
+        enum_value_type: ?[]const u8,
+        enum_key_limit: ?evm_types.U256,
+        enum_variant_count: ?evm_types.U256,
     };
 
     pub const StructFieldDef = struct {
         name: []const u8,
         type_name: []const u8,
+    };
+
+    pub const EnumDef = struct {
+        variant_count: evm_types.U256,
+        max_value: evm_types.U256,
+    };
+
+    pub const EnumCounts = struct {
+        key_limit: evm_types.U256,
+        variant_count: evm_types.U256,
     };
 
     pub const FunctionInfo = struct {
@@ -165,6 +182,7 @@ pub const Transformer = struct {
             .errors = .empty,
             .dialect = ast.Dialect.default(),
             .struct_defs = std.StringHashMap([]const StructFieldDef).init(allocator),
+            .enum_defs = std.StringHashMap(EnumDef).init(allocator),
             .struct_init_helpers = std.StringHashMap([]const u8).init(allocator),
             .local_struct_vars = std.StringHashMap([]const u8).init(allocator),
             .local_mapping_ref_vars = std.StringHashMap(MappingRefTypeInfo).init(allocator),
@@ -205,6 +223,12 @@ pub const Transformer = struct {
             self.allocator.free(entry.value_ptr.*);
         }
         self.struct_defs.deinit();
+
+        var enum_it = self.enum_defs.iterator();
+        while (enum_it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.enum_defs.deinit();
 
         var helper_it = self.struct_init_helpers.iterator();
         while (helper_it.next()) |entry| {
@@ -410,14 +434,20 @@ pub const Transformer = struct {
         if (p.getVarDecl(index)) |var_decl| {
             const name = p.getIdentifier(var_decl.name_token);
 
-            // Check if this is a struct definition
             if (var_decl.init_node.unwrap()) |init_idx| {
                 if (p.isContainerDecl(init_idx)) {
-                    try self.recordStructDef(name, init_idx);
-                    // This is a struct - treat as contract
-                    if (p.isPublic(index)) {
-                        self.current_contract = name;
-                        try self.processContract(init_idx);
+                    const container_src = std.mem.trim(u8, p.getNodeSource(init_idx), " \t\r\n");
+                    if (std.mem.startsWith(u8, container_src, "enum")) {
+                        try self.recordEnumDef(name, init_idx);
+                        return;
+                    }
+                    if (std.mem.startsWith(u8, container_src, "struct") or std.mem.startsWith(u8, container_src, "packed struct") or std.mem.startsWith(u8, container_src, "extern struct")) {
+                        try self.recordStructDef(name, init_idx);
+                        // This is a struct - treat as contract
+                        if (p.isPublic(index)) {
+                            self.current_contract = name;
+                            try self.processContract(init_idx);
+                        }
                     }
                 }
             }
@@ -452,6 +482,80 @@ pub const Transformer = struct {
         const fields_copy = try self.allocator.dupe(StructFieldDef, fields.items);
         const key = try self.allocator.dupe(u8, name);
         try self.struct_defs.put(key, fields_copy);
+    }
+
+    fn recordEnumDef(self: *Self, name: []const u8, index: ZigAst.Node.Index) !void {
+        const p = &self.zig_parser.?;
+        if (self.enum_defs.get(name) != null) return;
+
+        var variant_count: evm_types.U256 = 0;
+        var max_value: evm_types.U256 = 0;
+        var next_value: evm_types.U256 = 0;
+        var has_value = false;
+
+        var buf: [2]ZigAst.Node.Index = undefined;
+        if (p.ast.fullContainerDecl(&buf, index)) |container| {
+            for (container.ast.members) |member| {
+                if (@intFromEnum(member) == 0) continue;
+                const tag = p.getNodeTag(member);
+                if (tag == .container_field_init or tag == .container_field) {
+                    const field_src = p.getNodeSource(member);
+                    var value = next_value;
+                    if (std.mem.indexOfScalar(u8, field_src, '=')) |eq| {
+                        const value_src = std.mem.trim(u8, field_src[eq + 1 ..], " \t\r\n,");
+                        if (self.parseEnumLiteral(value_src)) |parsed| {
+                            value = parsed;
+                        } else {
+                            try self.addError("enum tag must be an integer literal", self.nodeLocation(member), .unsupported_feature);
+                        }
+                    }
+
+                    if (!has_value or value > max_value) {
+                        max_value = value;
+                        has_value = true;
+                    }
+                    variant_count += 1;
+                    next_value = value + 1;
+                }
+            }
+        }
+
+        const key = try self.allocator.dupe(u8, name);
+        try self.enum_defs.put(key, .{
+            .variant_count = variant_count,
+            .max_value = if (has_value) max_value else 0,
+        });
+    }
+
+    fn parseEnumLiteral(self: *Self, value_src: []const u8) ?evm_types.U256 {
+        if (value_src.len == 0) return null;
+
+        var buf = std.ArrayList(u8).empty;
+        defer buf.deinit(self.allocator);
+
+        for (value_src) |ch| {
+            if (ch == '_') continue;
+            if (ch == ' ' or ch == '\t' or ch == '\r' or ch == '\n') break;
+            buf.append(self.allocator, ch) catch return null;
+        }
+
+        if (buf.items.len == 0) return null;
+        return std.fmt.parseInt(evm_types.U256, buf.items, 0) catch null;
+    }
+
+    fn enumMapCounts(self: *Self, enum_type: []const u8, loc: ast.SourceLocation) !EnumCounts {
+        if (self.enum_defs.get(enum_type)) |def| {
+            const key_limit = if (def.max_value == 0 and def.variant_count == 0) 1 else def.max_value + 1;
+            return .{ .key_limit = key_limit, .variant_count = def.variant_count };
+        }
+        try self.addError("unknown enum type in EnumMap", loc, .unsupported_feature);
+        return .{ .key_limit = 1, .variant_count = 0 };
+    }
+
+    fn enumMapSlotCount(self: *Self, key_limit: evm_types.U256, elem_slots: evm_types.U256) evm_types.U256 {
+        _ = self;
+        const limit = if (key_limit == 0) @as(evm_types.U256, 1) else key_limit;
+        return limit * elem_slots;
     }
 
     fn fieldTypeFromSource(self: *Self, field_node: ZigAst.Node.Index) []const u8 {
@@ -677,6 +781,48 @@ pub const Transformer = struct {
     fn optionElemTypeName(self: *Self, type_name: []const u8) ?[]const u8 {
         const info = self.parseOptionType(type_name) orelse return null;
         return info.elem;
+    }
+
+    const EnumMapTypeInfo = struct {
+        key: []const u8,
+        value: []const u8,
+    };
+
+    fn parseEnumMapType(self: *Self, type_name: []const u8) ?EnumMapTypeInfo {
+        _ = self;
+        const trimmed = std.mem.trim(u8, type_name, " \t\r\n");
+        const prefix: []const u8 = blk: {
+            if (std.mem.startsWith(u8, trimmed, "evm.EnumMap(")) {
+                break :blk "evm.EnumMap(";
+            } else if (std.mem.startsWith(u8, trimmed, "EnumMap(")) {
+                break :blk "EnumMap(";
+            } else if (std.mem.startsWith(u8, trimmed, "evm.types.EnumMap(")) {
+                break :blk "evm.types.EnumMap(";
+            }
+            return null;
+        };
+        const end = if (std.mem.endsWith(u8, trimmed, ")")) trimmed.len - 1 else return null;
+        const inner = trimmed[prefix.len..end];
+        if (std.mem.indexOfScalar(u8, inner, ',')) |comma| {
+            const key = std.mem.trim(u8, inner[0..comma], " \t\r\n");
+            const value = std.mem.trim(u8, inner[comma + 1 ..], " \t\r\n");
+            return EnumMapTypeInfo{ .key = key, .value = value };
+        }
+        return null;
+    }
+
+    fn isEnumMapTypeName(self: *Self, type_name: []const u8) bool {
+        return self.parseEnumMapType(type_name) != null;
+    }
+
+    fn enumMapKeyTypeName(self: *Self, type_name: []const u8) ?[]const u8 {
+        const info = self.parseEnumMapType(type_name) orelse return null;
+        return info.key;
+    }
+
+    fn enumMapValueTypeName(self: *Self, type_name: []const u8) ?[]const u8 {
+        const info = self.parseEnumMapType(type_name) orelse return null;
+        return info.value;
     }
 
     fn isBytesBuilderTypeName(self: *Self, type_name: []const u8) bool {
@@ -3231,6 +3377,9 @@ pub const Transformer = struct {
         if (try self.translateStringBuilderMethod(call_info.ast.fn_expr, args.items, self.nodeLocation(index))) |expr| {
             return expr;
         }
+        if (try self.translateEnumMapMethod(call_info.ast.fn_expr, args.items, self.nodeLocation(index))) |expr| {
+            return expr;
+        }
         if (try self.translateArrayMethod(call_info.ast.fn_expr, args.items, self.nodeLocation(index))) |expr| {
             return expr;
         }
@@ -4498,6 +4647,92 @@ pub const Transformer = struct {
         return null;
     }
 
+    fn translateEnumMapMethod(
+        self: *Self,
+        fn_expr: ZigAst.Node.Index,
+        args: []const ast.Expression,
+        loc: ast.SourceLocation,
+    ) TransformProcessError!?ast.Expression {
+        const p = &self.zig_parser.?;
+        if (p.getNodeTag(fn_expr) != .field_access) return null;
+
+        const data = p.ast.nodeData(fn_expr).node_and_token;
+        const obj_node = data[0];
+        const method_name = p.getIdentifier(data[1]);
+
+        const is_get = std.mem.eql(u8, method_name, "get");
+        const is_set = std.mem.eql(u8, method_name, "set");
+        const is_len = std.mem.eql(u8, method_name, "len");
+        const is_empty = std.mem.eql(u8, method_name, "isEmpty");
+        const is_clear = std.mem.eql(u8, method_name, "clear");
+        if (!is_get and !is_set and !is_len and !is_empty and !is_clear) return null;
+
+        const sv = self.enumMapStorageVarForNode(obj_node) orelse return null;
+        const key_type = sv.enum_key_type orelse {
+            try self.addError("enum map key type missing; declare evm.EnumMap(Enum, Value)", loc, .unsupported_feature);
+            return null;
+        };
+        const value_type = sv.enum_value_type orelse {
+            try self.addError("enum map value type missing; declare evm.EnumMap(Enum, Value)", loc, .unsupported_feature);
+            return null;
+        };
+        if (self.isMappingTypeName(value_type) or self.isArrayTypeName(value_type) or self.isSetTypeName(value_type) or self.isDequeTypeName(value_type) or self.isStackTypeName(value_type) or self.isOptionTypeName(value_type) or self.isEnumMapTypeName(value_type) or self.isBytesBuilderTypeName(value_type) or self.isStringBuilderTypeName(value_type)) {
+            try self.addError("enum map value type must be scalar or struct", loc, .unsupported_feature);
+            return null;
+        }
+
+        const base_slot_expr = ast.Expression.lit(ast.Literal.number(sv.slot));
+        const counts = try self.enumMapCounts(key_type, loc);
+        const key_limit = sv.enum_key_limit orelse counts.key_limit;
+        const variant_count = sv.enum_variant_count orelse counts.variant_count;
+
+        if (is_len) {
+            if (args.len != 0) {
+                try self.addError("enum map len expects no arguments", loc, .unsupported_feature);
+                return null;
+            }
+            return ast.Expression.lit(ast.Literal.number(variant_count));
+        }
+
+        if (is_empty) {
+            if (args.len != 0) {
+                try self.addError("enum map isEmpty expects no arguments", loc, .unsupported_feature);
+                return null;
+            }
+            const is_zero = try self.builder.builtinCall("iszero", &.{ast.Expression.lit(ast.Literal.number(variant_count))});
+            return is_zero;
+        }
+
+        if (is_get) {
+            if (args.len != 1) {
+                try self.addError("enum map get expects key", loc, .unsupported_feature);
+                return null;
+            }
+            const helper = try self.ensureEnumMapGetHelper(value_type, key_limit, loc);
+            return try self.builder.call(helper, &.{ base_slot_expr, args[0] });
+        }
+
+        if (is_set) {
+            if (args.len != 2) {
+                try self.addError("enum map set expects key and value", loc, .unsupported_feature);
+                return null;
+            }
+            const helper = try self.ensureEnumMapSetHelper(value_type, key_limit, loc);
+            return try self.builder.call(helper, &.{ base_slot_expr, args[0], args[1] });
+        }
+
+        if (is_clear) {
+            if (args.len != 0) {
+                try self.addError("enum map clear expects no arguments", loc, .unsupported_feature);
+                return null;
+            }
+            const helper = try self.ensureEnumMapClearHelper(value_type, key_limit, loc);
+            return try self.builder.call(helper, &.{base_slot_expr});
+        }
+
+        return null;
+    }
+
     fn translateArrayAccess(self: *Self, index: ZigAst.Node.Index) TransformProcessError!ast.Expression {
         const p = &self.zig_parser.?;
         const data = p.ast.nodeData(index).node_and_node;
@@ -4541,6 +4776,10 @@ pub const Transformer = struct {
                         try self.addError("mapping access requires key; use get(key)", loc, .unsupported_feature);
                         return ast.Expression.lit(ast.Literal.number(0));
                     }
+                    if (sv.is_enum_map) {
+                        try self.addError("enum map access requires get(key)", loc, .unsupported_feature);
+                        return ast.Expression.lit(ast.Literal.number(0));
+                    }
                     if (sv.is_array) {
                         const elem_type = sv.array_elem_type orelse {
                             try self.addError("array element type missing; declare evm.Array(T)", loc, .unsupported_feature);
@@ -4562,6 +4801,10 @@ pub const Transformer = struct {
                     const idx_expr = try self.translateExpression(index_node);
                     if (sv.is_mapping) {
                         try self.addError("mapping access requires key; use get(key)", loc, .unsupported_feature);
+                        return ast.Expression.lit(ast.Literal.number(0));
+                    }
+                    if (sv.is_enum_map) {
+                        try self.addError("enum map access requires get(key)", loc, .unsupported_feature);
                         return ast.Expression.lit(ast.Literal.number(0));
                     }
                     if (sv.is_array) {
@@ -5245,6 +5488,36 @@ pub const Transformer = struct {
         return null;
     }
 
+    fn enumMapStorageVarForNode(self: *Self, node: ZigAst.Node.Index) ?StorageVar {
+        const p = &self.zig_parser.?;
+        const tag = p.getNodeTag(node);
+        switch (tag) {
+            .identifier => {
+                const name = p.getNodeSource(node);
+                if (self.storageVarByName(name)) |sv| {
+                    if (sv.is_enum_map) return sv;
+                }
+            },
+            .field_access => {
+                const data = p.ast.nodeData(node).node_and_token;
+                const obj_src = p.getNodeSource(data[0]);
+                const field_name = p.getIdentifier(data[1]);
+                if (std.mem.eql(u8, obj_src, "self")) {
+                    if (self.storageVarByName(field_name)) |sv| {
+                        if (sv.is_enum_map) return sv;
+                    }
+                } else if (std.mem.startsWith(u8, obj_src, "self.")) {
+                    const base_name = obj_src["self.".len..];
+                    if (self.storageVarForNested(base_name, field_name)) |sv| {
+                        if (sv.is_enum_map) return sv;
+                    }
+                }
+            },
+            else => {},
+        }
+        return null;
+    }
+
     const MappingAccess = struct {
         slot_expr: ast.Expression,
         base_slot_expr: ast.Expression,
@@ -5516,6 +5789,23 @@ pub const Transformer = struct {
     ) TransformProcessError!ast.Expression {
         const helper = try self.ensureArrayElementSlotHelper(value_type);
         return try self.builder.call(helper, &.{ base_slot_expr, index_expr });
+    }
+
+    fn enumMapElementSlotExpr(
+        self: *Self,
+        base_slot_expr: ast.Expression,
+        key_expr: ast.Expression,
+        value_type: []const u8,
+    ) TransformProcessError!ast.Expression {
+        const elem_slots = self.arrayElementSlots(value_type);
+        const offset_expr = if (elem_slots == @as(evm_types.U256, 1))
+            key_expr
+        else
+            try self.builder.builtinCall("mul", &.{
+                key_expr,
+                ast.Expression.lit(ast.Literal.number(elem_slots)),
+            });
+        return try self.builder.builtinCall("add", &.{ base_slot_expr, offset_expr });
     }
 
     fn arrayLoadValueExpr(
@@ -7130,6 +7420,119 @@ pub const Transformer = struct {
 
         const body = try self.builder.block(stmts.items);
         const func = try self.builder.funcDef(helper_name, &.{"slot"}, &.{}, body);
+        try self.extra_functions.append(self.allocator, func);
+
+        return helper_name;
+    }
+
+    fn ensureEnumMapGetHelper(self: *Self, value_type: []const u8, key_limit: evm_types.U256, loc: ast.SourceLocation) ![]const u8 {
+        const key_name = try std.fmt.allocPrint(self.allocator, "enum_map_get:{s}:{d}", .{ value_type, key_limit });
+        defer self.allocator.free(key_name);
+        if (self.math_helpers.get(key_name)) |helper| return helper;
+
+        const helper_name = try self.mappingStructHelperName("__zig2yul$enum_get$", value_type);
+        const key = try self.allocator.dupe(u8, key_name);
+        try self.math_helpers.put(key, helper_name);
+
+        var stmts: std.ArrayList(ast.Statement) = .empty;
+        defer stmts.deinit(self.allocator);
+
+        const cond = try self.builder.builtinCall("lt", &.{ ast.Expression.id("key"), ast.Expression.lit(ast.Literal.number(key_limit)) });
+        const fail = try self.builder.builtinCall("iszero", &.{cond});
+        try self.appendRevertIf(&stmts, fail);
+
+        const slot_expr = try self.enumMapElementSlotExpr(ast.Expression.id("base"), ast.Expression.id("key"), value_type);
+        const value_expr = try self.arrayLoadValueExpr(slot_expr, value_type, loc);
+        const assign = try self.builder.assign(&.{"result"}, value_expr);
+        try stmts.append(self.allocator, assign);
+
+        const body = try self.builder.block(stmts.items);
+        const func = try self.builder.funcDef(helper_name, &.{ "base", "key" }, &.{"result"}, body);
+        try self.extra_functions.append(self.allocator, func);
+
+        return helper_name;
+    }
+
+    fn ensureEnumMapSetHelper(self: *Self, value_type: []const u8, key_limit: evm_types.U256, loc: ast.SourceLocation) ![]const u8 {
+        const key_name = try std.fmt.allocPrint(self.allocator, "enum_map_set:{s}:{d}", .{ value_type, key_limit });
+        defer self.allocator.free(key_name);
+        if (self.math_helpers.get(key_name)) |helper| return helper;
+
+        const helper_name = try self.mappingStructHelperName("__zig2yul$enum_set$", value_type);
+        const key = try self.allocator.dupe(u8, key_name);
+        try self.math_helpers.put(key, helper_name);
+
+        var stmts: std.ArrayList(ast.Statement) = .empty;
+        defer stmts.deinit(self.allocator);
+
+        const cond = try self.builder.builtinCall("lt", &.{ ast.Expression.id("key"), ast.Expression.lit(ast.Literal.number(key_limit)) });
+        const fail = try self.builder.builtinCall("iszero", &.{cond});
+        try self.appendRevertIf(&stmts, fail);
+
+        const slot_expr = try self.enumMapElementSlotExpr(ast.Expression.id("base"), ast.Expression.id("key"), value_type);
+        const store_stmt = try self.arrayStoreValueStmt(slot_expr, value_type, ast.Expression.id("value"), loc);
+        try stmts.append(self.allocator, store_stmt);
+
+        const assign = try self.builder.assign(&.{"result"}, ast.Expression.lit(ast.Literal.number(0)));
+        try stmts.append(self.allocator, assign);
+
+        const body = try self.builder.block(stmts.items);
+        const func = try self.builder.funcDef(helper_name, &.{ "base", "key", "value" }, &.{"result"}, body);
+        try self.extra_functions.append(self.allocator, func);
+
+        return helper_name;
+    }
+
+    fn ensureEnumMapClearHelper(self: *Self, value_type: []const u8, key_limit: evm_types.U256, loc: ast.SourceLocation) ![]const u8 {
+        const key_name = try std.fmt.allocPrint(self.allocator, "enum_map_clear:{s}:{d}", .{ value_type, key_limit });
+        defer self.allocator.free(key_name);
+        if (self.math_helpers.get(key_name)) |helper| return helper;
+
+        const helper_name = try self.mappingStructHelperName("__zig2yul$enum_clear$", value_type);
+        const key = try self.allocator.dupe(u8, key_name);
+        try self.math_helpers.put(key, helper_name);
+
+        var stmts: std.ArrayList(ast.Statement) = .empty;
+        defer stmts.deinit(self.allocator);
+
+        var pre_stmts: std.ArrayList(ast.Statement) = .empty;
+        defer pre_stmts.deinit(self.allocator);
+        try pre_stmts.append(self.allocator, try self.builder.varDecl(&.{"i"}, ast.Expression.lit(ast.Literal.number(0))));
+        const pre_block = try self.builder.block(pre_stmts.items);
+
+        const cond = try self.builder.builtinCall("lt", &.{ ast.Expression.id("i"), ast.Expression.lit(ast.Literal.number(key_limit)) });
+
+        var post_stmts: std.ArrayList(ast.Statement) = .empty;
+        defer post_stmts.deinit(self.allocator);
+        const inc = try self.builder.builtinCall("add", &.{ ast.Expression.id("i"), ast.Expression.lit(ast.Literal.number(1)) });
+        try post_stmts.append(self.allocator, try self.builder.assign(&.{"i"}, inc));
+        const post_block = try self.builder.block(post_stmts.items);
+
+        var body_stmts: std.ArrayList(ast.Statement) = .empty;
+        defer body_stmts.deinit(self.allocator);
+        const slot_expr = try self.enumMapElementSlotExpr(ast.Expression.id("base"), ast.Expression.id("i"), value_type);
+        if (self.isStructTypeName(value_type)) {
+            const fields = self.struct_defs.get(value_type) orelse {
+                try self.addError("unknown struct type in enum map", loc, .unsupported_feature);
+                return helper_name;
+            };
+            const helper = try self.ensureMappingStructClearHelper(value_type, fields);
+            const call_expr = try self.builder.call(helper, &.{slot_expr});
+            try body_stmts.append(self.allocator, ast.Statement.expr(call_expr));
+        } else {
+            const store = try self.builder.builtinCall("sstore", &.{ slot_expr, ast.Expression.lit(ast.Literal.number(0)) });
+            try body_stmts.append(self.allocator, ast.Statement.expr(store));
+        }
+        const body_block = try self.builder.block(body_stmts.items);
+
+        const loop_stmt = ast.Statement.forStmt(pre_block, cond, post_block, body_block);
+        try stmts.append(self.allocator, loop_stmt);
+
+        const assign = try self.builder.assign(&.{"result"}, ast.Expression.lit(ast.Literal.number(0)));
+        try stmts.append(self.allocator, assign);
+
+        const body = try self.builder.block(stmts.items);
+        const func = try self.builder.funcDef(helper_name, &.{"base"}, &.{"result"}, body);
         try self.extra_functions.append(self.allocator, func);
 
         return helper_name;
@@ -9000,6 +9403,7 @@ pub const Transformer = struct {
         if (std.mem.startsWith(u8, trimmed, "evm.Deque(") or std.mem.startsWith(u8, trimmed, "Deque(") or std.mem.startsWith(u8, trimmed, "evm.types.Deque(") or std.mem.startsWith(u8, trimmed, "evm.Queue(") or std.mem.startsWith(u8, trimmed, "Queue(") or std.mem.startsWith(u8, trimmed, "evm.types.Queue(")) return 256;
         if (std.mem.startsWith(u8, trimmed, "evm.Stack(") or std.mem.startsWith(u8, trimmed, "Stack(") or std.mem.startsWith(u8, trimmed, "evm.types.Stack(")) return 256;
         if (std.mem.startsWith(u8, trimmed, "evm.Option(") or std.mem.startsWith(u8, trimmed, "Option(") or std.mem.startsWith(u8, trimmed, "evm.types.Option(")) return 256;
+        if (std.mem.startsWith(u8, trimmed, "evm.EnumMap(") or std.mem.startsWith(u8, trimmed, "EnumMap(") or std.mem.startsWith(u8, trimmed, "evm.types.EnumMap(")) return 256;
         if (std.mem.eql(u8, trimmed, "evm.BytesBuilder") or std.mem.eql(u8, trimmed, "BytesBuilder") or std.mem.eql(u8, trimmed, "evm.types.BytesBuilder")) return 256;
         if (std.mem.eql(u8, trimmed, "evm.StringBuilder") or std.mem.eql(u8, trimmed, "StringBuilder") or std.mem.eql(u8, trimmed, "evm.types.StringBuilder")) return 256;
         if (std.mem.eql(u8, type_name, "bool")) return 8;
@@ -9054,6 +9458,13 @@ pub const Transformer = struct {
                 const stack_elem_type = if (is_stack) self.stackElemTypeName(field_type) else null;
                 const is_option = self.isOptionTypeName(field_type);
                 const option_elem_type = if (is_option) self.optionElemTypeName(field_type) else null;
+                const is_enum_map = self.isEnumMapTypeName(field_type);
+                const enum_key_type = if (is_enum_map) self.enumMapKeyTypeName(field_type) else null;
+                const enum_value_type = if (is_enum_map) self.enumMapValueTypeName(field_type) else null;
+                const enum_counts = if (is_enum_map and enum_key_type != null)
+                    try self.enumMapCounts(enum_key_type.?, .none)
+                else
+                    EnumCounts{ .key_limit = 1, .variant_count = 0 };
                 const is_bytes_builder = self.isBytesBuilderTypeName(field_type);
                 const is_string_builder = self.isStringBuilderTypeName(field_type);
                 try self.storage_vars.append(self.allocator, .{
@@ -9076,6 +9487,11 @@ pub const Transformer = struct {
                     .option_elem_type = option_elem_type,
                     .is_bytes_builder = is_bytes_builder,
                     .is_string_builder = is_string_builder,
+                    .is_enum_map = is_enum_map,
+                    .enum_key_type = enum_key_type,
+                    .enum_value_type = enum_value_type,
+                    .enum_key_limit = if (is_enum_map) enum_counts.key_limit else null,
+                    .enum_variant_count = if (is_enum_map) enum_counts.variant_count else null,
                 });
                 if (is_set) {
                     slot_shift += 1;
@@ -9092,6 +9508,15 @@ pub const Transformer = struct {
                 if (is_option) {
                     slot_shift += 1;
                     if (base_slot_index + 1 > max_slot) max_slot = base_slot_index + 1;
+                }
+                if (is_enum_map) {
+                    const elem_slots = self.arrayElementSlots(enum_value_type orelse "u256");
+                    const enum_slots = self.enumMapSlotCount(enum_counts.key_limit, elem_slots);
+                    if (enum_slots > 1) {
+                        slot_shift += enum_slots - 1;
+                        const final_slot = base_slot_index + enum_slots - 1;
+                        if (final_slot > max_slot) max_slot = final_slot;
+                    }
                 }
             }
         }
@@ -9139,10 +9564,17 @@ pub const Transformer = struct {
             const stack_elem_type = if (is_stack) self.stackElemTypeName(field.type_name) else null;
             const is_option = self.isOptionTypeName(field.type_name);
             const option_elem_type = if (is_option) self.optionElemTypeName(field.type_name) else null;
+            const is_enum_map = self.isEnumMapTypeName(field.type_name);
+            const enum_key_type = if (is_enum_map) self.enumMapKeyTypeName(field.type_name) else null;
+            const enum_value_type = if (is_enum_map) self.enumMapValueTypeName(field.type_name) else null;
+            const enum_counts = if (is_enum_map and enum_key_type != null)
+                try self.enumMapCounts(enum_key_type.?, .none)
+            else
+                EnumCounts{ .key_limit = 1, .variant_count = 0 };
             const is_bytes_builder = self.isBytesBuilderTypeName(field.type_name);
             const is_string_builder = self.isStringBuilderTypeName(field.type_name);
 
-            if (is_set or is_deque or is_stack or is_option or is_bytes_builder or is_string_builder) {
+            if (is_set or is_deque or is_stack or is_option or is_enum_map or is_bytes_builder or is_string_builder) {
                 if (current_offset != 0) {
                     current_slot += 1;
                     current_offset = 0;
@@ -9167,11 +9599,20 @@ pub const Transformer = struct {
                     .option_elem_type = option_elem_type,
                     .is_bytes_builder = is_bytes_builder,
                     .is_string_builder = is_string_builder,
+                    .is_enum_map = is_enum_map,
+                    .enum_key_type = enum_key_type,
+                    .enum_value_type = enum_value_type,
+                    .enum_key_limit = if (is_enum_map) enum_counts.key_limit else null,
+                    .enum_variant_count = if (is_enum_map) enum_counts.variant_count else null,
                 });
                 if (is_deque) {
                     current_slot += 3;
                 } else if (is_set or is_stack or is_option) {
                     current_slot += 2;
+                } else if (is_enum_map) {
+                    const elem_slots = self.arrayElementSlots(enum_value_type orelse "u256");
+                    const enum_slots = self.enumMapSlotCount(enum_counts.key_limit, elem_slots);
+                    current_slot += enum_slots;
                 } else {
                     current_slot += 1;
                 }
@@ -9210,6 +9651,11 @@ pub const Transformer = struct {
                 .option_elem_type = null,
                 .is_bytes_builder = false,
                 .is_string_builder = false,
+                .is_enum_map = false,
+                .enum_key_type = null,
+                .enum_value_type = null,
+                .enum_key_limit = null,
+                .enum_variant_count = null,
             });
 
             current_offset += field_bits;

@@ -532,6 +532,41 @@ pub fn Option(comptime Element: type) type {
     };
 }
 
+/// Defines a compact enum-keyed map with contiguous storage slots.
+pub fn EnumMap(comptime Key: type, comptime Value: type) type {
+    return struct {
+        pub const KeyType = Key;
+        pub const ValueType = Value;
+        const Self = @This();
+
+        pub fn get(self: *Self, key: Key) Value {
+            _ = self;
+            _ = key;
+            return undefined;
+        }
+
+        pub fn set(self: *Self, key: Key, value: Value) void {
+            _ = self;
+            _ = key;
+            _ = value;
+        }
+
+        pub fn len(self: *Self) U256 {
+            _ = self;
+            return 0;
+        }
+
+        pub fn isEmpty(self: *Self) bool {
+            _ = self;
+            return true;
+        }
+
+        pub fn clear(self: *Self) void {
+            _ = self;
+        }
+    };
+}
+
 /// Defines a storage-backed bytes builder for incremental appends.
 pub const BytesBuilder = struct {
     const Self = @This();
@@ -1299,6 +1334,18 @@ test "option api" {
     _ = opt.get();
     opt.set(1);
     opt.clear();
+}
+
+test "enum map api" {
+    const Color = enum { red, green, blue };
+    const Map = EnumMap(Color, U256);
+    var map: Map = .{};
+
+    _ = map.get(.red);
+    map.set(.green, 3);
+    _ = map.len();
+    _ = map.isEmpty();
+    map.clear();
 }
 
 test "bytes builder api" {
