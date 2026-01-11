@@ -868,6 +868,27 @@ pub const Transformer = struct {
             .assign_mul => {
                 try self.processAssignMul(index, stmts);
             },
+            .assign_div => {
+                try self.processAssignDiv(index, stmts);
+            },
+            .assign_mod => {
+                try self.processAssignMod(index, stmts);
+            },
+            .assign_shl => {
+                try self.processAssignShl(index, stmts);
+            },
+            .assign_shr => {
+                try self.processAssignShr(index, stmts);
+            },
+            .assign_bit_and => {
+                try self.processAssignBitAnd(index, stmts);
+            },
+            .assign_bit_or => {
+                try self.processAssignBitOr(index, stmts);
+            },
+            .assign_bit_xor => {
+                try self.processAssignBitXor(index, stmts);
+            },
             .@"return" => {
                 try self.processReturn(index, stmts);
             },
@@ -1221,6 +1242,34 @@ pub const Transformer = struct {
 
     fn processAssignMul(self: *Self, index: ZigAst.Node.Index, stmts: *std.ArrayList(ast.Statement)) TransformProcessError!void {
         try self.processAssignBinary(index, stmts, "mul");
+    }
+
+    fn processAssignDiv(self: *Self, index: ZigAst.Node.Index, stmts: *std.ArrayList(ast.Statement)) TransformProcessError!void {
+        try self.processAssignBinary(index, stmts, "div");
+    }
+
+    fn processAssignMod(self: *Self, index: ZigAst.Node.Index, stmts: *std.ArrayList(ast.Statement)) TransformProcessError!void {
+        try self.processAssignBinary(index, stmts, "mod");
+    }
+
+    fn processAssignShl(self: *Self, index: ZigAst.Node.Index, stmts: *std.ArrayList(ast.Statement)) TransformProcessError!void {
+        try self.processAssignBinary(index, stmts, "shl");
+    }
+
+    fn processAssignShr(self: *Self, index: ZigAst.Node.Index, stmts: *std.ArrayList(ast.Statement)) TransformProcessError!void {
+        try self.processAssignBinary(index, stmts, "shr");
+    }
+
+    fn processAssignBitAnd(self: *Self, index: ZigAst.Node.Index, stmts: *std.ArrayList(ast.Statement)) TransformProcessError!void {
+        try self.processAssignBinary(index, stmts, "and");
+    }
+
+    fn processAssignBitOr(self: *Self, index: ZigAst.Node.Index, stmts: *std.ArrayList(ast.Statement)) TransformProcessError!void {
+        try self.processAssignBinary(index, stmts, "or");
+    }
+
+    fn processAssignBitXor(self: *Self, index: ZigAst.Node.Index, stmts: *std.ArrayList(ast.Statement)) TransformProcessError!void {
+        try self.processAssignBinary(index, stmts, "xor");
     }
 
     fn processReturn(self: *Self, index: ZigAst.Node.Index, stmts: *std.ArrayList(ast.Statement)) TransformProcessError!void {
@@ -2014,7 +2063,11 @@ pub const Transformer = struct {
             .bool_not => try self.translateUnaryIsZero(index),
             .bit_not => try self.translateUnaryOp(index, "not"),
             .negation, .negation_wrap => try self.translateUnaryNegation(index),
-            .builtin_call => try self.translateBuiltinCall(index),
+            .builtin_call,
+            .builtin_call_comma,
+            .builtin_call_two,
+            .builtin_call_two_comma,
+            => try self.translateBuiltinCall(index),
             .call, .call_one => try self.translateCall(index),
             .field_access => try self.translateFieldAccess(index),
             .array_access => try self.translateArrayAccess(index),
@@ -2147,19 +2200,49 @@ pub const Transformer = struct {
 
     fn translateBuiltinCall(self: *Self, index: ZigAst.Node.Index) TransformProcessError!ast.Expression {
         const p = &self.zig_parser.?;
-        var call_buf: [1]ZigAst.Node.Index = undefined;
-        const call_info = p.ast.fullCall(&call_buf, index) orelse {
-            self.reportUnsupportedExpr(index) catch {};
-            return ast.Expression.lit(ast.Literal.number(0));
-        };
+        const tag = p.getNodeTag(index);
 
-        const callee_src = p.getNodeSource(call_info.ast.fn_expr);
-        if (std.mem.eql(u8, callee_src, "@as")) {
-            if (call_info.ast.params.len != 2) {
+        var arg_nodes: []const ZigAst.Node.Index = &.{};
+        var arg_buf: [2]ZigAst.Node.Index = undefined;
+        switch (tag) {
+            .builtin_call_two, .builtin_call_two_comma => {
+                const data = p.ast.nodeData(index).opt_node_and_opt_node;
+                var count: usize = 0;
+                if (data[0].unwrap()) |node| {
+                    arg_buf[count] = node;
+                    count += 1;
+                }
+                if (data[1].unwrap()) |node| {
+                    arg_buf[count] = node;
+                    count += 1;
+                }
+                arg_nodes = arg_buf[0..count];
+            },
+            .builtin_call, .builtin_call_comma => {
+                arg_nodes = p.ast.extraDataSlice(p.ast.nodeData(index).extra_range, ZigAst.Node.Index);
+            },
+            else => {},
+        }
+
+        const builtin_src = p.getNodeSource(index);
+        const name_end = std.mem.indexOfScalar(u8, builtin_src, '(') orelse builtin_src.len;
+        const builtin_name = std.mem.trim(u8, builtin_src[0..name_end], " \t\r\n");
+        if (std.mem.eql(u8, builtin_name, "@as")) {
+            if (arg_nodes.len != 2) {
                 try self.addError("@as expects two arguments", self.nodeLocation(index), .unsupported_feature);
                 return ast.Expression.lit(ast.Literal.number(0));
             }
-            return try self.translateExpression(call_info.ast.params[1]);
+            const type_src = p.getNodeSource(arg_nodes[0]);
+            const value_expr = try self.translateExpression(arg_nodes[1]);
+            const abi_type = mapZigTypeToAbi(type_src);
+            if (std.mem.eql(u8, abi_type, "address")) {
+                const mask: ast.U256 = (@as(ast.U256, 1) << 160) - 1;
+                return try self.builder.builtinCall("and", &.{
+                    value_expr,
+                    ast.Expression.lit(ast.Literal.number(mask)),
+                });
+            }
+            return value_expr;
         }
 
         self.reportUnsupportedExpr(index) catch {};
@@ -7633,6 +7716,12 @@ test "transform loops and control flow" {
         \\            }
         \\        }
         \\
+        \\        while (i < 6) : (i += 1) {
+        \\            if (i == 5) {
+        \\                break;
+        \\            }
+        \\        }
+        \\
         \\        for (0..2) |j| {
         \\            i = i + j;
         \\        }
@@ -7734,8 +7823,21 @@ test "transform expression coverage" {
         \\        pairs[0] = q;
         \\        const r = self.make_pair(.{ 9, 10 });
         \\        _ = evm.precompile_sha256(0, 64, 0, 32);
-        \\        self.value = x + self.helper(p.a, y) + q.a + r.b + z;
-        \\        return x + y;
+        \\        var acc: u256 = 10;
+        \\        acc -= 2;
+        \\        acc *= 3;
+        \\        acc /= 2;
+        \\        acc %= 5;
+        \\        acc <<= 1;
+        \\        acc >>= 1;
+        \\        acc &= 0xff;
+        \\        acc |= 1;
+        \\        acc ^= 3;
+        \\        const addr: evm.Address = @as(evm.Address, acc);
+        \\        const back: u256 = @as(u256, addr);
+        \\        _ = back;
+        \\        self.value = x + self.helper(p.a, y) + q.a + r.b + z + acc;
+        \\        return x + y + acc;
         \\    }
         \\
         \\    pub fn make_pair(self: *Counter, v: Pair) Pair {
