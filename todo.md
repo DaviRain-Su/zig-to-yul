@@ -12,25 +12,20 @@
 - 优化研究：对比 https://github.com/Vectorized/solady
 
 
-阶段 1：语法糖/可读性
-- 支持 self.otherMethod() 方法互调  
-- 支持 @as 基础类型转换（u256 <-> Address 等）
-- 支持 -=、*= 等赋值运算
-- 支持 while (cond) : (i += 1) 语法
-- 支持 const/var 基本推导的安全报错提示
-阶段 2：数据结构抽象
-- evm.Mapping(K,V) 做到像 Zig 容器一样用  
-  - get/set/contains（语义清晰）
-  - 支持嵌套 mapping 与 struct 值
-- evm.Array(T) 对应 storage 动态数组（length + data）
-- ABI 自动序列化/反序列化封装
-阶段 3：开发体验
-- 更精确的错误定位（比如 “self.data.field 不支持”的提示）
-- debug/trace 辅助（生成 Yul 注释 / SourceMap）
-- 约束报告（比如 “mapping value 目前不能是动态类型”）
-如果你希望“更像 Zig”，建议优先做：  
-方法互调 + @as + -= + while :，这是写起来最自然的部分。
-
-- 文档同步：
-  - `docs/ROADMAP.md`
-  - `docs/stories/v0.1.0-runtime-profile.md`
+未完成清单（按你给的列表）：
+阶段 1
+- const/var 基本推导的安全报错提示（未做）
+阶段 2
+- evm.Array(T) storage 动态数组（未做）
+- ABI 自动序列化/反序列化封装（未做）
+阶段 3
+- 更精确错误定位提示（未做）
+- debug/trace 辅助（Yul 注释 / SourceMap）（未做）
+- 约束报告（如 mapping value 动态类型提示）（未做）
+并行补齐
+- Iterator.forEach 小封装（未做）
+- valuePtrAt 动态 value 语义说明（未做）
+- transformer 输出测试（getPtr/getOrPutPtr + removeOrNull）（未做）
+文档同步
+- docs/ROADMAP.md（未做）
+- docs/stories/v0.1.0-runtime-profile.md（未做）
