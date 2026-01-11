@@ -2144,7 +2144,9 @@ pub const Transformer = struct {
         const is_len = std.mem.eql(u8, method_name, "len");
         const is_key_at = std.mem.eql(u8, method_name, "keyAt");
         const is_value_at = std.mem.eql(u8, method_name, "valueAt");
-        if (!is_get and !is_set and !is_contains and !is_remove and !is_len and !is_key_at and !is_value_at) return null;
+        const is_keys = std.mem.eql(u8, method_name, "keys");
+        const is_values = std.mem.eql(u8, method_name, "values");
+        if (!is_get and !is_set and !is_contains and !is_remove and !is_len and !is_key_at and !is_value_at and !is_keys and !is_values) return null;
 
         var base_slot_expr: ast.Expression = undefined;
         var key_type: ?[]const u8 = null;
@@ -2186,6 +2188,35 @@ pub const Transformer = struct {
                 return null;
             }
             return try self.builder.builtinCall("sload", &.{base_slot_expr});
+        }
+
+        if (is_keys or is_values) {
+            if (args.len != 0) {
+                try self.addError("mapping keys/values expects no arguments", loc, .unsupported_feature);
+                return null;
+            }
+            const key_ty = key_type orelse {
+                try self.addError("mapping key type missing", loc, .unsupported_feature);
+                return null;
+            };
+            if (self.isBytesKeyType(key_ty)) {
+                try self.addError("mapping keys/values does not support bytes/string keys", loc, .unsupported_feature);
+                return null;
+            }
+            if (self.mappingValueTypeName(base_value_type) != null) {
+                try self.addError("mapping keys/values not supported for nested mappings", loc, .unsupported_feature);
+                return null;
+            }
+            if (is_values and (self.isStructTypeName(base_value_type) or self.isDynamicValueType(base_value_type))) {
+                try self.addError("mapping values does not support struct or dynamic values", loc, .unsupported_feature);
+                return null;
+            }
+            if (is_keys) {
+                const helper = try self.ensureMappingKeysHelper();
+                return try self.builder.call(helper, &.{base_slot_expr});
+            }
+            const helper = try self.ensureMappingValuesHelper(key_ty, base_value_type);
+            return try self.builder.call(helper, &.{base_slot_expr});
         }
 
         if (is_key_at or is_value_at) {
@@ -3399,6 +3430,172 @@ pub const Transformer = struct {
 
         const body = try self.builder.block(stmts.items);
         const func = try self.builder.funcDef(helper_name, &.{ "key", "base" }, &.{"slot"}, body);
+        try self.extra_functions.append(self.allocator, func);
+
+        return helper_name;
+    }
+
+    fn ensureMappingKeysHelper(self: *Self) ![]const u8 {
+        const key_name = "mapping_keys";
+        if (self.math_helpers.get(key_name)) |helper| return helper;
+
+        const helper_name = try std.fmt.allocPrint(self.allocator, "__zig2yul$map_keys", .{});
+        const key = try self.allocator.dupe(u8, key_name);
+        try self.math_helpers.put(key, helper_name);
+
+        var stmts: std.ArrayList(ast.Statement) = .empty;
+        defer stmts.deinit(self.allocator);
+
+        const len_expr = try self.builder.builtinCall("sload", &.{ast.Expression.id("base")});
+        try stmts.append(self.allocator, try self.builder.varDecl(&.{"len"}, len_expr));
+
+        const ptr_expr = try self.builder.builtinCall("mload", &.{
+            ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0x40))),
+        });
+        try stmts.append(self.allocator, try self.builder.varDecl(&.{"ptr"}, ptr_expr));
+
+        const store_len = try self.builder.builtinCall("mstore", &.{ ast.Expression.id("ptr"), ast.Expression.id("len") });
+        try stmts.append(self.allocator, ast.Statement.expr(store_len));
+
+        const data_ptr = try self.builder.builtinCall("add", &.{
+            ast.Expression.id("ptr"),
+            ast.Expression.lit(ast.Literal.number(@as(ast.U256, 32))),
+        });
+        try stmts.append(self.allocator, try self.builder.varDecl(&.{"data_ptr"}, data_ptr));
+
+        var pre_stmts: std.ArrayList(ast.Statement) = .empty;
+        defer pre_stmts.deinit(self.allocator);
+        try pre_stmts.append(self.allocator, try self.builder.varDecl(&.{"i"}, ast.Expression.lit(ast.Literal.number(0))));
+        const pre_block = try self.builder.block(pre_stmts.items);
+
+        const cond = try self.builder.builtinCall("lt", &.{ ast.Expression.id("i"), ast.Expression.id("len") });
+
+        var post_stmts: std.ArrayList(ast.Statement) = .empty;
+        defer post_stmts.deinit(self.allocator);
+        const inc = try self.builder.builtinCall("add", &.{ ast.Expression.id("i"), ast.Expression.lit(ast.Literal.number(1)) });
+        try post_stmts.append(self.allocator, try self.builder.assign(&.{"i"}, inc));
+        const post_block = try self.builder.block(post_stmts.items);
+
+        var body_stmts: std.ArrayList(ast.Statement) = .empty;
+        defer body_stmts.deinit(self.allocator);
+        const key_slot = try self.builder.builtinCall("add", &.{
+            try self.builder.builtinCall("add", &.{
+                ast.Expression.id("base"),
+                ast.Expression.lit(ast.Literal.number(2)),
+            }),
+            ast.Expression.id("i"),
+        });
+        const key_expr = try self.builder.builtinCall("sload", &.{key_slot});
+        const dst = try self.builder.builtinCall("add", &.{
+            ast.Expression.id("data_ptr"),
+            try self.builder.builtinCall("mul", &.{ ast.Expression.id("i"), ast.Expression.lit(ast.Literal.number(@as(ast.U256, 32))) }),
+        });
+        const store = try self.builder.builtinCall("mstore", &.{ dst, key_expr });
+        try body_stmts.append(self.allocator, ast.Statement.expr(store));
+        const body_block = try self.builder.block(body_stmts.items);
+
+        const loop_stmt = ast.Statement.forStmt(pre_block, cond, post_block, body_block);
+        try stmts.append(self.allocator, loop_stmt);
+
+        const new_free = try self.builder.builtinCall("add", &.{
+            ast.Expression.id("data_ptr"),
+            try self.builder.builtinCall("mul", &.{ ast.Expression.id("len"), ast.Expression.lit(ast.Literal.number(@as(ast.U256, 32))) }),
+        });
+        const update_free = try self.builder.builtinCall("mstore", &.{
+            ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0x40))),
+            new_free,
+        });
+        try stmts.append(self.allocator, ast.Statement.expr(update_free));
+
+        const body = try self.builder.block(stmts.items);
+        const func = try self.builder.funcDef(helper_name, &.{"base"}, &.{"ptr"}, body);
+        try self.extra_functions.append(self.allocator, func);
+
+        return helper_name;
+    }
+
+    fn ensureMappingValuesHelper(self: *Self, key_type: []const u8, value_type: []const u8) ![]const u8 {
+        const key_name = try std.fmt.allocPrint(self.allocator, "mapping_values:{s}:{s}", .{ key_type, value_type });
+        defer self.allocator.free(key_name);
+        if (self.math_helpers.get(key_name)) |helper| return helper;
+
+        const type_id = try std.fmt.allocPrint(self.allocator, "{s}_{s}", .{ key_type, value_type });
+        defer self.allocator.free(type_id);
+        const helper_name = try self.mappingStructHelperName("__zig2yul$map_vals$", type_id);
+        const key = try self.allocator.dupe(u8, key_name);
+        try self.math_helpers.put(key, helper_name);
+
+        var stmts: std.ArrayList(ast.Statement) = .empty;
+        defer stmts.deinit(self.allocator);
+
+        const len_expr = try self.builder.builtinCall("sload", &.{ast.Expression.id("base")});
+        try stmts.append(self.allocator, try self.builder.varDecl(&.{"len"}, len_expr));
+
+        const ptr_expr = try self.builder.builtinCall("mload", &.{
+            ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0x40))),
+        });
+        try stmts.append(self.allocator, try self.builder.varDecl(&.{"ptr"}, ptr_expr));
+
+        const store_len = try self.builder.builtinCall("mstore", &.{ ast.Expression.id("ptr"), ast.Expression.id("len") });
+        try stmts.append(self.allocator, ast.Statement.expr(store_len));
+
+        const data_ptr = try self.builder.builtinCall("add", &.{
+            ast.Expression.id("ptr"),
+            ast.Expression.lit(ast.Literal.number(@as(ast.U256, 32))),
+        });
+        try stmts.append(self.allocator, try self.builder.varDecl(&.{"data_ptr"}, data_ptr));
+
+        var pre_stmts: std.ArrayList(ast.Statement) = .empty;
+        defer pre_stmts.deinit(self.allocator);
+        try pre_stmts.append(self.allocator, try self.builder.varDecl(&.{"i"}, ast.Expression.lit(ast.Literal.number(0))));
+        const pre_block = try self.builder.block(pre_stmts.items);
+
+        const cond = try self.builder.builtinCall("lt", &.{ ast.Expression.id("i"), ast.Expression.id("len") });
+
+        var post_stmts: std.ArrayList(ast.Statement) = .empty;
+        defer post_stmts.deinit(self.allocator);
+        const inc = try self.builder.builtinCall("add", &.{ ast.Expression.id("i"), ast.Expression.lit(ast.Literal.number(1)) });
+        try post_stmts.append(self.allocator, try self.builder.assign(&.{"i"}, inc));
+        const post_block = try self.builder.block(post_stmts.items);
+
+        var body_stmts: std.ArrayList(ast.Statement) = .empty;
+        defer body_stmts.deinit(self.allocator);
+        const key_slot = try self.builder.builtinCall("add", &.{
+            try self.builder.builtinCall("add", &.{
+                ast.Expression.id("base"),
+                ast.Expression.lit(ast.Literal.number(2)),
+            }),
+            ast.Expression.id("i"),
+        });
+        const key_expr = try self.builder.builtinCall("sload", &.{key_slot});
+        const slot_expr = try self.mappingSlotExprForKey(ast.Expression.id("base"), key_expr, key_type);
+        const value_expr = if (storageTypeSizeBits(value_type) < 256)
+            try self.genPackedReadDynamic(slot_expr, storageTypeSizeBits(value_type), 0)
+        else
+            try self.builder.builtinCall("sload", &.{slot_expr});
+        const dst = try self.builder.builtinCall("add", &.{
+            ast.Expression.id("data_ptr"),
+            try self.builder.builtinCall("mul", &.{ ast.Expression.id("i"), ast.Expression.lit(ast.Literal.number(@as(ast.U256, 32))) }),
+        });
+        const store = try self.builder.builtinCall("mstore", &.{ dst, value_expr });
+        try body_stmts.append(self.allocator, ast.Statement.expr(store));
+        const body_block = try self.builder.block(body_stmts.items);
+
+        const loop_stmt = ast.Statement.forStmt(pre_block, cond, post_block, body_block);
+        try stmts.append(self.allocator, loop_stmt);
+
+        const new_free = try self.builder.builtinCall("add", &.{
+            ast.Expression.id("data_ptr"),
+            try self.builder.builtinCall("mul", &.{ ast.Expression.id("len"), ast.Expression.lit(ast.Literal.number(@as(ast.U256, 32))) }),
+        });
+        const update_free = try self.builder.builtinCall("mstore", &.{
+            ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0x40))),
+            new_free,
+        });
+        try stmts.append(self.allocator, ast.Statement.expr(update_free));
+
+        const body = try self.builder.block(stmts.items);
+        const func = try self.builder.funcDef(helper_name, &.{"base"}, &.{"ptr"}, body);
         try self.extra_functions.append(self.allocator, func);
 
         return helper_name;

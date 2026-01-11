@@ -61,6 +61,16 @@ pub fn Mapping(comptime Key: type, comptime Value: type) type {
             _ = index;
             return undefined;
         }
+
+        pub fn keys(self: *@This()) []Key {
+            _ = self;
+            return &[_]Key{};
+        }
+
+        pub fn values(self: *@This()) []Value {
+            _ = self;
+            return &[_]Value{};
+        }
     };
 }
 
