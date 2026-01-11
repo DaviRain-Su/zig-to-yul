@@ -80,6 +80,8 @@ pub const Transformer = struct {
         stack_elem_type: ?[]const u8,
         is_option: bool,
         option_elem_type: ?[]const u8,
+        is_bytes_builder: bool,
+        is_string_builder: bool,
     };
 
     pub const StructFieldDef = struct {
@@ -677,6 +679,22 @@ pub const Transformer = struct {
         return info.elem;
     }
 
+    fn isBytesBuilderTypeName(self: *Self, type_name: []const u8) bool {
+        _ = self;
+        const trimmed = std.mem.trim(u8, type_name, " \t\r\n");
+        return std.mem.eql(u8, trimmed, "evm.BytesBuilder") or
+            std.mem.eql(u8, trimmed, "BytesBuilder") or
+            std.mem.eql(u8, trimmed, "evm.types.BytesBuilder");
+    }
+
+    fn isStringBuilderTypeName(self: *Self, type_name: []const u8) bool {
+        _ = self;
+        const trimmed = std.mem.trim(u8, type_name, " \t\r\n");
+        return std.mem.eql(u8, trimmed, "evm.StringBuilder") or
+            std.mem.eql(u8, trimmed, "StringBuilder") or
+            std.mem.eql(u8, trimmed, "evm.types.StringBuilder");
+    }
+
     fn isStructTypeName(self: *Self, type_name: []const u8) bool {
         return self.struct_defs.get(type_name) != null;
     }
@@ -971,6 +989,8 @@ pub const Transformer = struct {
         if (std.mem.eql(u8, zig_type, "[32]u8")) return "bytes32";
         if (std.mem.eql(u8, zig_type, "[]u8")) return "bytes";
         if (std.mem.eql(u8, zig_type, "[]const u8")) return "string";
+        if (std.mem.eql(u8, zig_type, "BytesBuilder") or std.mem.eql(u8, zig_type, "evm.BytesBuilder") or std.mem.eql(u8, zig_type, "evm.types.BytesBuilder")) return "bytes";
+        if (std.mem.eql(u8, zig_type, "StringBuilder") or std.mem.eql(u8, zig_type, "evm.StringBuilder") or std.mem.eql(u8, zig_type, "evm.types.StringBuilder")) return "string";
         if (std.mem.startsWith(u8, zig_type, "[]")) {
             return "uint256[]";
         }
@@ -3205,6 +3225,12 @@ pub const Transformer = struct {
         if (try self.translateOptionMethod(call_info.ast.fn_expr, args.items, self.nodeLocation(index))) |expr| {
             return expr;
         }
+        if (try self.translateBytesBuilderMethod(call_info.ast.fn_expr, args.items, self.nodeLocation(index))) |expr| {
+            return expr;
+        }
+        if (try self.translateStringBuilderMethod(call_info.ast.fn_expr, args.items, self.nodeLocation(index))) |expr| {
+            return expr;
+        }
         if (try self.translateArrayMethod(call_info.ast.fn_expr, args.items, self.nodeLocation(index))) |expr| {
             return expr;
         }
@@ -4328,6 +4354,150 @@ pub const Transformer = struct {
         return null;
     }
 
+    fn translateBytesBuilderMethod(
+        self: *Self,
+        fn_expr: ZigAst.Node.Index,
+        args: []const ast.Expression,
+        loc: ast.SourceLocation,
+    ) TransformProcessError!?ast.Expression {
+        const p = &self.zig_parser.?;
+        if (p.getNodeTag(fn_expr) != .field_access) return null;
+
+        const data = p.ast.nodeData(fn_expr).node_and_token;
+        const obj_node = data[0];
+        const method_name = p.getIdentifier(data[1]);
+
+        const is_len = std.mem.eql(u8, method_name, "len");
+        const is_empty = std.mem.eql(u8, method_name, "isEmpty");
+        const is_clear = std.mem.eql(u8, method_name, "clear");
+        const is_append = std.mem.eql(u8, method_name, "append");
+        const is_append_bytes = std.mem.eql(u8, method_name, "appendBytes");
+        const is_to_bytes = std.mem.eql(u8, method_name, "toBytes");
+        if (!is_len and !is_empty and !is_clear and !is_append and !is_append_bytes and !is_to_bytes) return null;
+
+        const sv = self.bytesBuilderStorageVarForNode(obj_node) orelse return null;
+        const base_slot_expr = ast.Expression.lit(ast.Literal.number(sv.slot));
+        const value_type = "[]u8";
+
+        if (is_len) {
+            if (args.len != 0) {
+                try self.addError("bytes builder len expects no arguments", loc, .unsupported_feature);
+                return null;
+            }
+            return try self.builder.builtinCall("sload", &.{base_slot_expr});
+        }
+
+        if (is_empty) {
+            if (args.len != 0) {
+                try self.addError("bytes builder isEmpty expects no arguments", loc, .unsupported_feature);
+                return null;
+            }
+            const len_expr = try self.builder.builtinCall("sload", &.{base_slot_expr});
+            return try self.builder.builtinCall("iszero", &.{len_expr});
+        }
+
+        if (is_clear) {
+            if (args.len != 0) {
+                try self.addError("bytes builder clear expects no arguments", loc, .unsupported_feature);
+                return null;
+            }
+            const helper = try self.ensureBuilderClearHelper(value_type);
+            return try self.builder.call(helper, &.{base_slot_expr});
+        }
+
+        if (is_append or is_append_bytes) {
+            if (args.len != 1) {
+                try self.addError("bytes builder append expects bytes", loc, .unsupported_feature);
+                return null;
+            }
+            const helper = try self.ensureBuilderAppendHelper(value_type);
+            return try self.builder.call(helper, &.{ base_slot_expr, args[0] });
+        }
+
+        if (is_to_bytes) {
+            if (args.len != 0) {
+                try self.addError("bytes builder toBytes expects no arguments", loc, .unsupported_feature);
+                return null;
+            }
+            const helper = try self.ensureMappingDynamicGetHelper(value_type);
+            return try self.builder.call(helper, &.{base_slot_expr});
+        }
+
+        return null;
+    }
+
+    fn translateStringBuilderMethod(
+        self: *Self,
+        fn_expr: ZigAst.Node.Index,
+        args: []const ast.Expression,
+        loc: ast.SourceLocation,
+    ) TransformProcessError!?ast.Expression {
+        const p = &self.zig_parser.?;
+        if (p.getNodeTag(fn_expr) != .field_access) return null;
+
+        const data = p.ast.nodeData(fn_expr).node_and_token;
+        const obj_node = data[0];
+        const method_name = p.getIdentifier(data[1]);
+
+        const is_len = std.mem.eql(u8, method_name, "len");
+        const is_empty = std.mem.eql(u8, method_name, "isEmpty");
+        const is_clear = std.mem.eql(u8, method_name, "clear");
+        const is_append = std.mem.eql(u8, method_name, "append");
+        const is_append_string = std.mem.eql(u8, method_name, "appendString");
+        const is_to_string = std.mem.eql(u8, method_name, "toString");
+        if (!is_len and !is_empty and !is_clear and !is_append and !is_append_string and !is_to_string) return null;
+
+        const sv = self.stringBuilderStorageVarForNode(obj_node) orelse return null;
+        const base_slot_expr = ast.Expression.lit(ast.Literal.number(sv.slot));
+        const value_type = "[]const u8";
+
+        if (is_len) {
+            if (args.len != 0) {
+                try self.addError("string builder len expects no arguments", loc, .unsupported_feature);
+                return null;
+            }
+            return try self.builder.builtinCall("sload", &.{base_slot_expr});
+        }
+
+        if (is_empty) {
+            if (args.len != 0) {
+                try self.addError("string builder isEmpty expects no arguments", loc, .unsupported_feature);
+                return null;
+            }
+            const len_expr = try self.builder.builtinCall("sload", &.{base_slot_expr});
+            return try self.builder.builtinCall("iszero", &.{len_expr});
+        }
+
+        if (is_clear) {
+            if (args.len != 0) {
+                try self.addError("string builder clear expects no arguments", loc, .unsupported_feature);
+                return null;
+            }
+            const helper = try self.ensureBuilderClearHelper(value_type);
+            return try self.builder.call(helper, &.{base_slot_expr});
+        }
+
+        if (is_append or is_append_string) {
+            if (args.len != 1) {
+                try self.addError("string builder append expects string", loc, .unsupported_feature);
+                return null;
+            }
+            const helper = try self.ensureBuilderAppendHelper(value_type);
+            return try self.builder.call(helper, &.{ base_slot_expr, args[0] });
+        }
+
+        if (is_to_string) {
+            if (args.len != 0) {
+                try self.addError("string builder toString expects no arguments", loc, .unsupported_feature);
+                return null;
+            }
+            const helper = try self.ensureMappingDynamicGetHelper(value_type);
+            return try self.builder.call(helper, &.{base_slot_expr});
+        }
+
+        return null;
+    }
+
     fn translateArrayAccess(self: *Self, index: ZigAst.Node.Index) TransformProcessError!ast.Expression {
         const p = &self.zig_parser.?;
         const data = p.ast.nodeData(index).node_and_node;
@@ -5007,6 +5177,66 @@ pub const Transformer = struct {
                     const base_name = obj_src["self.".len..];
                     if (self.storageVarForNested(base_name, field_name)) |sv| {
                         if (sv.is_option) return sv;
+                    }
+                }
+            },
+            else => {},
+        }
+        return null;
+    }
+
+    fn bytesBuilderStorageVarForNode(self: *Self, node: ZigAst.Node.Index) ?StorageVar {
+        const p = &self.zig_parser.?;
+        const tag = p.getNodeTag(node);
+        switch (tag) {
+            .identifier => {
+                const name = p.getNodeSource(node);
+                if (self.storageVarByName(name)) |sv| {
+                    if (sv.is_bytes_builder) return sv;
+                }
+            },
+            .field_access => {
+                const data = p.ast.nodeData(node).node_and_token;
+                const obj_src = p.getNodeSource(data[0]);
+                const field_name = p.getIdentifier(data[1]);
+                if (std.mem.eql(u8, obj_src, "self")) {
+                    if (self.storageVarByName(field_name)) |sv| {
+                        if (sv.is_bytes_builder) return sv;
+                    }
+                } else if (std.mem.startsWith(u8, obj_src, "self.")) {
+                    const base_name = obj_src["self.".len..];
+                    if (self.storageVarForNested(base_name, field_name)) |sv| {
+                        if (sv.is_bytes_builder) return sv;
+                    }
+                }
+            },
+            else => {},
+        }
+        return null;
+    }
+
+    fn stringBuilderStorageVarForNode(self: *Self, node: ZigAst.Node.Index) ?StorageVar {
+        const p = &self.zig_parser.?;
+        const tag = p.getNodeTag(node);
+        switch (tag) {
+            .identifier => {
+                const name = p.getNodeSource(node);
+                if (self.storageVarByName(name)) |sv| {
+                    if (sv.is_string_builder) return sv;
+                }
+            },
+            .field_access => {
+                const data = p.ast.nodeData(node).node_and_token;
+                const obj_src = p.getNodeSource(data[0]);
+                const field_name = p.getIdentifier(data[1]);
+                if (std.mem.eql(u8, obj_src, "self")) {
+                    if (self.storageVarByName(field_name)) |sv| {
+                        if (sv.is_string_builder) return sv;
+                    }
+                } else if (std.mem.startsWith(u8, obj_src, "self.")) {
+                    const base_name = obj_src["self.".len..];
+                    if (self.storageVarForNested(base_name, field_name)) |sv| {
+                        if (sv.is_string_builder) return sv;
                     }
                 }
             },
@@ -6743,58 +6973,163 @@ pub const Transformer = struct {
     }
 
     fn ensureOptionClearHelper(self: *Self, value_type: []const u8, loc: ast.SourceLocation) ![]const u8 {
-        _ = loc;
         const key_name = try std.fmt.allocPrint(self.allocator, "option_clear:{s}", .{value_type});
         defer self.allocator.free(key_name);
         if (self.math_helpers.get(key_name)) |helper| return helper;
 
-        const helper_name = try self.mappingStructHelperName("__zig2yul$opt_clr$", value_type);
+        const helper_name = try self.mappingStructHelperName("__zig2yul$opt_clear$", value_type);
         const key = try self.allocator.dupe(u8, key_name);
         try self.math_helpers.put(key, helper_name);
 
         var stmts: std.ArrayList(ast.Statement) = .empty;
         defer stmts.deinit(self.allocator);
 
-        const store_flag = try self.builder.builtinCall("sstore", &.{ ast.Expression.id("base"), ast.Expression.lit(ast.Literal.number(0)) });
-        try stmts.append(self.allocator, ast.Statement.expr(store_flag));
-
         const value_slot = try self.builder.builtinCall("add", &.{ ast.Expression.id("base"), ast.Expression.lit(ast.Literal.number(1)) });
         const store_zero = try self.builder.builtinCall("sstore", &.{ value_slot, ast.Expression.lit(ast.Literal.number(0)) });
         try stmts.append(self.allocator, ast.Statement.expr(store_zero));
 
         if (self.isStructTypeName(value_type)) {
-            const extra_slots = self.structStorageSlots(value_type) orelse 1;
-            if (extra_slots > 1) {
-                var pre_stmts: std.ArrayList(ast.Statement) = .empty;
-                defer pre_stmts.deinit(self.allocator);
-                try pre_stmts.append(self.allocator, try self.builder.varDecl(&.{"i"}, ast.Expression.lit(ast.Literal.number(1))));
-                const pre_block = try self.builder.block(pre_stmts.items);
-
-                const cond = try self.builder.builtinCall("lt", &.{ ast.Expression.id("i"), ast.Expression.lit(ast.Literal.number(extra_slots)) });
-
-                var post_stmts: std.ArrayList(ast.Statement) = .empty;
-                defer post_stmts.deinit(self.allocator);
-                const inc = try self.builder.builtinCall("add", &.{ ast.Expression.id("i"), ast.Expression.lit(ast.Literal.number(1)) });
-                try post_stmts.append(self.allocator, try self.builder.assign(&.{"i"}, inc));
-                const post_block = try self.builder.block(post_stmts.items);
-
-                var body_stmts: std.ArrayList(ast.Statement) = .empty;
-                defer body_stmts.deinit(self.allocator);
-                const slot_expr = try self.builder.builtinCall("add", &.{ value_slot, ast.Expression.id("i") });
-                const clear_expr = try self.builder.builtinCall("sstore", &.{ slot_expr, ast.Expression.lit(ast.Literal.number(0)) });
-                try body_stmts.append(self.allocator, ast.Statement.expr(clear_expr));
-                const body_block = try self.builder.block(body_stmts.items);
-
-                const loop_stmt = ast.Statement.forStmt(pre_block, cond, post_block, body_block);
-                try stmts.append(self.allocator, loop_stmt);
-            }
+            const fields = self.struct_defs.get(value_type) orelse {
+                try self.addError("unknown struct type in option", loc, .unsupported_feature);
+                return helper_name;
+            };
+            const helper = try self.ensureMappingStructClearHelper(value_type, fields);
+            const ptr_call = try self.builder.call(helper, &.{value_slot});
+            try stmts.append(self.allocator, ast.Statement.expr(ptr_call));
         }
 
-        const assign = try self.builder.assign(&.{"result"}, ast.Expression.lit(ast.Literal.number(0)));
-        try stmts.append(self.allocator, assign);
+        const store_flag = try self.builder.builtinCall("sstore", &.{ ast.Expression.id("base"), ast.Expression.lit(ast.Literal.number(0)) });
+        try stmts.append(self.allocator, ast.Statement.expr(store_flag));
 
         const body = try self.builder.block(stmts.items);
-        const func = try self.builder.funcDef(helper_name, &.{"base"}, &.{"result"}, body);
+        const func = try self.builder.funcDef(helper_name, &.{"base"}, &.{}, body);
+        try self.extra_functions.append(self.allocator, func);
+
+        return helper_name;
+    }
+
+    fn ensureBuilderAppendHelper(self: *Self, value_type: []const u8) ![]const u8 {
+        const key_name = try std.fmt.allocPrint(self.allocator, "builder_append:{s}", .{value_type});
+        defer self.allocator.free(key_name);
+        if (self.math_helpers.get(key_name)) |helper| return helper;
+
+        const helper_name = try self.mappingStructHelperName("__zig2yul$builder_append$", value_type);
+        const key = try self.allocator.dupe(u8, key_name);
+        try self.math_helpers.put(key, helper_name);
+
+        const get_helper = try self.ensureMappingDynamicGetHelper(value_type);
+        const set_helper = try self.ensureArrayDynamicSetHelper(value_type);
+
+        var stmts: std.ArrayList(ast.Statement) = .empty;
+        defer stmts.deinit(self.allocator);
+
+        const existing_ptr = try self.builder.call(get_helper, &.{ast.Expression.id("slot")});
+        try stmts.append(self.allocator, try self.builder.varDecl(&.{"existing_ptr"}, existing_ptr));
+
+        const old_len = try self.builder.builtinCall("mload", &.{ast.Expression.id("existing_ptr")});
+        try stmts.append(self.allocator, try self.builder.varDecl(&.{"old_len"}, old_len));
+
+        const value_len = try self.builder.builtinCall("mload", &.{ast.Expression.id("value")});
+        try stmts.append(self.allocator, try self.builder.varDecl(&.{"value_len"}, value_len));
+
+        const new_len = try self.builder.builtinCall("add", &.{ ast.Expression.id("old_len"), ast.Expression.id("value_len") });
+        try stmts.append(self.allocator, try self.builder.varDecl(&.{"new_len"}, new_len));
+
+        const ptr_expr = try self.builder.builtinCall("mload", &.{
+            ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0x40))),
+        });
+        try stmts.append(self.allocator, try self.builder.varDecl(&.{"ptr"}, ptr_expr));
+
+        const store_len = try self.builder.builtinCall("mstore", &.{ ast.Expression.id("ptr"), ast.Expression.id("new_len") });
+        try stmts.append(self.allocator, ast.Statement.expr(store_len));
+
+        const data_ptr = try self.builder.builtinCall("add", &.{
+            ast.Expression.id("ptr"),
+            ast.Expression.lit(ast.Literal.number(@as(ast.U256, 32))),
+        });
+        try stmts.append(self.allocator, try self.builder.varDecl(&.{"data_ptr"}, data_ptr));
+
+        const old_data = try self.builder.builtinCall("add", &.{
+            ast.Expression.id("existing_ptr"),
+            ast.Expression.lit(ast.Literal.number(@as(ast.U256, 32))),
+        });
+        try stmts.append(self.allocator, try self.builder.varDecl(&.{"old_data"}, old_data));
+        try self.appendMemoryCopyLoop(&stmts, ast.Expression.id("data_ptr"), ast.Expression.id("old_data"), ast.Expression.id("old_len"));
+
+        const value_data = try self.builder.builtinCall("add", &.{
+            ast.Expression.id("value"),
+            ast.Expression.lit(ast.Literal.number(@as(ast.U256, 32))),
+        });
+        try stmts.append(self.allocator, try self.builder.varDecl(&.{"value_data"}, value_data));
+
+        const append_ptr = try self.builder.builtinCall("add", &.{ ast.Expression.id("data_ptr"), ast.Expression.id("old_len") });
+        try stmts.append(self.allocator, try self.builder.varDecl(&.{"append_ptr"}, append_ptr));
+        try self.appendMemoryCopyLoop(&stmts, ast.Expression.id("append_ptr"), ast.Expression.id("value_data"), ast.Expression.id("value_len"));
+
+        const word_count = try self.dynamicWordCountExpr(value_type, ast.Expression.id("new_len"));
+        try stmts.append(self.allocator, try self.builder.varDecl(&.{"word_count"}, word_count));
+
+        const new_free = try self.builder.builtinCall("add", &.{
+            ast.Expression.id("data_ptr"),
+            try self.builder.builtinCall("mul", &.{
+                ast.Expression.id("word_count"),
+                ast.Expression.lit(ast.Literal.number(@as(ast.U256, 32))),
+            }),
+        });
+        try stmts.append(self.allocator, try self.builder.varDecl(&.{"new_free"}, new_free));
+
+        const update_free = try self.builder.builtinCall("mstore", &.{
+            ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0x40))),
+            ast.Expression.id("new_free"),
+        });
+        try stmts.append(self.allocator, ast.Statement.expr(update_free));
+
+        const set_call = try self.builder.call(set_helper, &.{ ast.Expression.id("slot"), ast.Expression.id("ptr") });
+        try stmts.append(self.allocator, ast.Statement.expr(set_call));
+
+        const body = try self.builder.block(stmts.items);
+        const func = try self.builder.funcDef(helper_name, &.{ "slot", "value" }, &.{}, body);
+        try self.extra_functions.append(self.allocator, func);
+
+        return helper_name;
+    }
+
+    fn ensureBuilderClearHelper(self: *Self, value_type: []const u8) ![]const u8 {
+        const key_name = try std.fmt.allocPrint(self.allocator, "builder_clear:{s}", .{value_type});
+        defer self.allocator.free(key_name);
+        if (self.math_helpers.get(key_name)) |helper| return helper;
+
+        const helper_name = try self.mappingStructHelperName("__zig2yul$builder_clear$", value_type);
+        const key = try self.allocator.dupe(u8, key_name);
+        try self.math_helpers.put(key, helper_name);
+
+        const set_helper = try self.ensureArrayDynamicSetHelper(value_type);
+
+        var stmts: std.ArrayList(ast.Statement) = .empty;
+        defer stmts.deinit(self.allocator);
+
+        const ptr_expr = try self.builder.builtinCall("mload", &.{
+            ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0x40))),
+        });
+        try stmts.append(self.allocator, try self.builder.varDecl(&.{"ptr"}, ptr_expr));
+
+        const store_len = try self.builder.builtinCall("mstore", &.{ ast.Expression.id("ptr"), ast.Expression.lit(ast.Literal.number(0)) });
+        try stmts.append(self.allocator, ast.Statement.expr(store_len));
+
+        const new_free = try self.builder.builtinCall("add", &.{ ast.Expression.id("ptr"), ast.Expression.lit(ast.Literal.number(@as(ast.U256, 32))) });
+        try stmts.append(self.allocator, try self.builder.varDecl(&.{"new_free"}, new_free));
+
+        const update_free = try self.builder.builtinCall("mstore", &.{
+            ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0x40))),
+            ast.Expression.id("new_free"),
+        });
+        try stmts.append(self.allocator, ast.Statement.expr(update_free));
+
+        const set_call = try self.builder.call(set_helper, &.{ ast.Expression.id("slot"), ast.Expression.id("ptr") });
+        try stmts.append(self.allocator, ast.Statement.expr(set_call));
+
+        const body = try self.builder.block(stmts.items);
+        const func = try self.builder.funcDef(helper_name, &.{"slot"}, &.{}, body);
         try self.extra_functions.append(self.allocator, func);
 
         return helper_name;
@@ -8665,6 +9000,8 @@ pub const Transformer = struct {
         if (std.mem.startsWith(u8, trimmed, "evm.Deque(") or std.mem.startsWith(u8, trimmed, "Deque(") or std.mem.startsWith(u8, trimmed, "evm.types.Deque(") or std.mem.startsWith(u8, trimmed, "evm.Queue(") or std.mem.startsWith(u8, trimmed, "Queue(") or std.mem.startsWith(u8, trimmed, "evm.types.Queue(")) return 256;
         if (std.mem.startsWith(u8, trimmed, "evm.Stack(") or std.mem.startsWith(u8, trimmed, "Stack(") or std.mem.startsWith(u8, trimmed, "evm.types.Stack(")) return 256;
         if (std.mem.startsWith(u8, trimmed, "evm.Option(") or std.mem.startsWith(u8, trimmed, "Option(") or std.mem.startsWith(u8, trimmed, "evm.types.Option(")) return 256;
+        if (std.mem.eql(u8, trimmed, "evm.BytesBuilder") or std.mem.eql(u8, trimmed, "BytesBuilder") or std.mem.eql(u8, trimmed, "evm.types.BytesBuilder")) return 256;
+        if (std.mem.eql(u8, trimmed, "evm.StringBuilder") or std.mem.eql(u8, trimmed, "StringBuilder") or std.mem.eql(u8, trimmed, "evm.types.StringBuilder")) return 256;
         if (std.mem.eql(u8, type_name, "bool")) return 8;
         if (std.mem.eql(u8, type_name, "u8")) return 8;
         if (std.mem.eql(u8, type_name, "u16")) return 16;
@@ -8717,6 +9054,8 @@ pub const Transformer = struct {
                 const stack_elem_type = if (is_stack) self.stackElemTypeName(field_type) else null;
                 const is_option = self.isOptionTypeName(field_type);
                 const option_elem_type = if (is_option) self.optionElemTypeName(field_type) else null;
+                const is_bytes_builder = self.isBytesBuilderTypeName(field_type);
+                const is_string_builder = self.isStringBuilderTypeName(field_type);
                 try self.storage_vars.append(self.allocator, .{
                     .name = full_name,
                     .slot = base_slot + base_slot_index,
@@ -8735,6 +9074,8 @@ pub const Transformer = struct {
                     .stack_elem_type = stack_elem_type,
                     .is_option = is_option,
                     .option_elem_type = option_elem_type,
+                    .is_bytes_builder = is_bytes_builder,
+                    .is_string_builder = is_string_builder,
                 });
                 if (is_set) {
                     slot_shift += 1;
@@ -8798,8 +9139,10 @@ pub const Transformer = struct {
             const stack_elem_type = if (is_stack) self.stackElemTypeName(field.type_name) else null;
             const is_option = self.isOptionTypeName(field.type_name);
             const option_elem_type = if (is_option) self.optionElemTypeName(field.type_name) else null;
+            const is_bytes_builder = self.isBytesBuilderTypeName(field.type_name);
+            const is_string_builder = self.isStringBuilderTypeName(field.type_name);
 
-            if (is_set or is_deque or is_stack or is_option) {
+            if (is_set or is_deque or is_stack or is_option or is_bytes_builder or is_string_builder) {
                 if (current_offset != 0) {
                     current_slot += 1;
                     current_offset = 0;
@@ -8822,11 +9165,15 @@ pub const Transformer = struct {
                     .stack_elem_type = stack_elem_type,
                     .is_option = is_option,
                     .option_elem_type = option_elem_type,
+                    .is_bytes_builder = is_bytes_builder,
+                    .is_string_builder = is_string_builder,
                 });
                 if (is_deque) {
                     current_slot += 3;
-                } else {
+                } else if (is_set or is_stack or is_option) {
                     current_slot += 2;
+                } else {
+                    current_slot += 1;
                 }
                 current_offset = 0;
                 continue;
@@ -8861,6 +9208,8 @@ pub const Transformer = struct {
                 .stack_elem_type = null,
                 .is_option = false,
                 .option_elem_type = null,
+                .is_bytes_builder = false,
+                .is_string_builder = false,
             });
 
             current_offset += field_bits;

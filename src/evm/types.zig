@@ -532,6 +532,74 @@ pub fn Option(comptime Element: type) type {
     };
 }
 
+/// Defines a storage-backed bytes builder for incremental appends.
+pub const BytesBuilder = struct {
+    const Self = @This();
+
+    pub fn len(self: *Self) U256 {
+        _ = self;
+        return 0;
+    }
+
+    pub fn isEmpty(self: *Self) bool {
+        _ = self;
+        return true;
+    }
+
+    pub fn clear(self: *Self) void {
+        _ = self;
+    }
+
+    pub fn append(self: *Self, value: []const u8) void {
+        _ = self;
+        _ = value;
+    }
+
+    pub fn appendBytes(self: *Self, value: []const u8) void {
+        _ = self;
+        _ = value;
+    }
+
+    pub fn toBytes(self: *Self) []const u8 {
+        _ = self;
+        return "";
+    }
+};
+
+/// Defines a storage-backed string builder for incremental appends.
+pub const StringBuilder = struct {
+    const Self = @This();
+
+    pub fn len(self: *Self) U256 {
+        _ = self;
+        return 0;
+    }
+
+    pub fn isEmpty(self: *Self) bool {
+        _ = self;
+        return true;
+    }
+
+    pub fn clear(self: *Self) void {
+        _ = self;
+    }
+
+    pub fn append(self: *Self, value: []const u8) void {
+        _ = self;
+        _ = value;
+    }
+
+    pub fn appendString(self: *Self, value: []const u8) void {
+        _ = self;
+        _ = value;
+    }
+
+    pub fn toString(self: *Self) []const u8 {
+        _ = self;
+        return "";
+    }
+};
+
 /// Defines a Solidity-style dynamic array type for contracts.
 pub fn Array(comptime Element: type) type {
     return struct {
@@ -1231,6 +1299,28 @@ test "option api" {
     _ = opt.get();
     opt.set(1);
     opt.clear();
+}
+
+test "bytes builder api" {
+    var builder: BytesBuilder = .{};
+
+    _ = builder.len();
+    _ = builder.isEmpty();
+    builder.clear();
+    builder.append("");
+    builder.appendBytes("");
+    _ = builder.toBytes();
+}
+
+test "string builder api" {
+    var builder: StringBuilder = .{};
+
+    _ = builder.len();
+    _ = builder.isEmpty();
+    builder.clear();
+    builder.append("");
+    builder.appendString("");
+    _ = builder.toString();
 }
 
 test "array api" {

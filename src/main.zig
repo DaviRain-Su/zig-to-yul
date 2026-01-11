@@ -677,6 +677,8 @@ fn mapZigTypeToAbi(zig_type: []const u8) []const u8 {
     if (std.mem.eql(u8, zig_type, "[32]u8")) return "bytes32";
     if (std.mem.eql(u8, zig_type, "[]u8")) return "bytes";
     if (std.mem.eql(u8, zig_type, "[]const u8")) return "string";
+    if (std.mem.eql(u8, zig_type, "BytesBuilder") or std.mem.eql(u8, zig_type, "evm.BytesBuilder") or std.mem.eql(u8, zig_type, "evm.types.BytesBuilder")) return "bytes";
+    if (std.mem.eql(u8, zig_type, "StringBuilder") or std.mem.eql(u8, zig_type, "evm.StringBuilder") or std.mem.eql(u8, zig_type, "evm.types.StringBuilder")) return "string";
     if (std.mem.startsWith(u8, zig_type, "[]")) return "uint256[]";
     return "uint256";
 }
