@@ -327,6 +327,32 @@ pub const Token = struct {
 };
 ```
 
+### Mapping Iteration
+
+```zig
+pub fn totalBalance(self: *Token) u256 {
+    var sum: u256 = 0;
+    var it = self.balances.iterator();
+    while (it.next()) |entry| {
+        sum += entry.value;
+    }
+    return sum;
+}
+
+pub fn totalBalancePtr(self: *Token) u256 {
+    var sum: u256 = 0;
+    var it = self.balances.iteratorPtr();
+    while (it.next()) |entry| {
+        sum += entry.value_ptr.*;
+    }
+    return sum;
+}
+```
+
+Notes:
+- Iteration order is not stable after removals (swap-with-last storage).
+- `iteratorPtr()` iterates over snapshot arrays from `keys()`/`values()`.
+
 ### EVM Built-in Functions
 
 ```zig

@@ -21,6 +21,7 @@ pub fn Mapping(comptime Key: type, comptime Value: type) type {
     return struct {
         pub const KeyType = Key;
         pub const ValueType = Value;
+        const Self = @This();
 
         pub fn get(self: *@This(), key: Key) Value {
             _ = self;
@@ -108,9 +109,9 @@ pub fn Mapping(comptime Key: type, comptime Value: type) type {
         }
 
         pub const Iterator = struct {
-            mapping: *@This(),
+            mapping: *Self,
             index: U256,
-            len: U256,
+            total_len: U256,
 
             pub const Item = struct {
                 key: Key,
@@ -118,7 +119,7 @@ pub fn Mapping(comptime Key: type, comptime Value: type) type {
             };
 
             pub fn next(self: *Iterator) ?Item {
-                if (self.index >= self.len) {
+                if (self.index >= self.total_len) {
                     return null;
                 }
 
@@ -130,13 +131,63 @@ pub fn Mapping(comptime Key: type, comptime Value: type) type {
                     .value = self.mapping.valueAt(index),
                 };
             }
+
+            pub fn reset(self: *Iterator) void {
+                self.index = 0;
+                self.total_len = self.mapping.len();
+            }
+
+            pub fn len(self: *Iterator) U256 {
+                return self.total_len;
+            }
+        };
+
+        pub const PtrIterator = struct {
+            keys: []Key,
+            values: []Value,
+            index: usize,
+
+            pub const Item = struct {
+                key_ptr: *Key,
+                value_ptr: *Value,
+            };
+
+            pub fn next(self: *PtrIterator) ?Item {
+                if (self.index >= self.keys.len) {
+                    return null;
+                }
+
+                const index = self.index;
+                self.index += 1;
+
+                return .{
+                    .key_ptr = &self.keys[index],
+                    .value_ptr = &self.values[index],
+                };
+            }
+
+            pub fn reset(self: *PtrIterator) void {
+                self.index = 0;
+            }
+
+            pub fn len(self: *PtrIterator) usize {
+                return self.keys.len;
+            }
         };
 
         pub fn iterator(self: *@This()) Iterator {
             return .{
                 .mapping = self,
                 .index = 0,
-                .len = self.len(),
+                .total_len = self.len(),
+            };
+        }
+
+        pub fn iteratorPtr(self: *@This()) PtrIterator {
+            return .{
+                .keys = self.keys(),
+                .values = self.values(),
+                .index = 0,
             };
         }
     };
@@ -440,4 +491,19 @@ test "type mapper" {
 
     const t3 = try mapper.mapZigType("Address");
     try std.testing.expect(t3.* == .address);
+}
+
+test "mapping iterator api" {
+    const Map = Mapping(U256, U256);
+    var mapping: Map = .{};
+
+    var it = mapping.iterator();
+    try std.testing.expectEqual(@as(U256, 0), it.len());
+    try std.testing.expect(it.next() == null);
+    it.reset();
+
+    var ptr_it = mapping.iteratorPtr();
+    try std.testing.expectEqual(@as(usize, 0), ptr_it.len());
+    try std.testing.expect(ptr_it.next() == null);
+    ptr_it.reset();
 }
