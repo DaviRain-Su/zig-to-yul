@@ -2304,6 +2304,14 @@ pub const Transformer = struct {
         };
 
         if (key_count > 1) {
+            if (self.isStructTypeName(final_type)) {
+                const fields = self.struct_defs.get(final_type) orelse {
+                    try self.addError("unknown struct type in mapping", loc, .unsupported_feature);
+                    return null;
+                };
+                const helper = try self.ensureMappingStructSetHelper(final_type, fields);
+                return try self.builder.call(helper, &.{ access.slot_expr, value_expr });
+            }
             if (self.isDynamicValueType(final_type)) {
                 const helper = try self.ensureMappingDynamicSetHelper(key_ty, final_type, false);
                 return try self.builder.call(helper, &.{ access.slot_expr, access.base_slot_expr, args[key_count - 1], value_expr });
@@ -2312,6 +2320,14 @@ pub const Transformer = struct {
             return try self.builder.call(helper, &.{ access.slot_expr, access.base_slot_expr, args[key_count - 1], value_expr });
         }
 
+        if (self.isStructTypeName(final_type)) {
+            const fields = self.struct_defs.get(final_type) orelse {
+                try self.addError("unknown struct type in mapping", loc, .unsupported_feature);
+                return null;
+            };
+            const helper = try self.ensureMappingStructSetHelper(final_type, fields);
+            return try self.builder.call(helper, &.{ access.slot_expr, value_expr });
+        }
         if (self.isDynamicValueType(final_type)) {
             const helper = try self.ensureMappingDynamicSetHelper(key_ty, final_type, true);
             return try self.builder.call(helper, &.{ access.slot_expr, access.base_slot_expr, args[0], value_expr });
@@ -2831,6 +2847,10 @@ pub const Transformer = struct {
                 try self.addError("mapping key expression missing", loc, .unsupported_feature);
                 return null;
             };
+            if (self.isStructTypeName(value_type)) {
+                try self.addError("mapping value is a struct; assign fields", loc, .unsupported_feature);
+                return null;
+            }
             if (self.isDynamicValueType(value_type)) {
                 const helper = try self.ensureMappingDynamicSetHelper(key_ty, value_type, true);
                 const call_expr = try self.builder.call(helper, &.{ access.slot_expr, access.base_slot_expr, key_expr, value });
