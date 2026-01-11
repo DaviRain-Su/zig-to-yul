@@ -71,6 +71,10 @@ pub fn Mapping(comptime Key: type, comptime Value: type) type {
             _ = self;
             return &[_]Value{};
         }
+
+        pub fn clear(self: *@This()) void {
+            _ = self;
+        }
     };
 }
 

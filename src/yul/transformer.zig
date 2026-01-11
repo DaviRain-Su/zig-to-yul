@@ -2146,7 +2146,8 @@ pub const Transformer = struct {
         const is_value_at = std.mem.eql(u8, method_name, "valueAt");
         const is_keys = std.mem.eql(u8, method_name, "keys");
         const is_values = std.mem.eql(u8, method_name, "values");
-        if (!is_get and !is_set and !is_contains and !is_remove and !is_len and !is_key_at and !is_value_at and !is_keys and !is_values) return null;
+        const is_clear = std.mem.eql(u8, method_name, "clear");
+        if (!is_get and !is_set and !is_contains and !is_remove and !is_len and !is_key_at and !is_value_at and !is_keys and !is_values and !is_clear) return null;
 
         var base_slot_expr: ast.Expression = undefined;
         var key_type: ?[]const u8 = null;
@@ -2188,6 +2189,23 @@ pub const Transformer = struct {
                 return null;
             }
             return try self.builder.builtinCall("sload", &.{base_slot_expr});
+        }
+
+        if (is_clear) {
+            if (args.len != 0) {
+                try self.addError("mapping.clear expects no arguments", loc, .unsupported_feature);
+                return null;
+            }
+            if (self.mappingValueTypeName(base_value_type) != null) {
+                try self.addError("mapping.clear not supported for nested mappings", loc, .unsupported_feature);
+                return null;
+            }
+            const key_ty = key_type orelse {
+                try self.addError("mapping key type missing", loc, .unsupported_feature);
+                return null;
+            };
+            const helper = try self.ensureMappingClearHelper(key_ty, base_value_type);
+            return try self.builder.call(helper, &.{base_slot_expr});
         }
 
         if (is_keys or is_values) {
@@ -3901,6 +3919,29 @@ pub const Transformer = struct {
         const loop_stmt = ast.Statement.forStmt(pre_block, cond, post_block, body_block);
         try stmts.append(self.allocator, loop_stmt);
 
+        var clear_pre: std.ArrayList(ast.Statement) = .empty;
+        defer clear_pre.deinit(self.allocator);
+        try clear_pre.append(self.allocator, try self.builder.varDecl(&.{"j"}, ast.Expression.id("word_count")));
+        const clear_pre_block = try self.builder.block(clear_pre.items);
+
+        const clear_cond = try self.builder.builtinCall("lt", &.{ ast.Expression.id("j"), ast.Expression.id("old_words") });
+
+        var clear_post: std.ArrayList(ast.Statement) = .empty;
+        defer clear_post.deinit(self.allocator);
+        const inc_j = try self.builder.builtinCall("add", &.{ ast.Expression.id("j"), ast.Expression.lit(ast.Literal.number(1)) });
+        try clear_post.append(self.allocator, try self.builder.assign(&.{"j"}, inc_j));
+        const clear_post_block = try self.builder.block(clear_post.items);
+
+        var clear_body: std.ArrayList(ast.Statement) = .empty;
+        defer clear_body.deinit(self.allocator);
+        const clear_slot = try self.builder.builtinCall("add", &.{ ast.Expression.id("data_slot"), ast.Expression.id("j") });
+        const clear_store = try self.builder.builtinCall("sstore", &.{ clear_slot, ast.Expression.lit(ast.Literal.number(0)) });
+        try clear_body.append(self.allocator, ast.Statement.expr(clear_store));
+        const clear_body_block = try self.builder.block(clear_body.items);
+
+        const clear_loop = ast.Statement.forStmt(clear_pre_block, clear_cond, clear_post_block, clear_body_block);
+        try stmts.append(self.allocator, clear_loop);
+
         const body = try self.builder.block(stmts.items);
         const func = try self.builder.funcDef(helper_name, &.{ "slot", "key" }, &.{}, body);
         try self.extra_functions.append(self.allocator, func);
@@ -4281,6 +4322,64 @@ pub const Transformer = struct {
 
         const body = try self.builder.block(stmts.items);
         const func = try self.builder.funcDef(helper_name, &.{ "slot", "base", "key", "value" }, &.{}, body);
+        try self.extra_functions.append(self.allocator, func);
+
+        return helper_name;
+    }
+
+    fn ensureMappingClearHelper(self: *Self, key_type: []const u8, value_type: []const u8) ![]const u8 {
+        const key_name = try std.fmt.allocPrint(self.allocator, "mapping_clear:{s}:{s}", .{ key_type, value_type });
+        defer self.allocator.free(key_name);
+        if (self.math_helpers.get(key_name)) |helper| return helper;
+
+        const type_id = try std.fmt.allocPrint(self.allocator, "{s}_{s}", .{ key_type, value_type });
+        defer self.allocator.free(type_id);
+        const helper_name = try self.mappingStructHelperName("__zig2yul$map_clear$", type_id);
+        const key = try self.allocator.dupe(u8, key_name);
+        try self.math_helpers.put(key, helper_name);
+
+        var stmts: std.ArrayList(ast.Statement) = .empty;
+        defer stmts.deinit(self.allocator);
+
+        const pre_len = try self.builder.builtinCall("sload", &.{ast.Expression.id("base")});
+        try stmts.append(self.allocator, try self.builder.varDecl(&.{"idx"}, pre_len));
+
+        const cond = try self.builder.builtinCall("gt", &.{ ast.Expression.id("idx"), ast.Expression.lit(ast.Literal.number(0)) });
+
+        var post_stmts: std.ArrayList(ast.Statement) = .empty;
+        defer post_stmts.deinit(self.allocator);
+        const next_idx = try self.builder.builtinCall("sload", &.{ast.Expression.id("base")});
+        try post_stmts.append(self.allocator, try self.builder.assign(&.{"idx"}, next_idx));
+        const post_block = try self.builder.block(post_stmts.items);
+
+        var body_stmts: std.ArrayList(ast.Statement) = .empty;
+        defer body_stmts.deinit(self.allocator);
+        const last_index = try self.builder.builtinCall("sub", &.{ ast.Expression.id("idx"), ast.Expression.lit(ast.Literal.number(1)) });
+        const key_slot = try self.builder.builtinCall("add", &.{
+            try self.builder.builtinCall("add", &.{
+                ast.Expression.id("base"),
+                ast.Expression.lit(ast.Literal.number(2)),
+            }),
+            last_index,
+        });
+        const key_expr = if (self.isBytesKeyType(key_type)) blk: {
+            const helper = try self.ensureMappingDynamicGetHelper(key_type);
+            break :blk try self.builder.call(helper, &.{key_slot});
+        } else blk: {
+            break :blk try self.builder.builtinCall("sload", &.{key_slot});
+        };
+        const slot_expr = try self.mappingSlotExprForKey(ast.Expression.id("base"), key_expr, key_type);
+        const remove_helper = try self.ensureMappingRemoveHelper(key_type, value_type, true);
+        const remove_call = try self.builder.call(remove_helper, &.{ slot_expr, ast.Expression.id("base"), key_expr });
+        try body_stmts.append(self.allocator, ast.Statement.expr(remove_call));
+        const body_block = try self.builder.block(body_stmts.items);
+
+        const pre_block = try self.builder.block(&.{});
+        const loop_stmt = ast.Statement.forStmt(pre_block, cond, post_block, body_block);
+        try stmts.append(self.allocator, loop_stmt);
+
+        const body = try self.builder.block(stmts.items);
+        const func = try self.builder.funcDef(helper_name, &.{"base"}, &.{}, body);
         try self.extra_functions.append(self.allocator, func);
 
         return helper_name;
