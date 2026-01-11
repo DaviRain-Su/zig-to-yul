@@ -2344,7 +2344,7 @@ pub const Transformer = struct {
                 try self.addError("mapping key type missing", loc, .unsupported_feature);
                 return null;
             };
-            const helper = try self.ensureMappingRemoveHelper(key_ty, final_type, key_count == 1);
+            const helper = try self.ensureMappingRemoveHelper(key_ty, final_type, true);
             return try self.builder.call(helper, &.{ access.slot_expr, access.base_slot_expr, args[key_count - 1] });
         }
 
@@ -2364,10 +2364,10 @@ pub const Transformer = struct {
                 return try self.builder.call(helper, &.{ access.slot_expr, value_expr });
             }
             if (self.isDynamicValueType(final_type)) {
-                const helper = try self.ensureMappingDynamicSetHelper(key_ty, final_type, false);
+                const helper = try self.ensureMappingDynamicSetHelper(key_ty, final_type, true);
                 return try self.builder.call(helper, &.{ access.slot_expr, access.base_slot_expr, args[key_count - 1], value_expr });
             }
-            const helper = try self.ensureMappingSetHelper(key_ty, final_type, false);
+            const helper = try self.ensureMappingSetHelper(key_ty, final_type, true);
             return try self.builder.call(helper, &.{ access.slot_expr, access.base_slot_expr, args[key_count - 1], value_expr });
         }
 
