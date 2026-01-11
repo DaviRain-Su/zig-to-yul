@@ -75,6 +75,70 @@ pub fn Mapping(comptime Key: type, comptime Value: type) type {
         pub fn clear(self: *@This()) void {
             _ = self;
         }
+
+        pub fn getOrPut(self: *@This(), key: Key, default_value: Value) Value {
+            _ = self;
+            _ = key;
+            return default_value;
+        }
+
+        pub fn getOrPutDefault(self: *@This(), key: Key) Value {
+            _ = self;
+            _ = key;
+            return undefined;
+        }
+
+        pub fn putNoClobber(self: *@This(), key: Key, value: Value) bool {
+            _ = self;
+            _ = key;
+            _ = value;
+            return false;
+        }
+
+        pub fn fetchPut(self: *@This(), key: Key, value: Value) Value {
+            _ = self;
+            _ = key;
+            return value;
+        }
+
+        pub fn removeValue(self: *@This(), key: Key) Value {
+            _ = self;
+            _ = key;
+            return undefined;
+        }
+
+        pub const Iterator = struct {
+            mapping: *@This(),
+            index: U256,
+            len: U256,
+
+            pub const Item = struct {
+                key: Key,
+                value: Value,
+            };
+
+            pub fn next(self: *Iterator) ?Item {
+                if (self.index >= self.len) {
+                    return null;
+                }
+
+                const index = self.index;
+                self.index += 1;
+
+                return .{
+                    .key = self.mapping.keyAt(index),
+                    .value = self.mapping.valueAt(index),
+                };
+            }
+        };
+
+        pub fn iterator(self: *@This()) Iterator {
+            return .{
+                .mapping = self,
+                .index = 0,
+                .len = self.len(),
+            };
+        }
     };
 }
 
