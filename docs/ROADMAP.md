@@ -20,7 +20,8 @@
 
 - 6.5 SourceLocation
   - AST/Transformer 完整标注
-  - printer/sourcemap 输出对齐
+  - printer/sourcemap 输出对齐（已完成）
+  - Yul trace 注释输出（已完成）
 
 - 语言体验（语法糖/可读性）
   - self.otherMethod() 方法互调（已完成）
