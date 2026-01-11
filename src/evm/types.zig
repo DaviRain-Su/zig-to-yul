@@ -39,6 +39,16 @@ pub fn Mapping(comptime Key: type, comptime Value: type) type {
             _ = key;
             return false;
         }
+
+        pub fn remove(self: *@This(), key: Key) void {
+            _ = self;
+            _ = key;
+        }
+
+        pub fn len(self: *@This()) U256 {
+            _ = self;
+            return 0;
+        }
     };
 }
 
