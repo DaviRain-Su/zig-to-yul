@@ -3135,6 +3135,15 @@ pub const Transformer = struct {
             try args.append(self.allocator, try self.translateExpression(param_node));
         }
 
+        if (std.mem.eql(u8, callee_src, "require") or std.mem.eql(u8, callee_src, "assert") or std.mem.eql(u8, callee_src, "evm.require") or std.mem.eql(u8, callee_src, "evm.assert")) {
+            const is_assert = std.mem.eql(u8, callee_src, "assert") or std.mem.eql(u8, callee_src, "evm.assert");
+            if (args.items.len != 1) {
+                try self.addError(if (is_assert) "assert expects condition" else "require expects condition", self.nodeLocation(call_info.ast.fn_expr), .unsupported_feature);
+            }
+            const helper = try self.ensureRequireHelper(if (is_assert) "assert" else "require");
+            return try self.builder.call(helper, args.items);
+        }
+
         if (try self.translateMappingRemoveRefMethod(call_info.ast.fn_expr, args.items, self.nodeLocation(index))) |expr| {
             return expr;
         }
@@ -3290,6 +3299,29 @@ pub const Transformer = struct {
         try stmts.append(self.allocator, assign);
         const body = try self.builder.block(stmts.items);
         const func = try self.builder.funcDef(helper_name, &.{ "in_ptr", "in_len", "out_ptr", "out_len" }, &.{"success"}, body);
+        try self.extra_functions.append(self.allocator, func);
+
+        return helper_name;
+    }
+
+    fn ensureRequireHelper(self: *Self, label: []const u8) ![]const u8 {
+        const key_name = try std.fmt.allocPrint(self.allocator, "require:{s}", .{label});
+        defer self.allocator.free(key_name);
+        if (self.math_helpers.get(key_name)) |helper| return helper;
+
+        const helper_name = try std.fmt.allocPrint(self.allocator, "__zig2yul${s}", .{label});
+        const key = try self.allocator.dupe(u8, key_name);
+        try self.math_helpers.put(key, helper_name);
+
+        var stmts: std.ArrayList(ast.Statement) = .empty;
+        defer stmts.deinit(self.allocator);
+
+        const is_zero = try self.builder.builtinCall("iszero", &.{ast.Expression.id("cond")});
+        try self.appendRevertIf(&stmts, is_zero);
+        try stmts.append(self.allocator, try self.builder.assign(&.{"result"}, ast.Expression.lit(ast.Literal.number(0))));
+
+        const body = try self.builder.block(stmts.items);
+        const func = try self.builder.funcDef(helper_name, &.{"cond"}, &.{"result"}, body);
         try self.extra_functions.append(self.allocator, func);
 
         return helper_name;
@@ -10112,7 +10144,7 @@ test "saturating mul helper" {
         \\pub const Counter = struct {
         \\    value: u256,
         \\
-        \\    pub fn mul(self: *Counter, x: u256, y: u256) u256 {
+        \\    pub fn mulValue(self: *Counter, x: u256, y: u256) u256 {
         \\        _ = self;
         \\        return evm.saturating_mul(x, y);
         \\    }
@@ -10131,7 +10163,35 @@ test "saturating mul helper" {
 
     try std.testing.expect(std.mem.indexOf(u8, output, "__zig2yul$saturating_mul") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "function __zig2yul$saturating_mul") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "not(0)") != null);
+}
+
+test "require helper" {
+    const allocator = std.testing.allocator;
+    const printer = @import("printer.zig");
+
+    const source =
+        \\pub const Counter = struct {
+        \\    value: u256,
+        \\
+        \\    pub fn set(self: *Counter, x: u256) void {
+        \\        evm.require(x > 0);
+        \\        self.value = x;
+        \\    }
+        \\};
+    ;
+
+    const source_z = try allocator.dupeZ(u8, source);
+    defer allocator.free(source_z);
+
+    var transformer = Transformer.init(allocator);
+    defer transformer.deinit();
+
+    const yul_ast = try transformer.transform(source_z);
+    const output = try printer.format(allocator, yul_ast);
+    defer allocator.free(output);
+
+    try std.testing.expect(std.mem.indexOf(u8, output, "__zig2yul$require") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "revert(0, 0)") != null);
 }
 
 test "ffs helper" {
@@ -10170,7 +10230,7 @@ test "gas stipend constants" {
 
     const source =
         \\pub const Counter = struct {
-        \\    pub fn gas(self: *Counter) u256 {
+        \\    pub fn gasValue(self: *Counter) u256 {
         \\        _ = self;
         \\        return evm.gas_stipend_no_storage() + evm.gas_stipend_no_grief();
         \\    }

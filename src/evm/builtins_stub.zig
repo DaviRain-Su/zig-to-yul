@@ -211,6 +211,8 @@ pub fn revert(_: U256, _: U256) void {}
 pub fn stop() void {}
 pub fn invalid() void {}
 pub fn selfdestruct(_: Address) void {}
+pub fn require(_: bool) void {}
+pub fn assert(_: bool) void {}
 
 // Logging
 pub fn log0(_: U256, _: U256) void {}
