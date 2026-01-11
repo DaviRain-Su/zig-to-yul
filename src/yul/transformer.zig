@@ -3589,7 +3589,7 @@ pub const Transformer = struct {
                 try self.addError("array.resize expects length", loc, .unsupported_feature);
                 return null;
             }
-            const helper = try self.ensureArrayResizeHelper();
+            const helper = try self.ensureArrayResizeHelper(info.value_type);
             return try self.builder.call(helper, &.{ base_expr, args[0] });
         }
 
@@ -3775,7 +3775,7 @@ pub const Transformer = struct {
                 try self.addError("array.resize expects length", loc, .unsupported_feature);
                 return null;
             }
-            const helper = try self.ensureArrayResizeHelper();
+            const helper = try self.ensureArrayResizeHelper(value_type);
             return try self.builder.call(helper, &.{ base_slot_expr, args[0] });
         }
 
@@ -5146,19 +5146,83 @@ pub const Transformer = struct {
         return helper_name;
     }
 
-    fn ensureArrayResizeHelper(self: *Self) ![]const u8 {
-        const key_name = "array_resize";
+    fn ensureArrayResizeHelper(self: *Self, value_type: []const u8) ![]const u8 {
+        const key_name = try std.fmt.allocPrint(self.allocator, "array_resize:{s}", .{value_type});
+        defer self.allocator.free(key_name);
         if (self.math_helpers.get(key_name)) |helper| return helper;
 
-        const helper_name = try std.fmt.allocPrint(self.allocator, "__zig2yul$arr_resize", .{});
+        const helper_name = try self.mappingStructHelperName("__zig2yul$arr_resize$", value_type);
         const key = try self.allocator.dupe(u8, key_name);
         try self.math_helpers.put(key, helper_name);
+
+        const elem_slots = self.arrayElementSlots(value_type);
 
         var stmts: std.ArrayList(ast.Statement) = .empty;
         defer stmts.deinit(self.allocator);
 
+        const old_len_expr = try self.builder.builtinCall("sload", &.{ast.Expression.id("base")});
+        try stmts.append(self.allocator, try self.builder.varDecl(&.{"old_len"}, old_len_expr));
+
         const store_len = try self.builder.builtinCall("sstore", &.{ ast.Expression.id("base"), ast.Expression.id("len") });
         try stmts.append(self.allocator, ast.Statement.expr(store_len));
+
+        const grow_cond = try self.builder.builtinCall("lt", &.{ ast.Expression.id("old_len"), ast.Expression.id("len") });
+
+        var grow_stmts: std.ArrayList(ast.Statement) = .empty;
+        defer grow_stmts.deinit(self.allocator);
+
+        var pre_stmts: std.ArrayList(ast.Statement) = .empty;
+        defer pre_stmts.deinit(self.allocator);
+        try pre_stmts.append(self.allocator, try self.builder.varDecl(&.{"i"}, ast.Expression.id("old_len")));
+        const pre_block = try self.builder.block(pre_stmts.items);
+
+        const loop_cond = try self.builder.builtinCall("lt", &.{ ast.Expression.id("i"), ast.Expression.id("len") });
+
+        var post_stmts: std.ArrayList(ast.Statement) = .empty;
+        defer post_stmts.deinit(self.allocator);
+        const inc = try self.builder.builtinCall("add", &.{ ast.Expression.id("i"), ast.Expression.lit(ast.Literal.number(1)) });
+        try post_stmts.append(self.allocator, try self.builder.assign(&.{"i"}, inc));
+        const post_block = try self.builder.block(post_stmts.items);
+
+        var body_stmts: std.ArrayList(ast.Statement) = .empty;
+        defer body_stmts.deinit(self.allocator);
+
+        const slot_expr = try self.arrayElementSlotExpr(ast.Expression.id("base"), ast.Expression.id("i"), value_type);
+
+        if (self.isStructTypeName(value_type) and elem_slots > 1) {
+            var slot_pre: std.ArrayList(ast.Statement) = .empty;
+            defer slot_pre.deinit(self.allocator);
+            try slot_pre.append(self.allocator, try self.builder.varDecl(&.{"j"}, ast.Expression.lit(ast.Literal.number(0))));
+            const slot_pre_block = try self.builder.block(slot_pre.items);
+
+            const slot_cond = try self.builder.builtinCall("lt", &.{ ast.Expression.id("j"), ast.Expression.lit(ast.Literal.number(elem_slots)) });
+
+            var slot_post: std.ArrayList(ast.Statement) = .empty;
+            defer slot_post.deinit(self.allocator);
+            const inc_j = try self.builder.builtinCall("add", &.{ ast.Expression.id("j"), ast.Expression.lit(ast.Literal.number(1)) });
+            try slot_post.append(self.allocator, try self.builder.assign(&.{"j"}, inc_j));
+            const slot_post_block = try self.builder.block(slot_post.items);
+
+            var slot_body: std.ArrayList(ast.Statement) = .empty;
+            defer slot_body.deinit(self.allocator);
+            const target_slot = try self.builder.builtinCall("add", &.{ slot_expr, ast.Expression.id("j") });
+            const clear_store = try self.builder.builtinCall("sstore", &.{ target_slot, ast.Expression.lit(ast.Literal.number(0)) });
+            try slot_body.append(self.allocator, ast.Statement.expr(clear_store));
+            const slot_body_block = try self.builder.block(slot_body.items);
+
+            const slot_loop = ast.Statement.forStmt(slot_pre_block, slot_cond, slot_post_block, slot_body_block);
+            try body_stmts.append(self.allocator, slot_loop);
+        } else {
+            const store_zero = try self.builder.builtinCall("sstore", &.{ slot_expr, ast.Expression.lit(ast.Literal.number(0)) });
+            try body_stmts.append(self.allocator, ast.Statement.expr(store_zero));
+        }
+
+        const body_block = try self.builder.block(body_stmts.items);
+        const loop_stmt = ast.Statement.forStmt(pre_block, loop_cond, post_block, body_block);
+        try grow_stmts.append(self.allocator, loop_stmt);
+
+        const grow_block = try self.builder.block(grow_stmts.items);
+        try stmts.append(self.allocator, self.builder.ifStmt(grow_cond, grow_block));
 
         const assign = try self.builder.assign(&.{"result"}, ast.Expression.lit(ast.Literal.number(0)));
         try stmts.append(self.allocator, assign);
