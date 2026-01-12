@@ -1783,7 +1783,7 @@ fn printUsageStderr() void {
         \\
         \\For more information, visit: https://github.com/example/zig-to-yul
         \\
-    , .{version});
+    , .{});
 }
 
 fn runCommand(allocator: std.mem.Allocator, argv: []const []const u8) ![]u8 {
