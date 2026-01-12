@@ -771,6 +771,31 @@ fn scanAbiMutability(src: []const u8) AbiMutabilityScan {
     if (std.mem.indexOf(u8, src, "callvalue(") != null) {
         scan.uses_callvalue = true;
     }
+    if (containsAny(src, &.{
+        "caller(",
+        "address(",
+        "origin(",
+        "gasprice(",
+        "gas(",
+        "coinbase(",
+        "timestamp(",
+        "number(",
+        "difficulty(",
+        "prevrandao(",
+        "gaslimit(",
+        "chainid(",
+        "basefee(",
+        "blobbasefee(",
+        "selfbalance(",
+        "balance(",
+        "extcodesize(",
+        "extcodehash(",
+        "extcodecopy(",
+        "blockhash(",
+        "blobhash(",
+    })) {
+        scan.reads_storage = true;
+    }
     if (containsAny(src, &.{ "evm.sstore(", "sstore(" })) {
         scan.writes_storage = true;
     }
@@ -1800,7 +1825,7 @@ test "abi mutability inference" {
         \\    }
         \\
         \\    pub fn viewFn(self: *Pool) u256 {
-        \\        return self.value;
+        \\        return self.value + evm.caller();
         \\    }
         \\
         \\    pub fn nonpayableFn(self: *Pool, v: u256) void {
