@@ -2587,6 +2587,23 @@ pub const Transformer = struct {
             return value_expr;
         }
 
+        if (std.mem.eql(u8, builtin_name, "@panic")) {
+            var message: []u8 = &[_]u8{};
+            var message_owned = false;
+            defer if (message_owned) self.allocator.free(message);
+
+            if (arg_nodes.len != 1) {
+                try self.addError("@panic expects one argument", self.nodeLocation(index), .unsupported_feature);
+                message = try self.allocator.alloc(u8, 0);
+                message_owned = true;
+            } else {
+                message = try self.parsePanicMessage(arg_nodes[0], self.nodeLocation(index));
+                message_owned = true;
+            }
+            const helper = try self.ensurePanicHelper(message);
+            return try self.builder.call(helper, &.{});
+        }
+
         self.reportUnsupportedExpr(index) catch {};
         return ast.Expression.lit(ast.Literal.number(0));
     }
@@ -3482,6 +3499,207 @@ pub const Transformer = struct {
         try self.extra_functions.append(self.allocator, func);
 
         return helper_name;
+    }
+
+    fn ensurePanicHelper(self: *Self, message: []const u8) ![]const u8 {
+        const prefix = "panic:";
+        const key_name = try self.allocator.alloc(u8, prefix.len + message.len);
+        @memcpy(key_name[0..prefix.len], prefix);
+        @memcpy(key_name[prefix.len..], message);
+        if (self.math_helpers.get(key_name)) |helper| {
+            self.allocator.free(key_name);
+            return helper;
+        }
+
+        var hasher = std.hash.Wyhash.init(0);
+        hasher.update(message);
+        const digest = hasher.final();
+        const helper_name = try std.fmt.allocPrint(self.allocator, "__zig2yul$panic_{x}", .{digest});
+        try self.math_helpers.put(key_name, helper_name);
+
+        var stmts: std.ArrayList(ast.Statement) = .empty;
+        defer stmts.deinit(self.allocator);
+
+        const selector_expr = try self.builder.builtinCall("shl", &.{
+            ast.Expression.lit(ast.Literal.number(@as(ast.U256, 224))),
+            ast.Expression.lit(ast.Literal.hexNumber(0x08c379a0)),
+        });
+        const store_selector = try self.builder.builtinCall("mstore", &.{
+            ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0x00))),
+            selector_expr,
+        });
+        try stmts.append(self.allocator, ast.Statement.expr(store_selector));
+
+        const store_offset = try self.builder.builtinCall("mstore", &.{
+            ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0x04))),
+            ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0x20))),
+        });
+        try stmts.append(self.allocator, ast.Statement.expr(store_offset));
+
+        const msg_len = @as(usize, message.len);
+        const store_len = try self.builder.builtinCall("mstore", &.{
+            ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0x24))),
+            ast.Expression.lit(ast.Literal.number(@as(ast.U256, msg_len))),
+        });
+        try stmts.append(self.allocator, ast.Statement.expr(store_len));
+
+        if (message.len > 0) {
+            const padded_len: usize = ((message.len + 31) / 32) * 32;
+            var chunk_index: usize = 0;
+            while (chunk_index * 32 < message.len) : (chunk_index += 1) {
+                const chunk_start = chunk_index * 32;
+                const chunk_end = @min(chunk_start + 32, message.len);
+                const word = packMessageWord(message[chunk_start..chunk_end]);
+                const offset = @as(ast.U256, 0x44 + chunk_index * 32);
+                const store_word = try self.builder.builtinCall("mstore", &.{
+                    ast.Expression.lit(ast.Literal.number(offset)),
+                    ast.Expression.lit(ast.Literal.hexNumber(word)),
+                });
+                try stmts.append(self.allocator, ast.Statement.expr(store_word));
+            }
+
+            _ = padded_len;
+        }
+
+        const total_len: ast.U256 = @as(ast.U256, 4 + 32 + 32 + ((message.len + 31) / 32) * 32);
+        const revert_expr = try self.builder.builtinCall("revert", &.{
+            ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0x00))),
+            ast.Expression.lit(ast.Literal.number(total_len)),
+        });
+        try stmts.append(self.allocator, ast.Statement.expr(revert_expr));
+
+        const body = try self.builder.block(stmts.items);
+        const func = try self.builder.funcDef(helper_name, &.{}, &.{}, body);
+        try self.extra_functions.append(self.allocator, func);
+
+        return helper_name;
+    }
+
+    fn parsePanicMessage(self: *Self, node: ZigAst.Node.Index, loc: ast.SourceLocation) TransformProcessError![]u8 {
+        const p = &self.zig_parser.?;
+        const tag = p.getNodeTag(node);
+        if (tag != .string_literal) {
+            try self.addError("@panic expects string literal", loc, .unsupported_feature);
+            return try self.allocator.alloc(u8, 0);
+        }
+        const src = p.getNodeSource(node);
+        return try self.decodeStringLiteral(src, loc);
+    }
+
+    fn decodeStringLiteral(self: *Self, src: []const u8, loc: ast.SourceLocation) TransformProcessError![]u8 {
+        const start = std.mem.indexOfScalar(u8, src, '"') orelse {
+            try self.addError("invalid @panic string literal", loc, .unsupported_feature);
+            return try self.allocator.alloc(u8, 0);
+        };
+        const end = std.mem.lastIndexOfScalar(u8, src, '"') orelse {
+            try self.addError("invalid @panic string literal", loc, .unsupported_feature);
+            return try self.allocator.alloc(u8, 0);
+        };
+        if (end <= start) {
+            try self.addError("invalid @panic string literal", loc, .unsupported_feature);
+            return try self.allocator.alloc(u8, 0);
+        }
+
+        var out = std.ArrayList(u8).empty;
+        defer out.deinit(self.allocator);
+
+        var i: usize = start + 1;
+        while (i < end) {
+            const ch = src[i];
+            if (ch != '\\') {
+                try out.append(self.allocator, ch);
+                i += 1;
+                continue;
+            }
+            if (i + 1 >= end) {
+                try self.addError("invalid @panic string literal", loc, .unsupported_feature);
+                return try self.allocator.alloc(u8, 0);
+            }
+            const esc = src[i + 1];
+            switch (esc) {
+                'n' => {
+                    try out.append(self.allocator, '\n');
+                    i += 2;
+                },
+                'r' => {
+                    try out.append(self.allocator, '\r');
+                    i += 2;
+                },
+                't' => {
+                    try out.append(self.allocator, '\t');
+                    i += 2;
+                },
+                '\\' => {
+                    try out.append(self.allocator, '\\');
+                    i += 2;
+                },
+                '"' => {
+                    try out.append(self.allocator, '"');
+                    i += 2;
+                },
+                '\'' => {
+                    try out.append(self.allocator, '\'');
+                    i += 2;
+                },
+                'x' => {
+                    if (i + 3 >= end) {
+                        try self.addError("invalid @panic string literal", loc, .unsupported_feature);
+                        return try self.allocator.alloc(u8, 0);
+                    }
+                    const hex = src[i + 2 .. i + 4];
+                    const value = std.fmt.parseInt(u8, hex, 16) catch {
+                        try self.addError("invalid @panic string escape", loc, .unsupported_feature);
+                        return try self.allocator.alloc(u8, 0);
+                    };
+                    try out.append(self.allocator, value);
+                    i += 4;
+                },
+                'u' => {
+                    if (i + 2 >= end or src[i + 2] != '{') {
+                        try self.addError("invalid @panic string escape", loc, .unsupported_feature);
+                        return try self.allocator.alloc(u8, 0);
+                    }
+                    const close = std.mem.indexOfScalarPos(u8, src, i + 3, '}') orelse {
+                        try self.addError("invalid @panic string escape", loc, .unsupported_feature);
+                        return try self.allocator.alloc(u8, 0);
+                    };
+                    if (close >= end) {
+                        try self.addError("invalid @panic string escape", loc, .unsupported_feature);
+                        return try self.allocator.alloc(u8, 0);
+                    }
+                    const hex = src[i + 3 .. close];
+                    const codepoint = std.fmt.parseInt(u21, hex, 16) catch {
+                        try self.addError("invalid @panic string escape", loc, .unsupported_feature);
+                        return try self.allocator.alloc(u8, 0);
+                    };
+                    var buf: [4]u8 = undefined;
+                    const len = std.unicode.utf8Encode(codepoint, &buf) catch {
+                        try self.addError("invalid @panic string escape", loc, .unsupported_feature);
+                        return try self.allocator.alloc(u8, 0);
+                    };
+                    try out.appendSlice(self.allocator, buf[0..len]);
+                    i = close + 1;
+                },
+                else => {
+                    try self.addError("invalid @panic string escape", loc, .unsupported_feature);
+                    return try self.allocator.alloc(u8, 0);
+                },
+            }
+        }
+
+        return try out.toOwnedSlice(self.allocator);
+    }
+
+    fn packMessageWord(bytes: []const u8) ast.U256 {
+        var word: ast.U256 = 0;
+        for (bytes) |b| {
+            word = (word << 8) | @as(ast.U256, b);
+        }
+        if (bytes.len < 32) {
+            const shift_amount = @as(u8, @intCast((32 - bytes.len) * 8));
+            word <<= shift_amount;
+        }
+        return word;
     }
 
     fn ensureRequireHelper(self: *Self, label: []const u8) ![]const u8 {
@@ -10950,6 +11168,33 @@ test "transform inline if expressions" {
 
     try std.testing.expect(std.mem.indexOf(u8, output, "$zig2yul$if_cond") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "if iszero") != null);
+}
+
+test "transform panic" {
+    const allocator = std.testing.allocator;
+    const printer = @import("printer.zig");
+
+    const source =
+        \\pub const Counter = struct {
+        \\    pub fn fail(self: *Counter) void {
+        \\        _ = self;
+        \\        @panic("boom");
+        \\    }
+        \\};
+    ;
+
+    const source_z = try allocator.dupeZ(u8, source);
+    defer allocator.free(source_z);
+
+    var transformer = Transformer.init(allocator);
+    defer transformer.deinit();
+
+    const yul_ast = try transformer.transform(source_z);
+    const output = try printer.format(allocator, yul_ast);
+    defer allocator.free(output);
+
+    try std.testing.expect(std.mem.indexOf(u8, output, "0x8c379a0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "revert(0, 100)") != null);
 }
 
 test "var/const inference errors" {
