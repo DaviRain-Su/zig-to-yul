@@ -5019,6 +5019,30 @@ pub const Transformer = struct {
         const base_tag = p.getNodeTag(base_node);
         const loc = self.nodeLocation(index);
 
+        if (try self.mappingAccessFromArrayAccessChain(index, loc)) |access| {
+            const value_type = access.value_type orelse {
+                try self.addError("mapping value type missing; declare evm.Mapping(key, value)", loc, .unsupported_feature);
+                return ast.Expression.lit(ast.Literal.number(0));
+            };
+            if (self.mappingValueTypeName(value_type) != null) {
+                try self.addError("mapping access requires additional key", loc, .unsupported_feature);
+                return ast.Expression.lit(ast.Literal.number(0));
+            }
+            if (self.isDynamicValueType(value_type)) {
+                const helper = try self.ensureMappingDynamicGetHelper(value_type);
+                return try self.builder.call(helper, &.{access.slot_expr});
+            }
+            if (self.isStructTypeName(value_type)) {
+                try self.addError("mapping value is a struct; access fields", loc, .unsupported_feature);
+                return ast.Expression.lit(ast.Literal.number(0));
+            }
+            const size_bits = storageTypeSizeBits(value_type);
+            if (size_bits < 256) {
+                return try self.genPackedReadDynamic(access.slot_expr, size_bits, 0);
+            }
+            return try self.builder.builtinCall("sload", &.{access.slot_expr});
+        }
+
         if (try self.mappingSlotExprFromArrayAccess(index, loc)) |access| {
             const value_type = access.value_type orelse {
                 try self.addError("mapping value type missing; declare evm.Mapping(key, value)", loc, .unsupported_feature);
@@ -5154,6 +5178,37 @@ pub const Transformer = struct {
         const index_node = data[1];
         const base_tag = p.getNodeTag(base_node);
         const loc = self.nodeLocation(target);
+
+        if (try self.mappingAccessFromArrayAccessChain(target, loc)) |access| {
+            const value_type = access.value_type orelse {
+                try self.addError("mapping value type missing; declare evm.Mapping(key, value)", loc, .unsupported_feature);
+                return null;
+            };
+            if (self.mappingValueTypeName(value_type) != null) {
+                try self.addError("mapping access requires additional key", loc, .unsupported_feature);
+                return null;
+            }
+            const key_ty = access.key_type orelse {
+                try self.addError("mapping key type missing", loc, .unsupported_feature);
+                return null;
+            };
+            const key_expr = access.key_expr orelse {
+                try self.addError("mapping key expression missing", loc, .unsupported_feature);
+                return null;
+            };
+            if (self.isStructTypeName(value_type)) {
+                try self.addError("mapping value is a struct; assign fields", loc, .unsupported_feature);
+                return null;
+            }
+            if (self.isDynamicValueType(value_type)) {
+                const helper = try self.ensureMappingDynamicSetHelper(key_ty, value_type, true);
+                const call_expr = try self.builder.call(helper, &.{ access.slot_expr, access.base_slot_expr, key_expr, value });
+                return ast.Statement.expr(call_expr);
+            }
+            const helper = try self.ensureMappingSetHelper(key_ty, value_type, true, loc);
+            const call_expr = try self.builder.call(helper, &.{ access.slot_expr, access.base_slot_expr, key_expr, value });
+            return ast.Statement.expr(call_expr);
+        }
 
         if (try self.mappingSlotExprFromArrayAccess(target, loc)) |access| {
             const value_type = access.value_type orelse {
@@ -5904,13 +5959,75 @@ pub const Transformer = struct {
             }
         }
 
+        const last_key_expr = key_exprs[key_exprs.len - 1];
         return MappingAccess{
             .slot_expr = slot_expr,
             .base_slot_expr = current_base,
-            .key_expr = null,
+            .key_expr = last_key_expr,
             .key_type = current_key_type,
             .value_type = current_value_type,
         };
+    }
+
+    fn mappingAccessFromArrayAccessChain(self: *Self, node: ZigAst.Node.Index, loc: ast.SourceLocation) TransformProcessError!?MappingAccess {
+        const p = &self.zig_parser.?;
+        if (p.getNodeTag(node) != .array_access) return null;
+
+        var key_nodes: std.ArrayList(ZigAst.Node.Index) = .empty;
+        defer key_nodes.deinit(self.allocator);
+
+        var current = node;
+        while (p.getNodeTag(current) == .array_access) {
+            const data = p.ast.nodeData(current).node_and_node;
+            try key_nodes.append(self.allocator, data[1]);
+            current = data[0];
+        }
+
+        const key_count = key_nodes.items.len;
+        if (key_count == 0) return null;
+
+        if (self.arrayStorageVarForNode(current)) |sv| {
+            const elem_type = sv.array_elem_type orelse return null;
+            const key_ty = self.mappingKeyTypeName(elem_type) orelse return null;
+            const value_ty = self.mappingValueTypeName(elem_type) orelse return null;
+            const array_index_node = key_nodes.items[key_count - 1];
+            const array_index_expr = try self.translateExpression(array_index_node);
+            const base_slot_expr = try self.arrayElementSlotExpr(
+                ast.Expression.lit(ast.Literal.number(sv.slot)),
+                array_index_expr,
+                elem_type,
+            );
+
+            if (key_count == 1) return null;
+
+            var key_exprs: std.ArrayList(ast.Expression) = .empty;
+            defer key_exprs.deinit(self.allocator);
+            var idx: usize = key_count - 1;
+            while (idx > 0) : (idx -= 1) {
+                const key_node = key_nodes.items[idx - 1];
+                try key_exprs.append(self.allocator, try self.translateExpression(key_node));
+            }
+
+            return try self.mappingSlotExprForKeys(base_slot_expr, key_ty, value_ty, key_exprs.items, loc);
+        }
+
+        if (self.mappingStorageVarForNode(current)) |sv| {
+            const key_ty = sv.mapping_key_type orelse return null;
+            const value_ty = sv.mapping_value_type orelse return null;
+
+            var key_exprs: std.ArrayList(ast.Expression) = .empty;
+            defer key_exprs.deinit(self.allocator);
+            var idx: usize = key_count;
+            while (idx > 0) : (idx -= 1) {
+                const key_node = key_nodes.items[idx - 1];
+                try key_exprs.append(self.allocator, try self.translateExpression(key_node));
+            }
+
+            const base_slot_expr = ast.Expression.lit(ast.Literal.number(sv.slot));
+            return try self.mappingSlotExprForKeys(base_slot_expr, key_ty, value_ty, key_exprs.items, loc);
+        }
+
+        return null;
     }
 
     fn mappingSlotExprFromArrayAccess(self: *Self, node: ZigAst.Node.Index, loc: ast.SourceLocation) TransformProcessError!?MappingAccess {
@@ -11303,4 +11420,41 @@ test "transform mapping entry refs" {
     try std.testing.expect(std.mem.indexOf(u8, output, "__zig2yul$map_gopp$") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "__zig2yul$map_remon$") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "__zig2yul$map_remoni$") != null);
+}
+
+test "transform nested mapping array access" {
+    const allocator = std.testing.allocator;
+    const printer = @import("printer.zig");
+    const source =
+        \\pub const Token = struct {
+        \\    nested: evm.Mapping(u256, evm.Mapping(u256, u256)),
+        \\
+        \\    pub fn get(self: *Token, a: u256, b: u256) u256 {
+        \\        return self.nested[a][b];
+        \\    }
+        \\
+        \\    pub fn set(self: *Token, a: u256, b: u256, v: u256) void {
+        \\        self.nested[a][b] = v;
+        \\    }
+        \\};
+    ;
+
+    const source_z = try allocator.dupeZ(u8, source);
+    defer allocator.free(source_z);
+
+    var transformer = Transformer.init(allocator);
+    defer transformer.deinit();
+
+    const yul_ast = transformer.transform(source_z) catch |err| {
+        for (transformer.errors.items) |e| {
+            std.debug.print("Transform error: {s}\n", .{e.message});
+        }
+        return err;
+    };
+    const output = try printer.format(allocator, yul_ast);
+    defer allocator.free(output);
+
+    try std.testing.expect(std.mem.indexOf(u8, output, "__zig2yul$mapping_slot") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "sload") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "sstore") != null);
 }
