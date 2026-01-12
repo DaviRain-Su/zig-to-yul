@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### Session 2026-01-12-001
+
+**Date**: 2026-01-12
+**Goal**: Fix Yul statement return handling and ABI address decoding
+
+#### Completed Work
+1. Wrap statement-level expressions with `pop` when they return a value
+2. Drop multi-value returns in statements via temporary assignments
+3. Mask calldata/struct address decoding to keep low 160 bits
+
+#### Test Results
+- Unit tests: `zig build test --summary all` (fails: `evm.tx.test.anvil tx send (legacy + eip1559)` RPC error)
+
 ### Session 2026-01-10-001
 
 **Date**: 2026-01-10
