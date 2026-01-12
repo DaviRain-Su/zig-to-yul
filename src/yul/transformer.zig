@@ -2593,7 +2593,7 @@ pub const Transformer = struct {
             defer if (message_owned) self.allocator.free(message);
 
             if (arg_nodes.len != 1) {
-                try self.addError("@panic expects one argument", self.nodeLocation(index), .unsupported_feature);
+                try self.addError("@panic expects one argument; use evm.require(...) or explicit if/revert for dynamic errors", self.nodeLocation(index), .unsupported_feature);
                 message = try self.allocator.alloc(u8, 0);
                 message_owned = true;
             } else {
@@ -3579,7 +3579,7 @@ pub const Transformer = struct {
         const p = &self.zig_parser.?;
         const tag = p.getNodeTag(node);
         if (tag != .string_literal) {
-            try self.addError("@panic expects string literal", loc, .unsupported_feature);
+            try self.addError("@panic expects string literal; use evm.require(...) or explicit if/revert for dynamic errors", loc, .unsupported_feature);
             return try self.allocator.alloc(u8, 0);
         }
         const src = p.getNodeSource(node);
@@ -11195,6 +11195,34 @@ test "transform panic" {
 
     try std.testing.expect(std.mem.indexOf(u8, output, "0x8c379a0") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "revert(0, 100)") != null);
+}
+
+test "panic diagnostics hint" {
+    const allocator = std.testing.allocator;
+    const source =
+        \\pub const Counter = struct {
+        \\    pub fn fail(self: *Counter, msg: []const u8) void {
+        \\        _ = self;
+        \\        @panic(msg);
+        \\    }
+        \\};
+    ;
+
+    const source_z = try allocator.dupeZ(u8, source);
+    defer allocator.free(source_z);
+
+    var transformer = Transformer.init(allocator);
+    defer transformer.deinit();
+
+    try std.testing.expectError(error.TransformError, transformer.transform(source_z));
+    const errors = transformer.getErrors();
+    var saw_hint = false;
+    for (errors) |err| {
+        if (std.mem.indexOf(u8, err.message, "use evm.require") != null) {
+            saw_hint = true;
+        }
+    }
+    try std.testing.expect(saw_hint);
 }
 
 test "var/const inference errors" {
