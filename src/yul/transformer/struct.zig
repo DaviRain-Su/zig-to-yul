@@ -426,9 +426,9 @@ pub fn decodeStructFromHead(
             const val = try self.builder.builtinCall("calldataload", &.{head_slot});
             const field_abi = transformer_types.mapZigTypeToAbi(field.type_name);
             const stored = if (std.mem.eql(u8, field_abi, "address"))
-                try self.builder.builtinCall("shr", &.{
-                    ast.Expression.lit(ast.Literal.number(@as(ast.U256, 96))),
+                try self.builder.builtinCall("and", &.{
                     val,
+                    ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0xffffffffffffffffffffffffffffffffffffffff))),
                 })
             else
                 val;

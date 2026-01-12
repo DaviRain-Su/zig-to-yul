@@ -61,9 +61,9 @@ pub fn generateFunctionCase(self: anytype, fi: anytype) !ast.Block {
                         ast.Expression.lit(ast.Literal.number(@as(ast.U256, @intCast(k * 32)))),
                     });
                     const value_expr = if (std.mem.eql(u8, param_abi, "address"))
-                        try self.builder.builtinCall("shr", &.{
-                            ast.Expression.lit(ast.Literal.number(@as(ast.U256, 96))),
+                        try self.builder.builtinCall("and", &.{
                             load_expr,
+                            ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0xffffffffffffffffffffffffffffffffffffffff))),
                         })
                     else
                         load_expr;
@@ -209,9 +209,9 @@ pub fn generateFunctionCase(self: anytype, fi: anytype) !ast.Block {
                 ast.Expression.lit(ast.Literal.number(offset)),
             });
             const value_expr = if (std.mem.eql(u8, abi_type, "address"))
-                try self.builder.builtinCall("shr", &.{
-                    ast.Expression.lit(ast.Literal.number(@as(ast.U256, 96))),
+                try self.builder.builtinCall("and", &.{
                     load_call,
+                    ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0xffffffffffffffffffffffffffffffffffffffff))),
                 })
             else
                 load_call;

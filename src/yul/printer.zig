@@ -6,6 +6,7 @@
 const std = @import("std");
 const ast = @import("ast.zig");
 const source_map = @import("source_map.zig");
+const builtins = @import("../evm/builtins.zig");
 
 pub const Printer = struct {
     output: std.ArrayList(u8),
@@ -15,6 +16,7 @@ pub const Printer = struct {
     source_map: ?*source_map.Builder = null,
     trace_locations: bool = false,
     trace_source: ?[]const u8 = null,
+    function_returns: std.StringHashMap(u8),
 
     const Self = @This();
     const Error = std.mem.Allocator.Error || error{NoSpaceLeft};
@@ -23,6 +25,7 @@ pub const Printer = struct {
         return .{
             .output = .empty,
             .allocator = allocator,
+            .function_returns = std.StringHashMap(u8).init(allocator),
         };
     }
 
@@ -31,6 +34,7 @@ pub const Printer = struct {
             .output = .empty,
             .allocator = allocator,
             .source_map = map_builder,
+            .function_returns = std.StringHashMap(u8).init(allocator),
         };
     }
 
@@ -40,11 +44,13 @@ pub const Printer = struct {
     }
 
     pub fn deinit(self: *Self) void {
+        self.function_returns.deinit();
         self.output.deinit(self.allocator);
     }
 
     /// Print an AST and return the formatted string
     pub fn print(self: *Self, root: ast.AST) ![]const u8 {
+        try self.indexFunctionReturns(root.root);
         try self.printObject(root.root);
         return self.output.toOwnedSlice(self.allocator);
     }
@@ -125,7 +131,7 @@ pub const Printer = struct {
         }
         try self.recordStatement(stmt);
         switch (stmt) {
-            .expression_statement => |s| try self.printExpression(s.expression),
+            .expression_statement => |s| try self.printExpressionStatement(s),
             .variable_declaration => |s| try self.printVariableDeclaration(s),
             .assignment => |s| try self.printAssignment(s),
             .block => |s| try self.printBlock(s),
@@ -221,6 +227,26 @@ pub const Printer = struct {
         try self.printBlock(func.body);
     }
 
+    fn printExpressionStatement(self: *Self, stmt: ast.ExpressionStatement) Error!void {
+        const return_count = self.expressionReturnCount(stmt.expression);
+        if (return_count == 0) {
+            return self.printExpression(stmt.expression);
+        }
+        if (return_count == 1) {
+            try self.write("pop(");
+            try self.printExpression(stmt.expression);
+            return self.write(")");
+        }
+
+        try self.write("let ");
+        for (0..return_count) |i| {
+            if (i > 0) try self.write(", ");
+            try self.writeFmt("_drop{d}", .{i});
+        }
+        try self.write(" := ");
+        try self.printExpression(stmt.expression);
+    }
+
     fn printExpression(self: *Self, expr: ast.Expression) Error!void {
         switch (expr) {
             .literal => |l| try self.printLiteral(l),
@@ -238,6 +264,60 @@ pub const Printer = struct {
             try self.printExpression(arg);
         }
         try self.write(")");
+    }
+
+    fn expressionReturnCount(self: *Self, expr: ast.Expression) u8 {
+        switch (expr) {
+            .literal, .identifier => return 1,
+            .builtin_call => |call| {
+                if (builtins.getBuiltin(call.builtin_name.name)) |builtin| {
+                    return builtin.outputs;
+                }
+                return 0;
+            },
+            .function_call => |call| {
+                if (self.function_returns.get(call.function_name)) |count| {
+                    return count;
+                }
+                return 0;
+            },
+        }
+    }
+
+    fn indexFunctionReturns(self: *Self, obj: ast.Object) Error!void {
+        try self.indexBlockReturns(obj.code);
+        for (obj.sub_objects) |sub| {
+            try self.indexFunctionReturns(sub);
+        }
+    }
+
+    fn indexBlockReturns(self: *Self, blk: ast.Block) Error!void {
+        for (blk.statements) |stmt| {
+            try self.indexStatementReturns(stmt);
+        }
+    }
+
+    fn indexStatementReturns(self: *Self, stmt: ast.Statement) Error!void {
+        switch (stmt) {
+            .function_definition => |func| {
+                const count: u8 = @intCast(func.return_variables.len);
+                _ = try self.function_returns.put(func.name, count);
+                try self.indexBlockReturns(func.body);
+            },
+            .block => |blk| try self.indexBlockReturns(blk),
+            .if_statement => |if_stmt| try self.indexBlockReturns(if_stmt.body),
+            .switch_statement => |switch_stmt| {
+                for (switch_stmt.cases) |case| {
+                    try self.indexBlockReturns(case.body);
+                }
+            },
+            .for_loop => |loop| {
+                try self.indexBlockReturns(loop.pre);
+                try self.indexBlockReturns(loop.post);
+                try self.indexBlockReturns(loop.body);
+            },
+            else => {},
+        }
     }
 
     fn printLiteral(self: *Self, lit: ast.Literal) Error!void {
