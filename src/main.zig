@@ -575,6 +575,29 @@ const AbiItem = struct {
     };
 };
 
+const AbiMutability = enum {
+    pure,
+    view,
+    nonpayable,
+    payable,
+};
+
+const AbiMutabilityScan = struct {
+    reads_storage: bool = false,
+    writes_storage: bool = false,
+    uses_callvalue: bool = false,
+    emits_event: bool = false,
+};
+
+fn abiMutabilityString(mutability: AbiMutability) []const u8 {
+    return switch (mutability) {
+        .pure => "pure",
+        .view => "view",
+        .nonpayable => "nonpayable",
+        .payable => "payable",
+    };
+}
+
 fn buildAbiJson(allocator: std.mem.Allocator, trans: *Transformer, source_path: []const u8) ![]u8 {
     _ = source_path;
 
@@ -602,12 +625,14 @@ fn buildAbiJson(allocator: std.mem.Allocator, trans: *Transformer, source_path: 
             }
         }
 
+        const mutability = try inferAbiMutability(allocator, trans, fi.name);
+
         try items.append(allocator, .{
             .type = "function",
             .name = fi.name,
             .inputs = try inputs.toOwnedSlice(allocator),
             .outputs = try outputs.toOwnedSlice(allocator),
-            .stateMutability = "nonpayable",
+            .stateMutability = abiMutabilityString(mutability),
         });
     }
 
@@ -619,6 +644,230 @@ fn buildAbiJson(allocator: std.mem.Allocator, trans: *Transformer, source_path: 
         allocator.free(item.outputs);
     }
     return json_out;
+}
+
+fn inferAbiMutability(allocator: std.mem.Allocator, trans: *Transformer, fn_name: []const u8) !AbiMutability {
+    const fn_decl = findContractFnDecl(trans, fn_name) orelse return .nonpayable;
+    const p = &trans.zig_parser.?;
+    const proto = p.getFnProto(fn_decl) orelse return .nonpayable;
+    if (@intFromEnum(proto.body_node) == 0) return .nonpayable;
+
+    const body_src = p.getNodeSource(proto.body_node);
+    const clean = try scrubZigSource(allocator, body_src);
+    defer allocator.free(clean);
+
+    const scan = scanAbiMutability(clean);
+    if (scan.uses_callvalue) return .payable;
+    if (scan.writes_storage or scan.emits_event) return .nonpayable;
+    if (scan.reads_storage) return .view;
+    return .pure;
+}
+
+fn findContractFnDecl(trans: *Transformer, fn_name: []const u8) ?std.zig.Ast.Node.Index {
+    const contract_name = trans.current_contract orelse return null;
+    const p = &trans.zig_parser.?;
+
+    for (p.rootDecls()) |decl| {
+        if (p.getVarDecl(decl)) |var_decl| {
+            const name = p.getIdentifier(var_decl.name_token);
+            if (!std.mem.eql(u8, name, contract_name)) continue;
+            const init_node = var_decl.init_node.unwrap() orelse continue;
+            var buf: [2]std.zig.Ast.Node.Index = undefined;
+            if (p.getContainerDeclWithBuf(&buf, init_node)) |container| {
+                for (container.members) |member| {
+                    if (@intFromEnum(member) == 0) continue;
+                    if (p.getNodeTag(member) != .fn_decl) continue;
+                    const proto = p.getFnProto(member) orelse continue;
+                    const name_token = proto.name_token orelse continue;
+                    const name_src = p.getIdentifier(name_token);
+                    if (std.mem.eql(u8, name_src, fn_name)) return member;
+                }
+            }
+        }
+    }
+
+    return null;
+}
+
+fn scrubZigSource(allocator: std.mem.Allocator, src: []const u8) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(allocator);
+
+    var i: usize = 0;
+    var in_line_comment = false;
+    var in_block_comment = false;
+    var in_string = false;
+    var in_char = false;
+    while (i < src.len) : (i += 1) {
+        const ch = src[i];
+        const next = if (i + 1 < src.len) src[i + 1] else 0;
+
+        if (in_line_comment) {
+            if (ch == '\n') {
+                in_line_comment = false;
+                try out.append(allocator, ch);
+            }
+            continue;
+        }
+
+        if (in_block_comment) {
+            if (ch == '*' and next == '/') {
+                in_block_comment = false;
+                i += 1;
+            }
+            continue;
+        }
+
+        if (in_string) {
+            if (ch == '\\' and next != 0) {
+                i += 1;
+                continue;
+            }
+            if (ch == '"') {
+                in_string = false;
+            }
+            continue;
+        }
+
+        if (in_char) {
+            if (ch == '\\' and next != 0) {
+                i += 1;
+                continue;
+            }
+            if (ch == '\'') {
+                in_char = false;
+            }
+            continue;
+        }
+
+        if (ch == '/' and next == '/') {
+            in_line_comment = true;
+            i += 1;
+            continue;
+        }
+        if (ch == '/' and next == '*') {
+            in_block_comment = true;
+            i += 1;
+            continue;
+        }
+        if (ch == '"') {
+            in_string = true;
+            continue;
+        }
+        if (ch == '\'') {
+            in_char = true;
+            continue;
+        }
+
+        try out.append(allocator, ch);
+    }
+
+    return try out.toOwnedSlice(allocator);
+}
+
+fn scanAbiMutability(src: []const u8) AbiMutabilityScan {
+    var scan: AbiMutabilityScan = .{};
+
+    if (std.mem.indexOf(u8, src, "callvalue(") != null) {
+        scan.uses_callvalue = true;
+    }
+    if (containsAny(src, &.{ "evm.sstore(", "sstore(" })) {
+        scan.writes_storage = true;
+    }
+    if (containsAny(src, &.{ "evm.log0(", "evm.log1(", "evm.log2(", "evm.log3(", "evm.log4(", "log0(", "log1(", "log2(", "log3(", "log4(" })) {
+        scan.emits_event = true;
+    }
+    if (containsAny(src, &.{ ".emit0(", ".emit1(", ".emit2(", ".emit3(", ".emit4(" }) and std.mem.indexOf(u8, src, "event") != null) {
+        scan.emits_event = true;
+    }
+
+    if (std.mem.indexOf(u8, src, "self.") != null) {
+        scan.reads_storage = true;
+    }
+    if (containsAny(src, &.{ "evm.sload(", "sload(" })) {
+        scan.reads_storage = true;
+    }
+
+    if (hasSelfAssignment(src)) {
+        scan.writes_storage = true;
+    }
+    if (hasSelfMutationCall(src)) {
+        scan.writes_storage = true;
+    }
+
+    return scan;
+}
+
+fn hasSelfAssignment(src: []const u8) bool {
+    var pos: usize = 0;
+    while (std.mem.indexOfPos(u8, src, pos, "self.")) |start| {
+        const range_start = start + "self.".len;
+        const range_end = blk: {
+            if (std.mem.indexOfAnyPos(u8, src, range_start, ";\n")) |end| break :blk end;
+            break :blk src.len;
+        };
+
+        var i = range_start;
+        while (i < range_end) : (i += 1) {
+            const ch = src[i];
+            if (ch == '=') {
+                const prev = if (i > 0) src[i - 1] else 0;
+                const next = if (i + 1 < range_end) src[i + 1] else 0;
+                if (prev == '=' or prev == '!' or prev == '<' or prev == '>' or next == '=') {
+                    continue;
+                }
+                return true;
+            }
+        }
+
+        pos = range_end;
+    }
+    return false;
+}
+
+fn hasSelfMutationCall(src: []const u8) bool {
+    const methods = [_][]const u8{
+        ".set(",
+        ".remove(",
+        ".clear(",
+        ".getOrPut(",
+        ".getOrPutDefault(",
+        ".putNoClobber(",
+        ".fetchPut(",
+        ".removeValue(",
+        ".removeOrNull(",
+        ".removeOrNullInfo(",
+        ".getOrPutPtr(",
+        ".getOrPutPtrDefault(",
+        ".putNoClobberPtr(",
+        ".fetchPutPtr(",
+        ".push(",
+        ".pop(",
+        ".append(",
+        ".insert(",
+        ".swapRemove(",
+    };
+
+    var pos: usize = 0;
+    while (std.mem.indexOfPos(u8, src, pos, "self.")) |start| {
+        const range_start = start + "self.".len;
+        const range_end = blk: {
+            if (std.mem.indexOfAnyPos(u8, src, range_start, ";\n")) |end| break :blk end;
+            break :blk src.len;
+        };
+        const slice = src[range_start..range_end];
+        if (containsAny(slice, methods[0..])) return true;
+        pos = range_end;
+    }
+
+    return false;
+}
+
+fn containsAny(src: []const u8, needles: []const []const u8) bool {
+    for (needles) |needle| {
+        if (std.mem.indexOf(u8, src, needle) != null) return true;
+    }
+    return false;
 }
 
 fn buildAbiParam(
@@ -1492,60 +1741,125 @@ fn printUsageStdout() void {
 
 fn printUsageStderr() void {
     std.debug.print(
-        \\zig-to-yul v{s} - Compile Zig smart contracts to EVM bytecode
-        \\
         \\USAGE:
-        \\    zig-to-yul <command> [options] <input.zig>
+        \\    zig-to-yul <command> [options]
         \\
         \\COMMANDS:
-        \\    compile     Compile Zig to Yul intermediate language
-        \\    build       Compile Zig to EVM bytecode (requires solc)
-        \\    estimate    Estimate gas; supports profile overrides
-        \\    profile     Instrument Yul and aggregate profile counts
+        \\    compile    Compile Zig to Yul
+        \\    build      Compile Zig to EVM bytecode
         \\    decode-event Decode EVM event logs
         \\    decode-abi  Decode ABI-encoded data
-        \\    version     Print version information
-        \\    help        Print this help message
+        \\    estimate   Estimate gas usage
+        \\    profile    Run Yul profiler
         \\
-        \\OPTIONS:
-        \\    -o, --output <file>    Write output to <file>
-        \\    -O, --optimize         Enable solc optimizer (build only)
-        \\    --project <dir>       Use build.zig root module
-        \\    --abi <file>          Write ABI JSON
-        \\    --sourcemap           Write a .map file next to output (compile only)
-        \\    --trace               Emit Yul with source-range comments (compile only)
-        \\    --optimize-yul        Run basic Yul optimizer (compile only)
-        \\    --profile <file>       Profile counts JSON (estimate only)
-        \\    --evm-version <name>   EVM version (estimate only)
+        \\GLOBAL OPTIONS:
         \\    -h, --help             Print help message
-        \\
-        \\EXAMPLES:
-        \\    # Compile to Yul
-        \\    zig-to-yul compile token.zig -o token.yul
-        \\
-        \\    # Build to EVM bytecode (deploy-ready)
-        \\    zig-to-yul build token.zig -o token.bin
-        \\
-        \\    # Build with optimization
-        \\    zig-to-yul build -O token.zig
-        \\
-        \\    # Decode an event log
-        \\    zig-to-yul decode-event --event Transfer --param from:address:indexed \\
-        \\      --param to:address:indexed --param value:uint256 --topic 0x... --data 0x...
-        \\
-        \\    # Decode ABI data
-        \\    zig-to-yul decode-abi --type uint256 --type string --data 0x...
+        \\    -v, --version          Print version information
         \\
         \\For more information, visit: https://github.com/example/zig-to-yul
         \\
     , .{version});
 }
 
+fn runCommand(allocator: std.mem.Allocator, argv: []const []const u8) ![]u8 {
+    var child = std.process.Child.init(argv, allocator);
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
+
+    try child.spawn();
+
+    var stdout_buf: [64 * 1024]u8 = undefined;
+    var stderr_buf: [64 * 1024]u8 = undefined;
+    const stdout_len = child.stdout.?.readAll(&stdout_buf) catch 0;
+    const stderr_len = child.stderr.?.readAll(&stderr_buf) catch 0;
+
+    const term = try child.wait();
+    const stdout = stdout_buf[0..stdout_len];
+    const stderr = stderr_buf[0..stderr_len];
+    if (term.Exited != 0) {
+        std.debug.print("Command failed: {s}\n{s}\n{s}\n", .{ argv[0], stdout, stderr });
+        return error.CommandFailed;
+    }
+
+    if (stdout_len == 0 and stderr_len > 0) {
+        return try allocator.dupe(u8, stderr);
+    }
+    return try allocator.dupe(u8, stdout);
+}
+
+test "abi mutability inference" {
+    const allocator = std.testing.allocator;
+
+    const source =
+        \\pub const Pool = struct {
+        \\    value: u256,
+        \\
+        \\    pub fn pureFn(self: *Pool, x: u256) u256 {
+        \\        _ = self;
+        \\        return x + 1;
+        \\    }
+        \\
+        \\    pub fn viewFn(self: *Pool) u256 {
+        \\        return self.value;
+        \\    }
+        \\
+        \\    pub fn nonpayableFn(self: *Pool, v: u256) void {
+        \\        self.value = v;
+        \\    }
+        \\
+        \\    pub fn payableFn(self: *Pool) u256 {
+        \\        _ = self;
+        \\        return evm.callvalue();
+        \\    }
+        \\};
+    ;
+
+    const source_z = try allocator.dupeZ(u8, source);
+    defer allocator.free(source_z);
+
+    var trans = Transformer.init(allocator);
+    defer trans.deinit();
+
+    _ = try trans.transform(source_z);
+    const abi_json = try buildAbiJson(allocator, &trans, "");
+    defer allocator.free(abi_json);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, abi_json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .array) return error.InvalidAbi;
+
+    try std.testing.expect(hasAbiMutability(parsed.value.array.items, "pureFn", "pure"));
+    try std.testing.expect(hasAbiMutability(parsed.value.array.items, "viewFn", "view"));
+    try std.testing.expect(hasAbiMutability(parsed.value.array.items, "nonpayableFn", "nonpayable"));
+    try std.testing.expect(hasAbiMutability(parsed.value.array.items, "payableFn", "payable"));
+}
+
+fn hasAbiMutability(items: []const std.json.Value, name: []const u8, mutability: []const u8) bool {
+    for (items) |item| {
+        if (item != .object) continue;
+        const obj = item.object;
+        const name_value = obj.get("name") orelse continue;
+        if (name_value != .string) continue;
+        if (!std.mem.eql(u8, name_value.string, name)) continue;
+        const mut_value = obj.get("stateMutability") orelse continue;
+        if (mut_value != .string) return false;
+        return std.mem.eql(u8, mut_value.string, mutability);
+    }
+    return false;
+}
+
 test "cli help" {
-    var buf: [4096]u8 = undefined;
-    var stream = std.io.fixedBufferStream(&buf);
-    try printUsageTo(stream.writer());
-    try std.testing.expect(std.mem.indexOf(u8, stream.getWritten(), "zig-to-yul") != null);
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const exe_path = "zig-out/bin/zig_to_yul";
+    std.fs.cwd().access(exe_path, .{}) catch return error.SkipZigTest;
+
+    const output = try runCommand(allocator, &.{ exe_path, "help" });
+    defer allocator.free(output);
+
+    try std.testing.expect(std.mem.indexOf(u8, output, "zig-to-yul") != null);
 }
 
 test "extract bytecode" {

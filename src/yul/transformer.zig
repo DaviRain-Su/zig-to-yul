@@ -1225,6 +1225,154 @@ pub const Transformer = struct {
         return transformer_statement.processStatement(self, index, stmts);
     }
 
+    const InlineIfAssignMode = enum {
+        normal,
+        return_value,
+    };
+
+    fn isInlineIfExprTag(self: *Self, tag: ZigAst.Node.Tag) bool {
+        _ = self;
+        return tag == .@"if" or tag == .if_simple;
+    }
+
+    fn translateReturnValue(self: *Self, node: ZigAst.Node.Index) TransformProcessError!ast.Expression {
+        const p = &self.zig_parser.?;
+        const tag = p.getNodeTag(node);
+        if (self.current_return_struct != null and (self.isStructInitTag(tag) or self.isArrayInitTag(tag))) {
+            return try self.translateStructInitWithType(node, self.current_return_struct.?);
+        }
+        return try self.translateExpression(node);
+    }
+
+    fn translateInlineIfValue(self: *Self, node: ZigAst.Node.Index, mode: InlineIfAssignMode) TransformProcessError!ast.Expression {
+        return switch (mode) {
+            .normal => try self.translateExpression(node),
+            .return_value => try self.translateReturnValue(node),
+        };
+    }
+
+    fn inlineIfStructType(self: *Self, if_node: ZigAst.Node.Index) TransformProcessError!?[]const u8 {
+        const p = &self.zig_parser.?;
+        const if_info = p.ast.fullIf(if_node) orelse return null;
+        const else_node = if_info.ast.else_expr.unwrap() orelse return null;
+        const then_tag = p.getNodeTag(if_info.ast.then_expr);
+        const else_tag = p.getNodeTag(else_node);
+        if (!self.isStructInitTag(then_tag) or !self.isStructInitTag(else_tag)) return null;
+        const then_type = try self.structInitTypeName(if_info.ast.then_expr) orelse return null;
+        const else_type = try self.structInitTypeName(else_node) orelse return null;
+        if (std.mem.eql(u8, then_type, else_type)) return then_type;
+        return null;
+    }
+
+    fn emitInlineIfAssignName(
+        self: *Self,
+        index: ZigAst.Node.Index,
+        target_name: []const u8,
+        if_node: ZigAst.Node.Index,
+        mode: InlineIfAssignMode,
+        stmts: *std.ArrayList(ast.Statement),
+    ) TransformProcessError!void {
+        const p = &self.zig_parser.?;
+        const if_info = p.ast.fullIf(if_node) orelse return;
+        const else_node = if_info.ast.else_expr.unwrap() orelse {
+            try self.addError("inline if expression requires else branch", self.nodeLocation(if_node), .unsupported_feature);
+            return;
+        };
+        const cond_expr = try self.translateExpression(if_info.ast.cond_expr);
+
+        const cond_name = try self.makeTemp("if_cond");
+        const cond_decl = try self.builder.varDecl(&.{cond_name}, cond_expr);
+        try stmts.append(self.allocator, self.stmtWithLocation(cond_decl, self.nodeLocation(if_node)));
+        const cond_id = ast.Expression.id(cond_name);
+
+        try self.emitInlineIfAssignNameBody(index, target_name, if_info.ast.then_expr, cond_id, mode, stmts);
+        const negated = try self.builder.builtinCall("iszero", &.{cond_id});
+        try self.emitInlineIfAssignNameBody(index, target_name, else_node, negated, mode, stmts);
+    }
+
+    fn emitInlineIfAssignNameBody(
+        self: *Self,
+        index: ZigAst.Node.Index,
+        target_name: []const u8,
+        value_node: ZigAst.Node.Index,
+        cond_expr: ast.Expression,
+        mode: InlineIfAssignMode,
+        stmts: *std.ArrayList(ast.Statement),
+    ) TransformProcessError!void {
+        const p = &self.zig_parser.?;
+        var body_stmts: std.ArrayList(ast.Statement) = .empty;
+        defer body_stmts.deinit(self.allocator);
+
+        const value_tag = p.getNodeTag(value_node);
+        if (self.isInlineIfExprTag(value_tag)) {
+            try self.emitInlineIfAssignName(index, target_name, value_node, mode, &body_stmts);
+        } else {
+            const value = try self.translateInlineIfValue(value_node, mode);
+            const assign = try self.builder.assign(&.{target_name}, value);
+            try body_stmts.append(self.allocator, self.stmtWithLocation(assign, self.nodeLocation(value_node)));
+        }
+
+        if (body_stmts.items.len == 0) return;
+        var block = try self.builder.block(body_stmts.items);
+        block = self.blockWithLocation(block, self.nodeLocation(value_node));
+        const if_stmt = self.builder.ifStmt(cond_expr, block);
+        try stmts.append(self.allocator, self.stmtWithLocation(if_stmt, self.nodeLocation(index)));
+    }
+
+    fn emitInlineIfAssign(
+        self: *Self,
+        index: ZigAst.Node.Index,
+        target_node: ZigAst.Node.Index,
+        target_tag: ZigAst.Node.Tag,
+        if_node: ZigAst.Node.Index,
+        stmts: *std.ArrayList(ast.Statement),
+    ) TransformProcessError!void {
+        const p = &self.zig_parser.?;
+        const if_info = p.ast.fullIf(if_node) orelse return;
+        const else_node = if_info.ast.else_expr.unwrap() orelse {
+            try self.addError("inline if expression requires else branch", self.nodeLocation(if_node), .unsupported_feature);
+            return;
+        };
+        const cond_expr = try self.translateExpression(if_info.ast.cond_expr);
+
+        const cond_name = try self.makeTemp("if_cond");
+        const cond_decl = try self.builder.varDecl(&.{cond_name}, cond_expr);
+        try stmts.append(self.allocator, self.stmtWithLocation(cond_decl, self.nodeLocation(if_node)));
+        const cond_id = ast.Expression.id(cond_name);
+
+        try self.emitInlineIfAssignBody(index, target_node, target_tag, if_info.ast.then_expr, cond_id, stmts);
+        const negated = try self.builder.builtinCall("iszero", &.{cond_id});
+        try self.emitInlineIfAssignBody(index, target_node, target_tag, else_node, negated, stmts);
+    }
+
+    fn emitInlineIfAssignBody(
+        self: *Self,
+        index: ZigAst.Node.Index,
+        target_node: ZigAst.Node.Index,
+        target_tag: ZigAst.Node.Tag,
+        value_node: ZigAst.Node.Index,
+        cond_expr: ast.Expression,
+        stmts: *std.ArrayList(ast.Statement),
+    ) TransformProcessError!void {
+        const p = &self.zig_parser.?;
+        var body_stmts: std.ArrayList(ast.Statement) = .empty;
+        defer body_stmts.deinit(self.allocator);
+
+        const value_tag = p.getNodeTag(value_node);
+        if (self.isInlineIfExprTag(value_tag)) {
+            try self.emitInlineIfAssign(index, target_node, target_tag, value_node, &body_stmts);
+        } else {
+            const value = try self.translateExpression(value_node);
+            try self.assignValueToTarget(index, target_node, target_tag, value_node, value_tag, value, &body_stmts);
+        }
+
+        if (body_stmts.items.len == 0) return;
+        var block = try self.builder.block(body_stmts.items);
+        block = self.blockWithLocation(block, self.nodeLocation(value_node));
+        const if_stmt = self.builder.ifStmt(cond_expr, block);
+        try stmts.append(self.allocator, self.stmtWithLocation(if_stmt, self.nodeLocation(index)));
+    }
+
     pub fn processLocalVarDecl(self: *Self, index: ZigAst.Node.Index, stmts: *std.ArrayList(ast.Statement)) TransformProcessError!void {
         const p = &self.zig_parser.?;
 
@@ -1249,6 +1397,17 @@ pub const Transformer = struct {
             var value: ?ast.Expression = null;
             if (var_decl.init_node.unwrap()) |init_idx| {
                 const init_tag = p.getNodeTag(init_idx);
+                if (self.isInlineIfExprTag(init_tag)) {
+                    if (type_override == null) {
+                        if (try self.inlineIfStructType(init_idx)) |type_name| {
+                            try self.setLocalStructVar(name, type_name);
+                        }
+                    }
+                    const decl = try self.builder.varDecl(&.{name}, ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0))));
+                    try stmts.append(self.allocator, self.stmtWithLocation(decl, self.nodeLocation(index)));
+                    try self.emitInlineIfAssignName(index, name, init_idx, .normal, stmts);
+                    return;
+                }
                 if (type_override == null and init_tag == .identifier) {
                     const init_name = p.getNodeSource(init_idx);
                     if (std.mem.eql(u8, init_name, "undefined")) {
@@ -1298,16 +1457,17 @@ pub const Transformer = struct {
         }
     }
 
-    pub fn processAssign(self: *Self, index: ZigAst.Node.Index, stmts: *std.ArrayList(ast.Statement)) TransformProcessError!void {
+    fn assignValueToTarget(
+        self: *Self,
+        index: ZigAst.Node.Index,
+        target_node: ZigAst.Node.Index,
+        target_tag: ZigAst.Node.Tag,
+        value_node: ZigAst.Node.Index,
+        value_tag: ZigAst.Node.Tag,
+        value: ast.Expression,
+        stmts: *std.ArrayList(ast.Statement),
+    ) TransformProcessError!void {
         const p = &self.zig_parser.?;
-        const data = p.ast.nodeData(index);
-        const nodes = data.node_and_node;
-
-        const target_node = nodes[0];
-        const target_tag = p.getNodeTag(target_node);
-        const value_node = nodes[1];
-        const value_tag = p.getNodeTag(value_node);
-        const value = try self.translateExpression(value_node);
 
         if (target_tag == .identifier and self.isStructInitTag(value_tag)) {
             const target_name = p.getNodeSource(target_node);
@@ -1440,6 +1600,25 @@ pub const Transformer = struct {
         }
         const stmt = try self.builder.assign(&.{target_name}, value);
         try stmts.append(self.allocator, self.stmtWithLocation(stmt, self.nodeLocation(index)));
+    }
+
+    pub fn processAssign(self: *Self, index: ZigAst.Node.Index, stmts: *std.ArrayList(ast.Statement)) TransformProcessError!void {
+        const p = &self.zig_parser.?;
+        const data = p.ast.nodeData(index);
+        const nodes = data.node_and_node;
+
+        const target_node = nodes[0];
+        const target_tag = p.getNodeTag(target_node);
+        const value_node = nodes[1];
+        const value_tag = p.getNodeTag(value_node);
+
+        if (self.isInlineIfExprTag(value_tag)) {
+            try self.emitInlineIfAssign(index, target_node, target_tag, value_node, stmts);
+            return;
+        }
+
+        const value = try self.translateExpression(value_node);
+        try self.assignValueToTarget(index, target_node, target_tag, value_node, value_tag, value, stmts);
     }
 
     fn processAssignBinary(self: *Self, index: ZigAst.Node.Index, stmts: *std.ArrayList(ast.Statement), op: []const u8) TransformProcessError!void {
@@ -1612,12 +1791,13 @@ pub const Transformer = struct {
 
         if (opt_node.unwrap()) |ret_node| {
             const tag = p.getNodeTag(ret_node);
-            const value = if (self.current_return_struct != null and (self.isStructInitTag(tag) or self.isArrayInitTag(tag)))
-                try self.translateStructInitWithType(ret_node, self.current_return_struct.?)
-            else
-                try self.translateExpression(ret_node);
-            const assign = try self.builder.assign(&.{"result"}, value);
-            try stmts.append(self.allocator, self.stmtWithLocation(assign, self.nodeLocation(index)));
+            if (self.isInlineIfExprTag(tag)) {
+                try self.emitInlineIfAssignName(index, "result", ret_node, .return_value, stmts);
+            } else {
+                const value = try self.translateReturnValue(ret_node);
+                const assign = try self.builder.assign(&.{"result"}, value);
+                try stmts.append(self.allocator, self.stmtWithLocation(assign, self.nodeLocation(index)));
+            }
         }
         try stmts.append(self.allocator, self.stmtWithLocation(ast.Statement.leaveStmt(), self.nodeLocation(index)));
     }
@@ -10739,6 +10919,37 @@ test "transform expression coverage" {
     try std.testing.expect(std.mem.indexOf(u8, output, "mload") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "pairs") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "__zig2yul$precompile$precompile_sha256") != null);
+}
+
+test "transform inline if expressions" {
+    const allocator = std.testing.allocator;
+    const printer = @import("printer.zig");
+
+    const source =
+        \\pub const Counter = struct {
+        \\    value: u256,
+        \\
+        \\    pub fn compute(self: *Counter, flag: bool) u256 {
+        \\        var x = if (flag) 1 else 2;
+        \\        self.value = if (flag) x else 3;
+        \\        const y = if (flag) x + 1 else x + 2;
+        \\        return if (flag) y else x;
+        \\    }
+        \\};
+    ;
+
+    const source_z = try allocator.dupeZ(u8, source);
+    defer allocator.free(source_z);
+
+    var transformer = Transformer.init(allocator);
+    defer transformer.deinit();
+
+    const yul_ast = try transformer.transform(source_z);
+    const output = try printer.format(allocator, yul_ast);
+    defer allocator.free(output);
+
+    try std.testing.expect(std.mem.indexOf(u8, output, "$zig2yul$if_cond") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "if iszero") != null);
 }
 
 test "var/const inference errors" {
