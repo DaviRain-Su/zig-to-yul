@@ -14,10 +14,28 @@ pub const evm = struct {
     pub const contract = @import("evm/contract.zig");
     pub const tx = @import("evm/tx.zig");
 
+    // EVM bytecode generation modules (direct compilation without solc)
+    pub const opcodes = @import("evm/opcodes.zig");
+    pub const ir = @import("evm/ir.zig");
+    pub const codegen = @import("evm/codegen.zig");
+    pub const stack = @import("evm/stack.zig");
+    pub const from_yul = @import("evm/from_yul.zig");
+    pub const bytecode_compiler = @import("evm/bytecode_compiler.zig");
+
     pub const event = struct {
         pub const encode = event_encode;
         pub const decode = event_decode;
     };
+
+    // Bytecode generation types
+    pub const Opcode = opcodes.Opcode;
+    pub const EvmVersion = opcodes.EvmVersion;
+    pub const Instruction = ir.Instruction;
+    pub const Label = ir.Label;
+    pub const Builder = ir.Builder;
+    pub const Codegen = codegen.Codegen;
+    pub const StackTracker = stack.StackTracker;
+    pub const BytecodeCompiler = bytecode_compiler.BytecodeCompiler;
 
     pub const U256 = types.U256;
     pub const Address = types.Address;
@@ -85,4 +103,12 @@ test {
     std.testing.refAllDecls(evm.abi);
     std.testing.refAllDecls(evm.precompile);
     std.testing.refAllDecls(evm.rpc);
+
+    // EVM bytecode generation modules
+    std.testing.refAllDecls(evm.opcodes);
+    std.testing.refAllDecls(evm.ir);
+    std.testing.refAllDecls(evm.codegen);
+    std.testing.refAllDecls(evm.stack);
+    std.testing.refAllDecls(evm.from_yul);
+    std.testing.refAllDecls(evm.bytecode_compiler);
 }

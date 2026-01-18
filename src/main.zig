@@ -10,6 +10,7 @@ const gas_estimator = @import("yul/gas_estimator.zig");
 const profile = @import("profile.zig");
 const yul_ast = @import("yul/ast.zig");
 const profile_instrumenter = @import("yul/profile_instrumenter.zig");
+const bytecode_compiler = @import("evm/bytecode_compiler.zig");
 
 const version = "0.1.0";
 
@@ -40,6 +41,8 @@ pub fn main() !void {
         try runEstimate(allocator, args[2..]);
     } else if (std.mem.eql(u8, command, "profile")) {
         try runProfile(allocator, args[2..]);
+    } else if (std.mem.eql(u8, command, "build-direct")) {
+        try runBuildDirect(allocator, args[2..]);
     } else if (std.mem.eql(u8, command, "version") or std.mem.eql(u8, command, "--version") or std.mem.eql(u8, command, "-v")) {
         printVersionStdout();
     } else if (std.mem.eql(u8, command, "help") or std.mem.eql(u8, command, "--help") or std.mem.eql(u8, command, "-h")) {
@@ -204,6 +207,246 @@ fn runBuild(allocator: std.mem.Allocator, args: []const []const u8) !void {
         stdout.writeAll(bytecode) catch {};
         stdout.writeAll("\n") catch {};
     }
+}
+
+/// Compile Zig to EVM bytecode directly (no solc required)
+fn runBuildDirect(allocator: std.mem.Allocator, args: []const []const u8) !void {
+    const opts = try parseBuildDirectOptions(args);
+
+    if (opts.input_file == null and opts.project_dir == null) {
+        std.debug.print("Error: No input file or project specified\n", .{});
+        printBuildDirectUsageStderr();
+        std.process.exit(1);
+    }
+
+    const resolved = try resolveInputPath(allocator, opts.input_file, opts.project_dir);
+    defer resolved.deinit(allocator);
+
+    const source = try readFile(allocator, resolved.path);
+    defer allocator.free(source);
+
+    // Step 1: Transform Zig source to Yul AST
+    var trans = Transformer.init(allocator);
+    defer trans.deinit();
+
+    var ast = trans.transform(source) catch |err| {
+        printTransformErrorsStderr(&trans, resolved.path, source);
+        std.debug.print("Compilation failed: {}\n", .{err});
+        std.process.exit(1);
+    };
+
+    // Step 2: Optionally optimize the Yul AST
+    if (opts.optimize_yul) {
+        var opt = optimizer.Optimizer.init(allocator);
+        defer opt.deinit();
+        ast = opt.optimize(ast) catch |err| {
+            std.debug.print("Yul optimization error: {}\n", .{err});
+            std.process.exit(1);
+        };
+    }
+
+    // Step 3: Compile Yul AST directly to EVM bytecode
+    var compiler = bytecode_compiler.BytecodeCompiler.initWithOptions(allocator, .{
+        .evm_version = opts.evm_version,
+        .optimize = opts.optimize,
+    });
+
+    var result = compiler.compile(ast) catch |err| {
+        std.debug.print("Direct bytecode compilation failed: {}\n", .{err});
+        std.debug.print("Hint: Try using 'build' command with solc for better compatibility\n", .{});
+        std.process.exit(1);
+    };
+    defer result.deinit();
+
+    // Get hex output
+    const hex = result.toHex(allocator) catch {
+        std.debug.print("Error: Failed to encode bytecode as hex\n", .{});
+        std.process.exit(1);
+    };
+    defer allocator.free(hex);
+
+    // Output
+    if (opts.output_file) |out_path| {
+        const file = try std.fs.cwd().createFile(out_path, .{});
+        defer file.close();
+        try file.writeAll("0x");
+        try file.writeAll(hex);
+        std.debug.print("Built successfully (direct): {s}\n", .{out_path});
+        std.debug.print("  Bytecode size: {d} bytes\n", .{result.bytecode.len});
+    } else {
+        const stdout = std.fs.File.stdout();
+        stdout.writeAll("0x") catch {};
+        stdout.writeAll(hex) catch {};
+        stdout.writeAll("\n") catch {};
+    }
+
+    // Generate ABI if requested
+    if (opts.abi_output) |abi_path| {
+        const abi_json = try buildAbiJson(allocator, &trans, resolved.path);
+        defer allocator.free(abi_json);
+        try writeOutput(abi_json, abi_path);
+    }
+}
+
+const BuildDirectOptions = struct {
+    input_file: ?[]const u8 = null,
+    output_file: ?[]const u8 = null,
+    project_dir: ?[]const u8 = null,
+    abi_output: ?[]const u8 = null,
+    evm_version: bytecode_compiler.EvmVersion = .cancun,
+    optimize: bool = false,
+    optimize_yul: bool = false,
+};
+
+fn parseBuildDirectOptions(args: []const []const u8) !BuildDirectOptions {
+    var opts = BuildDirectOptions{};
+    var i: usize = 0;
+
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+
+        if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
+            printBuildDirectUsageStdout();
+            std.process.exit(0);
+        } else if (std.mem.eql(u8, arg, "-o") or std.mem.eql(u8, arg, "--output")) {
+            i += 1;
+            if (i >= args.len) {
+                std.debug.print("Error: -o/--output requires an argument\n", .{});
+                std.process.exit(1);
+            }
+            opts.output_file = args[i];
+        } else if (std.mem.eql(u8, arg, "--project")) {
+            i += 1;
+            if (i >= args.len) {
+                std.debug.print("Error: --project requires an argument\n", .{});
+                std.process.exit(1);
+            }
+            opts.project_dir = args[i];
+        } else if (std.mem.eql(u8, arg, "--abi")) {
+            i += 1;
+            if (i >= args.len) {
+                std.debug.print("Error: --abi requires an argument\n", .{});
+                std.process.exit(1);
+            }
+            opts.abi_output = args[i];
+        } else if (std.mem.eql(u8, arg, "-O") or std.mem.eql(u8, arg, "--optimize")) {
+            opts.optimize = true;
+        } else if (std.mem.eql(u8, arg, "--optimize-yul")) {
+            opts.optimize_yul = true;
+        } else if (std.mem.eql(u8, arg, "--evm-version")) {
+            i += 1;
+            if (i >= args.len) {
+                std.debug.print("Error: --evm-version requires an argument\n", .{});
+                std.process.exit(1);
+            }
+            opts.evm_version = parseEvmVersionForBytecode(args[i]) orelse {
+                std.debug.print("Error: Unknown EVM version: {s}\n", .{args[i]});
+                std.debug.print("Valid versions: homestead, byzantium, constantinople, istanbul, berlin, london, paris, shanghai, cancun, prague\n", .{});
+                std.process.exit(1);
+            };
+        } else if (!std.mem.startsWith(u8, arg, "-")) {
+            if (opts.input_file != null) {
+                std.debug.print("Error: Multiple input files not supported\n", .{});
+                std.process.exit(1);
+            }
+            opts.input_file = arg;
+        } else {
+            std.debug.print("Error: Unknown option: {s}\n", .{arg});
+            printBuildDirectUsageStderr();
+            std.process.exit(1);
+        }
+    }
+
+    return opts;
+}
+
+fn parseEvmVersionForBytecode(name: []const u8) ?bytecode_compiler.EvmVersion {
+    const versions = std.StaticStringMap(bytecode_compiler.EvmVersion).initComptime(.{
+        .{ "homestead", .homestead },
+        .{ "byzantium", .byzantium },
+        .{ "constantinople", .constantinople },
+        .{ "petersburg", .petersburg },
+        .{ "istanbul", .istanbul },
+        .{ "berlin", .berlin },
+        .{ "london", .london },
+        .{ "paris", .paris },
+        .{ "shanghai", .shanghai },
+        .{ "cancun", .cancun },
+        .{ "prague", .prague },
+    });
+    return versions.get(name);
+}
+
+fn printBuildDirectUsageStdout() void {
+    var buf: [4096]u8 = undefined;
+    var stream = std.io.fixedBufferStream(&buf);
+    printBuildDirectUsageTo(stream.writer()) catch {};
+    std.debug.print("{s}", .{stream.getWritten()});
+}
+
+fn printBuildDirectUsageStderr() void {
+    std.debug.print(
+        \\USAGE:
+        \\    zig-to-yul build-direct [options] <input.zig>
+        \\
+        \\Compile Zig smart contracts directly to EVM bytecode (no solc required).
+        \\
+        \\OPTIONS:
+        \\    -o, --output <file>     Write bytecode to <file>
+        \\    --abi <file>            Write ABI JSON to <file>
+        \\    -O, --optimize          Enable bytecode optimization
+        \\    --optimize-yul          Enable Yul-level optimization
+        \\    --evm-version <name>    Target EVM version (default: cancun)
+        \\    --project <dir>         Use build.zig root module
+        \\    -h, --help              Print this help
+        \\
+        \\EVM VERSIONS:
+        \\    homestead, byzantium, constantinople, istanbul, berlin,
+        \\    london, paris, shanghai, cancun, prague
+        \\
+    , .{});
+}
+
+fn printBuildDirectUsageTo(writer: anytype) !void {
+    try writer.writeAll(
+        \\zig-to-yul build-direct - Direct EVM bytecode compilation
+        \\
+        \\USAGE:
+        \\    zig-to-yul build-direct [options] <input.zig>
+        \\
+        \\DESCRIPTION:
+        \\    Compiles Zig smart contracts directly to EVM bytecode without
+        \\    requiring the Solidity compiler (solc). This uses an internal
+        \\    bytecode generator that transforms Yul AST directly to EVM opcodes.
+        \\
+        \\OPTIONS:
+        \\    -o, --output <file>     Write bytecode to <file>
+        \\    --abi <file>            Write ABI JSON to <file>
+        \\    -O, --optimize          Enable bytecode optimization
+        \\    --optimize-yul          Enable Yul-level optimization first
+        \\    --evm-version <name>    Target EVM version (default: cancun)
+        \\    --project <dir>         Use build.zig root module
+        \\    -h, --help              Print this help
+        \\
+        \\EVM VERSIONS:
+        \\    homestead, byzantium, constantinople, istanbul, berlin,
+        \\    london, paris, shanghai, cancun, prague
+        \\
+        \\EXAMPLES:
+        \\    # Build with default settings (Cancun)
+        \\    zig-to-yul build-direct token.zig -o token.bin
+        \\
+        \\    # Build for Shanghai (has PUSH0)
+        \\    zig-to-yul build-direct --evm-version shanghai token.zig
+        \\
+        \\    # Build with optimization
+        \\    zig-to-yul build-direct -O --optimize-yul token.zig -o token.bin
+        \\
+        \\NOTE:
+        \\    This is an experimental feature. For production contracts,
+        \\    consider using 'build' command with solc for better optimization.
+        \\
+    );
 }
 
 fn runEstimate(allocator: std.mem.Allocator, args: []const []const u8) !void {
@@ -1714,9 +1957,10 @@ fn printUsageTo(writer: anytype) !void {
         \\    zig-to-yul <command> [options] <input.zig>
         \\
         \\COMMANDS:
-        \\    compile     Compile Zig to Yul intermediate language
-        \\    build       Compile Zig to EVM bytecode (requires solc)
-        \\    estimate    Estimate gas; supports profile overrides
+        \\    compile      Compile Zig to Yul intermediate language
+        \\    build        Compile Zig to EVM bytecode (requires solc)
+        \\    build-direct Compile Zig to EVM bytecode (no solc required)
+        \\    estimate     Estimate gas; supports profile overrides
         \\    profile     Instrument Yul and aggregate profile counts
         \\    decode-event Decode EVM event logs
         \\    decode-abi  Decode ABI-encoded data
@@ -1770,12 +2014,13 @@ fn printUsageStderr() void {
         \\    zig-to-yul <command> [options]
         \\
         \\COMMANDS:
-        \\    compile    Compile Zig to Yul
-        \\    build      Compile Zig to EVM bytecode
-        \\    decode-event Decode EVM event logs
-        \\    decode-abi  Decode ABI-encoded data
-        \\    estimate   Estimate gas usage
-        \\    profile    Run Yul profiler
+        \\    compile       Compile Zig to Yul
+        \\    build         Compile Zig to EVM bytecode (via solc)
+        \\    build-direct  Compile Zig to EVM bytecode (no solc)
+        \\    decode-event  Decode EVM event logs
+        \\    decode-abi    Decode ABI-encoded data
+        \\    estimate      Estimate gas usage
+        \\    profile       Run Yul profiler
         \\
         \\GLOBAL OPTIONS:
         \\    -h, --help             Print help message
