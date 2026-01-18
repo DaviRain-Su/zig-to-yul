@@ -242,28 +242,33 @@ fn transformVariableDeclaration(
     if (decl.value) |value| {
         // Transform the value expression (pushes result onto stack)
         try transformExpression(ctx, value);
-    } else {
-        // No value: push 0 for each variable
-        for (decl.variables) |_| {
-            ctx.builder.push(0) catch return TransformError.OutOfMemory;
-            ctx.stack_tracker.push(1) catch return TransformError.StackOverflow;
-        }
-    }
 
-    // Register variables in reverse order (first variable gets deepest position)
-    var i = decl.variables.len;
-    while (i > 0) {
-        i -= 1;
-        ctx.stack_tracker.pushVariable(decl.variables[i].name) catch
-            return TransformError.OutOfMemory;
-        // Adjust for the push we already did
-        ctx.stack_tracker.pop(1) catch return TransformError.StackUnderflow;
+        // Name the values that are now on stack (in reverse order)
+        // The expression result(s) are already tracked in height, just name them
+        var i = decl.variables.len;
+        while (i > 0) {
+            i -= 1;
+            // Add variable entry for existing stack slot at appropriate depth
+            const var_depth: u8 = @intCast(decl.variables.len - i);
+            ctx.stack_tracker.variables.append(ctx.allocator, .{
+                .name = decl.variables[i].name,
+                .depth = var_depth,
+                .scope_level = ctx.stack_tracker.scope_level,
+            }) catch return TransformError.OutOfMemory;
+        }
+    } else {
+        // No value: push 0 for each variable and name them
+        for (decl.variables) |var_decl| {
+            ctx.builder.push(0) catch return TransformError.OutOfMemory;
+            ctx.stack_tracker.pushVariable(var_decl.name) catch
+                return TransformError.OutOfMemory;
+        }
     }
 }
 
 /// Transform assignment: x := expr
 fn transformAssignment(ctx: *TransformContext, assign: yul_ast.Assignment) TransformError!void {
-    // Transform the value expression
+    // Transform the value expression(s)
     try transformExpression(ctx, assign.value);
 
     // Assign to each variable (in reverse order for multiple assignment)
@@ -271,25 +276,27 @@ fn transformAssignment(ctx: *TransformContext, assign: yul_ast.Assignment) Trans
     while (i > 0) {
         i -= 1;
         const name = assign.variable_names[i].name;
-        const depth = ctx.stack_tracker.getVariableDepth(name) catch
+        const depth = ctx.stack_tracker.getVariableDepth(name) catch {
+            std.debug.print("UndefinedVariable in assignment: '{s}'\n", .{name});
             return TransformError.UndefinedVariable;
+        };
 
         if (depth > stack.MAX_DUP_DEPTH) {
             return TransformError.VariableTooDeep;
         }
 
         if (depth > 1) {
-            // Swap with variable position and pop old value
+            // Swap new value (on top) with old variable value at depth
+            // After swap, old value is on top
             ctx.builder.swap(@intCast(depth - 1)) catch return TransformError.OutOfMemory;
             ctx.stack_tracker.recordSwap(@intCast(depth - 1)) catch
                 return TransformError.StackUnderflow;
-        }
-
-        if (i > 0) {
-            // More variables to assign, keep the value
+            // Pop old value (now on top after swap)
             ctx.builder.pop() catch return TransformError.OutOfMemory;
             ctx.stack_tracker.pop(1) catch return TransformError.StackUnderflow;
         }
+        // Note: if depth == 1, the new value is directly replacing the variable
+        // which shouldn't happen in normal assignment (variable is pushed before expression)
     }
 }
 
@@ -316,7 +323,10 @@ fn transformIf(ctx: *TransformContext, if_stmt: yul_ast.If) TransformError!void 
 fn transformSwitch(ctx: *TransformContext, switch_stmt: yul_ast.Switch) TransformError!void {
     const end_label = ctx.newLabel("switch_end");
 
-    // Transform the switch expression
+    // Save stack height before switch expression
+    const stack_height_before = ctx.stack_tracker.getHeight();
+
+    // Transform the switch expression (pushes 1 value)
     try transformExpression(ctx, switch_stmt.expression);
 
     var default_case: ?yul_ast.Case = null;
@@ -334,45 +344,41 @@ fn transformSwitch(ctx: *TransformContext, switch_stmt: yul_ast.Switch) Transfor
     }
 
     // Generate comparison and jump code
+    // After each comparison iteration, switch value remains on stack
     var case_idx: usize = 0;
     for (switch_stmt.cases) |case| {
         if (case.value) |val| {
             // DUP the switch value
             ctx.builder.dup(1) catch return TransformError.OutOfMemory;
-            ctx.stack_tracker.recordDup(1) catch return TransformError.StackOverflow;
 
             // Push case value
             const case_val = getLiteralValue(val);
             ctx.builder.push(case_val) catch return TransformError.OutOfMemory;
-            ctx.stack_tracker.push(1) catch return TransformError.StackOverflow;
 
-            // EQ
+            // EQ: compares dup'd switch value with case value
             ctx.builder.emit(.EQ) catch return TransformError.OutOfMemory;
-            ctx.stack_tracker.pop(1) catch return TransformError.StackUnderflow;
 
-            // JUMPI to case body
+            // JUMPI to case body if equal
             ctx.builder.jumpi(case_labels.items[case_idx]) catch
                 return TransformError.OutOfMemory;
-            ctx.stack_tracker.pop(1) catch return TransformError.StackUnderflow;
 
             case_idx += 1;
         }
     }
 
+    // After all comparisons, switch value is still on stack
     // Jump to default or end
     if (default_case != null) {
         const default_label = ctx.newLabel("default");
         ctx.builder.jump(default_label) catch return TransformError.OutOfMemory;
 
-        // Generate case bodies
+        // Generate case bodies (each pops the switch value)
         case_idx = 0;
         for (switch_stmt.cases) |case| {
             if (case.value != null) {
                 ctx.builder.defineLabel(case_labels.items[case_idx]) catch
                     return TransformError.OutOfMemory;
-                // Pop the switch value before entering case body
                 ctx.builder.pop() catch return TransformError.OutOfMemory;
-                ctx.stack_tracker.pop(1) catch return TransformError.StackUnderflow;
                 try transformBlock(ctx, case.body);
                 ctx.builder.jump(end_label) catch return TransformError.OutOfMemory;
                 case_idx += 1;
@@ -382,19 +388,19 @@ fn transformSwitch(ctx: *TransformContext, switch_stmt: yul_ast.Switch) Transfor
         // Default case
         ctx.builder.defineLabel(default_label) catch return TransformError.OutOfMemory;
         ctx.builder.pop() catch return TransformError.OutOfMemory;
-        ctx.stack_tracker.pop(1) catch return TransformError.StackUnderflow;
         try transformBlock(ctx, default_case.?.body);
     } else {
+        // No default - pop switch value and jump to end
+        ctx.builder.pop() catch return TransformError.OutOfMemory;
         ctx.builder.jump(end_label) catch return TransformError.OutOfMemory;
 
-        // Generate case bodies
+        // Generate case bodies (each pops the switch value)
         case_idx = 0;
         for (switch_stmt.cases) |case| {
             if (case.value != null) {
                 ctx.builder.defineLabel(case_labels.items[case_idx]) catch
                     return TransformError.OutOfMemory;
                 ctx.builder.pop() catch return TransformError.OutOfMemory;
-                ctx.stack_tracker.pop(1) catch return TransformError.StackUnderflow;
                 try transformBlock(ctx, case.body);
                 ctx.builder.jump(end_label) catch return TransformError.OutOfMemory;
                 case_idx += 1;
@@ -403,6 +409,9 @@ fn transformSwitch(ctx: *TransformContext, switch_stmt: yul_ast.Switch) Transfor
     }
 
     ctx.builder.defineLabel(end_label) catch return TransformError.OutOfMemory;
+
+    // Reset stack height - all branches leave stack at same height (switch value consumed)
+    ctx.stack_tracker.height = stack_height_before;
 }
 
 /// Transform for loop.
@@ -520,9 +529,20 @@ fn transformLeave(ctx: *TransformContext) TransformError!void {
         return;
     }
 
-    // Return values should already be on the stack
-    // The caller expects them in the right positions
-    // Use JUMP to return (return address should be on stack)
+    // Stack layout: [return_addr, return_val1, return_val2, ...]
+    // Note: params have been consumed/overwritten during function execution
+    // The return address is under the return values
+    // Need to bring it to top for JUMP
+    const num_return_vals = ctx.return_vars.len;
+    if (num_return_vals > 0) {
+        // Swap return address to top: it's at depth (num_return_vals + 1)
+        // SWAP(n) exchanges position 1 with position n+1
+        // So SWAP(num_return_vals) brings ret_addr from depth num_return_vals+1 to top
+        ctx.builder.swap(@intCast(num_return_vals)) catch return TransformError.OutOfMemory;
+    }
+    // If num_return_vals == 0, return address is already on top (no swap needed)
+
+    // Now return address is on top, JUMP to it
     ctx.builder.emit(.JUMP) catch return TransformError.OutOfMemory;
 }
 
@@ -540,8 +560,10 @@ fn transformExpression(ctx: *TransformContext, expr: yul_ast.Expression) Transfo
         },
 
         .identifier => |id| {
-            const depth = ctx.stack_tracker.getVariableDepth(id.name) catch
+            const depth = ctx.stack_tracker.getVariableDepth(id.name) catch {
+                std.debug.print("UndefinedVariable in identifier: '{s}'\n", .{id.name});
                 return TransformError.UndefinedVariable;
+            };
 
             if (depth > stack.MAX_DUP_DEPTH) {
                 return TransformError.VariableTooDeep;

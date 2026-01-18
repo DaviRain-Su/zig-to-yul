@@ -115,6 +115,10 @@ pub const BytecodeCompiler = struct {
 
     /// Compile a Yul AST to EVM bytecode.
     pub fn compile(self: *BytecodeCompiler, ast: yul_ast.AST) CompilerError!CompileResult {
+        // If the contract has sub-objects (e.g., _deployed), use deploy code compilation
+        if (ast.root.sub_objects.len > 0) {
+            return self.compileWithDeployCode(ast);
+        }
         return self.compileObject(ast.root);
     }
 
@@ -181,7 +185,10 @@ pub const BytecodeCompiler = struct {
                 self.allocator,
                 runtime,
                 self.options.evm_version,
-            ) catch return CompilerError.TransformFailed;
+            ) catch |err| {
+                std.debug.print("Transform error for runtime code: {}\n", .{err});
+                return CompilerError.TransformFailed;
+            };
             defer self.allocator.free(runtime_instructions);
 
             var runtime_cg = codegen.Codegen.init(self.allocator, self.options.evm_version);
@@ -210,78 +217,68 @@ pub const BytecodeCompiler = struct {
     }
 
     /// Generate deploy code (initcode) that includes runtime code.
+    /// The standard deploy code: copies runtime bytecode to memory and returns it.
     fn generateDeployCode(
         self: *BytecodeCompiler,
-        constructor_block: yul_ast.Block,
+        _: yul_ast.Block, // constructor_block - not used, we generate deploy code directly
         runtime_bytecode: []const u8,
     ) CompilerError![]u8 {
-        var code = std.ArrayList(u8).init(self.allocator);
-        errdefer code.deinit();
+        var code: std.ArrayList(u8) = .empty;
+        errdefer code.deinit(self.allocator);
 
-        // Transform constructor code if not empty
-        if (constructor_block.statements.len > 0) {
-            const constructor_ir = from_yul.transform(
-                self.allocator,
-                yul_ast.AST.init(yul_ast.Object.init("constructor", constructor_block, &.{}, &.{})),
-                self.options.evm_version,
-            ) catch return CompilerError.TransformFailed;
-            defer self.allocator.free(constructor_ir);
-
-            var constructor_cg = codegen.Codegen.init(self.allocator, self.options.evm_version);
-            defer constructor_cg.deinit();
-
-            var constructor_result = constructor_cg.generate(constructor_ir) catch
-                return CompilerError.CodegenFailed;
-            defer constructor_result.deinit();
-
-            code.appendSlice(constructor_result.bytecode) catch
-                return CompilerError.OutOfMemory;
-        }
-
-        // Calculate sizes
         const runtime_size = runtime_bytecode.len;
-        const runtime_offset = code.items.len + 13; // Size of the copy instructions below
 
-        // Generate code to copy runtime to memory and return it
+        // Deploy code sequence (for shanghai+):
+        // PUSH2 runtime_size    ; 61 XX XX
+        // DUP1                  ; 80
+        // PUSH2 runtime_offset  ; 61 XX XX (offset = 11 for PUSH0 or 13 for PUSH1)
+        // PUSH0                 ; 5f (or PUSH1 0 = 60 00)
+        // CODECOPY              ; 39
+        // PUSH0                 ; 5f (or PUSH1 0 = 60 00)
+        // RETURN                ; f3
+
+        const deploy_size: usize = if (self.options.evm_version.hasPush0()) 11 else 13;
+        const runtime_offset = deploy_size;
+
         // PUSH2 runtime_size
-        code.append(0x61) catch return CompilerError.OutOfMemory;
-        code.append(@truncate(runtime_size >> 8)) catch return CompilerError.OutOfMemory;
-        code.append(@truncate(runtime_size)) catch return CompilerError.OutOfMemory;
+        code.append(self.allocator, 0x61) catch return CompilerError.OutOfMemory;
+        code.append(self.allocator, @truncate(runtime_size >> 8)) catch return CompilerError.OutOfMemory;
+        code.append(self.allocator, @truncate(runtime_size)) catch return CompilerError.OutOfMemory;
 
-        // DUP1 (for RETURN later)
-        code.append(0x80) catch return CompilerError.OutOfMemory;
+        // DUP1 (duplicate size for RETURN)
+        code.append(self.allocator, 0x80) catch return CompilerError.OutOfMemory;
 
         // PUSH2 runtime_offset
-        code.append(0x61) catch return CompilerError.OutOfMemory;
-        code.append(@truncate(runtime_offset >> 8)) catch return CompilerError.OutOfMemory;
-        code.append(@truncate(runtime_offset)) catch return CompilerError.OutOfMemory;
+        code.append(self.allocator, 0x61) catch return CompilerError.OutOfMemory;
+        code.append(self.allocator, @truncate(runtime_offset >> 8)) catch return CompilerError.OutOfMemory;
+        code.append(self.allocator, @truncate(runtime_offset)) catch return CompilerError.OutOfMemory;
 
-        // PUSH1 0 (memory destination)
+        // PUSH0 or PUSH1 0 (memory destination)
         if (self.options.evm_version.hasPush0()) {
-            code.append(0x5f) catch return CompilerError.OutOfMemory; // PUSH0
+            code.append(self.allocator, 0x5f) catch return CompilerError.OutOfMemory;
         } else {
-            code.append(0x60) catch return CompilerError.OutOfMemory; // PUSH1
-            code.append(0) catch return CompilerError.OutOfMemory;
+            code.append(self.allocator, 0x60) catch return CompilerError.OutOfMemory;
+            code.append(self.allocator, 0) catch return CompilerError.OutOfMemory;
         }
 
         // CODECOPY
-        code.append(0x39) catch return CompilerError.OutOfMemory;
+        code.append(self.allocator, 0x39) catch return CompilerError.OutOfMemory;
 
-        // PUSH1 0 (memory offset for RETURN)
+        // PUSH0 or PUSH1 0 (memory offset for RETURN)
         if (self.options.evm_version.hasPush0()) {
-            code.append(0x5f) catch return CompilerError.OutOfMemory;
+            code.append(self.allocator, 0x5f) catch return CompilerError.OutOfMemory;
         } else {
-            code.append(0x60) catch return CompilerError.OutOfMemory;
-            code.append(0) catch return CompilerError.OutOfMemory;
+            code.append(self.allocator, 0x60) catch return CompilerError.OutOfMemory;
+            code.append(self.allocator, 0) catch return CompilerError.OutOfMemory;
         }
 
         // RETURN
-        code.append(0xf3) catch return CompilerError.OutOfMemory;
+        code.append(self.allocator, 0xf3) catch return CompilerError.OutOfMemory;
 
         // Append runtime bytecode
-        code.appendSlice(runtime_bytecode) catch return CompilerError.OutOfMemory;
+        code.appendSlice(self.allocator, runtime_bytecode) catch return CompilerError.OutOfMemory;
 
-        return code.toOwnedSlice() catch return CompilerError.OutOfMemory;
+        return code.toOwnedSlice(self.allocator) catch return CompilerError.OutOfMemory;
     }
 };
 
