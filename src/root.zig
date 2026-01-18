@@ -21,6 +21,7 @@ pub const evm = struct {
     pub const stack = @import("evm/stack.zig");
     pub const from_yul = @import("evm/from_yul.zig");
     pub const bytecode_compiler = @import("evm/bytecode_compiler.zig");
+    pub const optimizer = @import("evm/optimizer.zig");
 
     pub const event = struct {
         pub const encode = event_encode;
@@ -36,6 +37,8 @@ pub const evm = struct {
     pub const Codegen = codegen.Codegen;
     pub const StackTracker = stack.StackTracker;
     pub const BytecodeCompiler = bytecode_compiler.BytecodeCompiler;
+    pub const Optimizer = optimizer.Optimizer;
+    pub const OptimizationLevel = optimizer.OptimizationLevel;
 
     pub const U256 = types.U256;
     pub const Address = types.Address;
@@ -111,4 +114,5 @@ test {
     std.testing.refAllDecls(evm.stack);
     std.testing.refAllDecls(evm.from_yul);
     std.testing.refAllDecls(evm.bytecode_compiler);
+    std.testing.refAllDecls(evm.optimizer);
 }

@@ -22,18 +22,21 @@ const ir = @import("ir.zig");
 const codegen = @import("codegen.zig");
 const from_yul = @import("from_yul.zig");
 const opcodes = @import("opcodes.zig");
+const optimizer = @import("optimizer.zig");
 
 pub const Opcode = opcodes.Opcode;
 pub const EvmVersion = opcodes.EvmVersion;
 pub const CodegenResult = codegen.CodegenResult;
+pub const OptimizationLevel = optimizer.OptimizationLevel;
+pub const OptimizationStats = optimizer.OptimizationStats;
 
 /// Compilation options.
 pub const CompileOptions = struct {
     /// Target EVM version.
     evm_version: EvmVersion = .cancun,
 
-    /// Whether to optimize the generated code.
-    optimize: bool = false,
+    /// Optimization level.
+    optimization_level: OptimizationLevel = .none,
 
     /// Whether to include constructor (deploy code).
     include_deploy_code: bool = true,
@@ -135,18 +138,35 @@ pub const BytecodeCompiler = struct {
         };
         defer self.allocator.free(instructions);
 
-        // Step 2: Generate bytecode from IR
+        // Step 2: Optimize IR (if enabled)
+        const optimized = if (self.options.optimization_level != .none) blk: {
+            var opt = optimizer.Optimizer.initWithConfig(self.allocator, .{
+                .evm_version = self.options.evm_version,
+                .level = self.options.optimization_level,
+            });
+            defer opt.deinit();
+
+            break :blk opt.optimize(instructions) catch |err| {
+                std.debug.print("Optimizer error: {}\n", .{err});
+                return CompilerError.TransformFailed;
+            };
+        } else null;
+        defer if (optimized) |o| self.allocator.free(o);
+
+        const final_instructions = optimized orelse instructions;
+
+        // Step 3: Generate bytecode from IR
         var cg = codegen.Codegen.init(self.allocator, self.options.evm_version);
         defer cg.deinit();
 
-        const result = cg.generate(instructions) catch |err| {
+        const result = cg.generate(final_instructions) catch |err| {
             std.debug.print("Codegen error: {}\n", .{err});
             return CompilerError.CodegenFailed;
         };
         // Free source_map since we only need bytecode for CompileResult
         defer self.allocator.free(result.source_map);
 
-        // Step 3: Check code size limit
+        // Step 4: Check code size limit
         if (self.options.max_code_size > 0 and result.bytecode.len > self.options.max_code_size) {
             self.allocator.free(result.bytecode);
             return CompilerError.CodeTooLarge;
@@ -191,10 +211,27 @@ pub const BytecodeCompiler = struct {
             };
             defer self.allocator.free(runtime_instructions);
 
+            // Optimize runtime IR (if enabled)
+            const optimized_runtime = if (self.options.optimization_level != .none) blk: {
+                var opt = optimizer.Optimizer.initWithConfig(self.allocator, .{
+                    .evm_version = self.options.evm_version,
+                    .level = self.options.optimization_level,
+                });
+                defer opt.deinit();
+
+                break :blk opt.optimize(runtime_instructions) catch |err| {
+                    std.debug.print("Optimizer error: {}\n", .{err});
+                    return CompilerError.TransformFailed;
+                };
+            } else null;
+            defer if (optimized_runtime) |o| self.allocator.free(o);
+
+            const final_runtime_instructions = optimized_runtime orelse runtime_instructions;
+
             var runtime_cg = codegen.Codegen.init(self.allocator, self.options.evm_version);
             defer runtime_cg.deinit();
 
-            var runtime_result = runtime_cg.generate(runtime_instructions) catch
+            var runtime_result = runtime_cg.generate(final_runtime_instructions) catch
                 return CompilerError.CodegenFailed;
             defer runtime_result.deinit();
 

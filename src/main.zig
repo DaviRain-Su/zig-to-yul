@@ -248,7 +248,7 @@ fn runBuildDirect(allocator: std.mem.Allocator, args: []const []const u8) !void 
     // Step 3: Compile Yul AST directly to EVM bytecode
     var compiler = bytecode_compiler.BytecodeCompiler.initWithOptions(allocator, .{
         .evm_version = opts.evm_version,
-        .optimize = opts.optimize,
+        .optimization_level = if (opts.optimize) .standard else .none,
     });
 
     var result = compiler.compile(ast) catch |err| {
