@@ -5,7 +5,7 @@
 > 本规范部分内容参考自 [Xuanwo's AGENTS.md](https://gist.github.com/Xuanwo/fa5162ed3548ae4f962dcc8b8e256bed)。
 
 **支持的语言版本**:
-- Zig: 0.15.x (最低要求)
+- Zig: 0.16.0 (最低要求)
 - Rust: 1.75+ (推荐)
 
 ---
@@ -16,7 +16,7 @@
 
 | Skill | 路径 | 用途 |
 |-------|------|------|
-| **zig-0.15** | `skills/zig-0.15/SKILL.md` | Zig 0.15+ API：ArrayList、HashMap、HTTP、JSON、Ed25519 |
+| **zig-0.16** | `skills/zig-0.16/SKILL.md` | Zig 0.16 API：std.Io、ArrayList、HashMap、HTTP、JSON、Ed25519 |
 | **solana-sdk-zig** | `skills/solana-sdk-zig/SKILL.md` | Solana SDK：Rust 源引用、crate 映射、测试规范 |
 | **doc-driven-dev** | `skills/doc-driven-dev/SKILL.md` | 文档驱动开发：Story 文件、ROADMAP、状态追踪 |
 | **zig-memory** | `skills/zig-memory/SKILL.md` | 内存管理：defer/errdefer、allocator、泄漏检测 |
@@ -234,7 +234,7 @@ const result = doSomething() catch |err| {
 - [ ] 无内存泄漏（使用 `std.testing.allocator`）
 - [ ] 公共 API 有文档注释
 
-### Zig 0.15 API（详见 `skills/zig-0.15/SKILL.md`）
+### Zig 0.16 API（详见 `skills/zig-0.16/SKILL.md`）
 - [ ] ArrayList 方法传入 allocator 参数
 - [ ] HashMap 区分 Managed/Unmanaged
 - [ ] Ed25519 使用结构体 API
