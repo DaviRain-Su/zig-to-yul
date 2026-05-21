@@ -251,11 +251,14 @@ fn runBuildDirect(allocator: std.mem.Allocator, args: []const []const u8) !void 
         std.process.exit(1);
     };
 
-    // Step 2: Optionally optimize the Yul AST
+    // Step 2: Optionally optimize the Yul AST.
+    // The optimized AST references memory owned by the optimizer's builder, so the
+    // optimizer must outlive the compile step below (deinit at function exit).
+    var yul_opt: ?optimizer.Optimizer = null;
+    defer if (yul_opt) |*o| o.deinit();
     if (opts.optimize_yul) {
-        var opt = optimizer.Optimizer.init(allocator);
-        defer opt.deinit();
-        ast = opt.optimize(ast) catch |err| {
+        yul_opt = optimizer.Optimizer.init(allocator);
+        ast = (&yul_opt.?).optimize(ast) catch |err| {
             std.debug.print("Yul optimization error: {}\n", .{err});
             std.process.exit(1);
         };
