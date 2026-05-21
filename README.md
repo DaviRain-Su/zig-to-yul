@@ -80,12 +80,26 @@ zig-to-yul build contract.zig -o contract.bin
 zig-to-yul build -O contract.zig -o contract.bin
 ```
 
+### Build Without solc (experimental)
+
+`build-direct` uses a built-in Yul→EVM backend, so it needs no external solc.
+It is **experimental and only supports a subset of Yul**: simple contracts
+(see `examples/counter.zig`) compile, but contracts whose internal functions
+are called from inside expressions — most notably mappings, which lower to
+nested helper calls — are not yet supported and will report an error.
+For full language support and smaller bytecode, use `build` (solc).
+
+```bash
+zig-to-yul build-direct counter.zig -o counter.bin
+```
+
 ### Commands
 
 | Command | Description |
 |---------|-------------|
 | `compile` | Compile Zig to Yul intermediate language |
 | `build` | Compile Zig to EVM bytecode (requires solc) |
+| `build-direct` | Compile to EVM bytecode without solc (experimental, subset only) |
 | `estimate` | Estimate gas usage (supports profile overrides) |
 | `profile` | Instrument Yul and aggregate profile counts |
 | `version` | Print version information |

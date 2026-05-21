@@ -272,7 +272,15 @@ fn runBuildDirect(allocator: std.mem.Allocator, args: []const []const u8) !void 
 
     var result = compiler.compile(ast) catch |err| {
         std.debug.print("Direct bytecode compilation failed: {}\n", .{err});
-        std.debug.print("Hint: Try using 'build' command with solc for better compatibility\n", .{});
+        std.debug.print(
+            \\
+            \\The built-in (no-solc) backend only supports a subset of Yul. It does not
+            \\yet correctly compile contracts whose internal functions are called from
+            \\within expressions (e.g. mappings, which lower to nested helper calls).
+            \\Use the 'build' command (requires solc) for full support:
+            \\    zig-to-yul build {s} -o <out.bin>
+            \\
+        , .{resolved.path});
         std.process.exit(1);
     };
     defer result.deinit();
