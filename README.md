@@ -21,7 +21,7 @@ Zig Source Code → [zig-to-yul] → Yul Code → [solc] → EVM Bytecode
 ### From Source
 
 Requirements:
-- [Zig 0.15.x](https://ziglang.org/download/)
+- [Zig 0.16.0](https://ziglang.org/download/)
 - [solc](https://docs.soliditylang.org/en/latest/installing-solidity.html) (for bytecode generation)
 
 ```bash
@@ -42,7 +42,7 @@ One-line installer (Linux/macOS, installs `z2y` + `zig_to_yul` to `~/.local/bin`
 curl -fsSL https://raw.githubusercontent.com/DaviRain-Su/zig-to-yul/v0.1.0/scripts/install.sh | bash
 ```
 
-Ensure Zig 0.15.2 is installed separately (required by `z2y`).
+Ensure Zig 0.16.0 is installed separately (required by `z2y`).
 
 ## Usage
 
