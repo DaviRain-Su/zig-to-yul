@@ -3709,6 +3709,57 @@ pub const Transformer = struct {
         return try out.toOwnedSlice(self.allocator);
     }
 
+    /// A string literal used as a value lowers to a Yul string literal (a single
+    /// left-aligned word). Yul caps such literals at 32 bytes. Bytes that are not
+    /// safe printable ASCII are emitted as `hex"..."`.
+    pub fn translateStringLiteralExpr(self: *Self, node: ZigAst.Node.Index, loc: ast.SourceLocation) TransformProcessError!ast.Expression {
+        const p = &self.zig_parser.?;
+        const src = p.getNodeSource(node);
+        const bytes = try self.decodeStringLiteral(src, loc);
+
+        if (bytes.len > 32) {
+            try self.addError("string literal value exceeds 32 bytes; use a storage bytes/string field for longer data", loc, .unsupported_feature);
+            self.allocator.free(bytes);
+            return ast.Expression.lit(ast.Literal.number(0));
+        }
+
+        var safe = true;
+        for (bytes) |b| {
+            if (b < 0x20 or b > 0x7e or b == '"' or b == '\\') {
+                safe = false;
+                break;
+            }
+        }
+
+        if (safe) {
+            try self.temp_strings.append(self.allocator, bytes);
+            return ast.Expression.lit(ast.Literal.string(bytes));
+        }
+
+        defer self.allocator.free(bytes);
+        const hex_chars = "0123456789abcdef";
+        const hex = try self.allocator.alloc(u8, bytes.len * 2);
+        for (bytes, 0..) |b, i| {
+            hex[i * 2] = hex_chars[b >> 4];
+            hex[i * 2 + 1] = hex_chars[b & 0x0f];
+        }
+        try self.temp_strings.append(self.allocator, hex);
+        return ast.Expression.lit(ast.Literal.hexString(hex));
+    }
+
+    /// A char literal lowers to its numeric Unicode codepoint.
+    pub fn translateCharLiteralExpr(self: *Self, node: ZigAst.Node.Index, loc: ast.SourceLocation) TransformProcessError!ast.Expression {
+        const p = &self.zig_parser.?;
+        const src = p.getNodeSource(node);
+        switch (std.zig.parseCharLiteral(src)) {
+            .success => |codepoint| return ast.Expression.lit(ast.Literal.number(@as(ast.U256, codepoint))),
+            .failure => {
+                try self.addError("invalid character literal", loc, .unsupported_feature);
+                return ast.Expression.lit(ast.Literal.number(0));
+            },
+        }
+    }
+
     fn packMessageWord(bytes: []const u8) ast.U256 {
         var word: ast.U256 = 0;
         for (bytes) |b| {
@@ -10684,6 +10735,39 @@ test "small int arithmetic is masked to width" {
     try std.testing.expect(std.mem.indexOf(u8, output, "and(calldataload(4), 255)") != null);
     // u256 addition is left unmasked
     try std.testing.expect(std.mem.indexOf(u8, output, "result := add(a, b)") != null);
+}
+
+test "string and char literals as values" {
+    const allocator = std.testing.allocator;
+    const printer = @import("printer.zig");
+
+    const source =
+        \\pub const S = struct {
+        \\    pub fn tag(self: *S) u256 {
+        \\        _ = self;
+        \\        const t = "ERC20";
+        \\        return t;
+        \\    }
+        \\    pub fn grade(self: *S) u256 {
+        \\        _ = self;
+        \\        const c = 'A';
+        \\        return c;
+        \\    }
+        \\};
+    ;
+
+    const source_z = try allocator.dupeZ(u8, source);
+    defer allocator.free(source_z);
+
+    var transformer = Transformer.init(allocator);
+    defer transformer.deinit();
+
+    const yul_ast = try transformer.transform(source_z);
+    const output = try printer.format(allocator, yul_ast);
+    defer allocator.free(output);
+
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"ERC20\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "let c := 65") != null);
 }
 
 test "transient storage builtins" {

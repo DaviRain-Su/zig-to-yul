@@ -76,6 +76,8 @@ pub fn translateExpression(self: anytype, index: ZigAst.Node.Index) TransformPro
             const data = p.ast.nodeData(index).node_and_token;
             break :blk try self.translateExpression(data[0]);
         },
+        .string_literal => try self.translateStringLiteralExpr(index, loc),
+        .char_literal => try self.translateCharLiteralExpr(index, loc),
         .add => try self.translateBinaryOp(index, "add"),
         .sub => try self.translateBinaryOp(index, "sub"),
         .mul => try self.translateBinaryOp(index, "mul"),

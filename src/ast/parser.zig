@@ -321,11 +321,42 @@ fn tokenLength(tag: std.zig.Token.Tag, source: []const u8) u32 {
         .string_literal, .multiline_string_literal_line => {
             var len: u32 = 0;
             var in_string = false;
+            var escaped = false;
             for (source) |c| {
                 len += 1;
-                if (c == '"' and !in_string) {
-                    in_string = true;
-                } else if (c == '"' and in_string) {
+                if (!in_string) {
+                    if (c == '"') in_string = true;
+                    continue;
+                }
+                if (escaped) {
+                    escaped = false;
+                    continue;
+                }
+                if (c == '\\') {
+                    escaped = true;
+                } else if (c == '"') {
+                    break;
+                }
+            }
+            return len;
+        },
+        .char_literal => {
+            var len: u32 = 0;
+            var in_char = false;
+            var escaped = false;
+            for (source) |c| {
+                len += 1;
+                if (!in_char) {
+                    if (c == '\'') in_char = true;
+                    continue;
+                }
+                if (escaped) {
+                    escaped = false;
+                    continue;
+                }
+                if (c == '\\') {
+                    escaped = true;
+                } else if (c == '\'') {
                     break;
                 }
             }
