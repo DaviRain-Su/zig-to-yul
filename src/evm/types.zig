@@ -5,16 +5,10 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 /// 256-bit unsigned integer (native EVM word)
-pub const U256 = @Type(.{ .int = .{
-    .signedness = .unsigned,
-    .bits = 256,
-} });
+pub const U256 = u256;
 
 /// 160-bit address type
-pub const Address = @Type(.{ .int = .{
-    .signedness = .unsigned,
-    .bits = 160,
-} });
+pub const Address = u160;
 
 /// Defines a Solidity-style mapping type for contracts.
 pub fn Mapping(comptime Key: type, comptime Value: type) type {

@@ -11,7 +11,7 @@ const Address = types.Address;
 const ParseError = std.mem.Allocator.Error || error{UnsupportedType};
 const DecodeErrorSet = std.mem.Allocator.Error || DecodeError;
 
-pub const I256 = @Type(.{ .int = .{ .signedness = .signed, .bits = 256 } });
+pub const I256 = i256;
 
 pub const EventParam = struct {
     name: []const u8,

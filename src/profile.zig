@@ -231,7 +231,7 @@ pub fn profileMapToJson(allocator: std.mem.Allocator, map: ProfileMap) ![]const 
 }
 
 fn jsonStringifyAlloc(allocator: std.mem.Allocator, value: anytype) ![]u8 {
-    var out: std.io.Writer.Allocating = .init(allocator);
+    var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
 
     var write_stream: std.json.Stringify = .{

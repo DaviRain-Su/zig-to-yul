@@ -6,6 +6,14 @@ const rpc = @import("rpc.zig");
 const event_decode = @import("event_decode.zig");
 const tx = @import("tx.zig");
 const types = @import("types.zig");
+const env = @import("env.zig");
+
+fn defaultIo() std.Io {
+    return if (@import("builtin").is_test)
+        std.testing.io
+    else
+        std.Io.Threaded.global_single_threaded.io();
+}
 
 pub const Value = abi.Value;
 pub const Address = types.Address;
@@ -146,17 +154,14 @@ const TestError = error{
 test "foundry sdk call (anvil + cast)" {
     const allocator = std.testing.allocator;
 
-    const cast_env = std.process.getEnvVarOwned(allocator, "CAST_BIN") catch |err| switch (err) {
-        error.EnvironmentVariableNotFound => null,
-        else => return err,
-    };
+    const cast_env = try env.getEnvOwned(allocator, "CAST_BIN");
     defer if (cast_env) |path| allocator.free(path);
     const cast_bin = cast_env orelse "cast";
 
-    const version = std.process.Child.run(.{
-        .allocator = allocator,
+    const version = std.process.run(allocator, defaultIo(), .{
         .argv = &.{ cast_bin, "--version" },
-        .max_output_bytes = 8 * 1024,
+        .stdout_limit = .limited(8 * 1024),
+        .stderr_limit = .limited(8 * 1024),
     }) catch |err| switch (err) {
         error.FileNotFound => return,
         else => return err,
@@ -174,8 +179,7 @@ test "foundry sdk call (anvil + cast)" {
     const private_key = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
     const bytecode = "0x600a600c600039600a6000f3602a60005260206000f3";
 
-    const deploy = try std.process.Child.run(.{
-        .allocator = allocator,
+    const deploy = try std.process.run(allocator, defaultIo(), .{
         .argv = &.{
             cast_bin,
             "send",
@@ -187,7 +191,8 @@ test "foundry sdk call (anvil + cast)" {
             bytecode,
             "--json",
         },
-        .max_output_bytes = 128 * 1024,
+        .stdout_limit = .limited(128 * 1024),
+        .stderr_limit = .limited(128 * 1024),
     });
     defer allocator.free(deploy.stdout);
     defer allocator.free(deploy.stderr);
@@ -213,10 +218,7 @@ test "foundry sdk call (anvil + cast)" {
 }
 
 fn startAnvil(allocator: std.mem.Allocator) !std.process.Child {
-    const anvil_env = std.process.getEnvVarOwned(allocator, "ANVIL_BIN") catch |err| switch (err) {
-        error.EnvironmentVariableNotFound => null,
-        else => return err,
-    };
+    const anvil_env = try env.getEnvOwned(allocator, "ANVIL_BIN");
     defer if (anvil_env) |path| allocator.free(path);
 
     var argv: std.ArrayList([]const u8) = .empty;
@@ -225,24 +227,23 @@ fn startAnvil(allocator: std.mem.Allocator) !std.process.Child {
     try argv.append(allocator, anvil_env orelse "anvil");
     try argv.appendSlice(allocator, &.{ "--host", "127.0.0.1", "--port", "8545" });
 
-    var child = std.process.Child.init(argv.items, allocator);
-    child.stdout_behavior = .Ignore;
-    child.stderr_behavior = .Ignore;
-    try child.spawn();
+    const child = try std.process.spawn(defaultIo(), .{
+        .argv = argv.items,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    });
 
-    std.Thread.sleep(std.time.ns_per_s);
+    std.Io.sleep(defaultIo(), .fromSeconds(1), .awake) catch {};
     return child;
 }
 
 fn stopAnvil(child: *std.process.Child) void {
-    const term = child.kill() catch return;
-    _ = term;
-    _ = child.wait() catch {};
+    child.kill(defaultIo());
 }
 
 fn expectExitedOk(term: std.process.Child.Term) !void {
     switch (term) {
-        .Exited => |code| if (code == 0) return else return TestError.ProcessFailed,
+        .exited => |code| if (code == 0) return else return TestError.ProcessFailed,
         else => return TestError.ProcessFailed,
     }
 }

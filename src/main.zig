@@ -14,13 +14,29 @@ const bytecode_compiler = @import("evm/bytecode_compiler.zig");
 
 const version = "0.1.0";
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+/// Process-wide Io, set once in `main`. The CLI is single-threaded and blocking,
+/// so a module-global avoids threading `io` through every helper signature.
+/// In test builds it defaults to `std.testing.io` (a fully-backed Io); the
+/// global single-threaded Io uses a failing allocator and cannot spawn.
+var g_io: std.Io = if (@import("builtin").is_test)
+    std.testing.io
+else
+    std.Io.Threaded.global_single_threaded.io();
 
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+const StdoutWriter = struct {
+    pub fn writeAll(_: StdoutWriter, bytes: []const u8) !void {
+        return std.Io.File.stdout().writeStreamingAll(g_io, bytes);
+    }
+};
+fn getStdout() StdoutWriter {
+    return .{};
+}
+
+pub fn main(init: std.process.Init) !void {
+    g_io = init.io;
+    const allocator = init.gpa;
+
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
 
     if (args.len < 2) {
         printUsageStderr();
@@ -112,9 +128,9 @@ fn runCompile(allocator: std.mem.Allocator, args: []const []const u8) !void {
 
         const map_path = try std.fmt.allocPrint(allocator, "{s}.map", .{opts.output_file.?});
         defer allocator.free(map_path);
-        const map_file = try std.fs.cwd().createFile(map_path, .{});
-        defer map_file.close();
-        try map_file.writeAll(map_json);
+        const map_file = try std.Io.Dir.cwd().createFile(g_io, map_path, .{});
+        defer map_file.close(g_io);
+        try map_file.writeStreamingAll(g_io, map_json);
         std.debug.print("Source map written to: {s}\n", .{map_path});
         return;
     }
@@ -196,13 +212,13 @@ fn runBuild(allocator: std.mem.Allocator, args: []const []const u8) !void {
     defer allocator.free(bytecode);
 
     if (opts.output_file) |out_path| {
-        const file = try std.fs.cwd().createFile(out_path, .{});
-        defer file.close();
-        try file.writeAll("0x");
-        try file.writeAll(bytecode);
+        const file = try std.Io.Dir.cwd().createFile(g_io, out_path, .{});
+        defer file.close(g_io);
+        try file.writeStreamingAll(g_io, "0x");
+        try file.writeStreamingAll(g_io, bytecode);
         std.debug.print("Built successfully: {s}\n", .{out_path});
     } else {
-        const stdout = std.fs.File.stdout();
+        const stdout = getStdout();
         stdout.writeAll("0x") catch {};
         stdout.writeAll(bytecode) catch {};
         stdout.writeAll("\n") catch {};
@@ -267,14 +283,14 @@ fn runBuildDirect(allocator: std.mem.Allocator, args: []const []const u8) !void 
 
     // Output
     if (opts.output_file) |out_path| {
-        const file = try std.fs.cwd().createFile(out_path, .{});
-        defer file.close();
-        try file.writeAll("0x");
-        try file.writeAll(hex);
+        const file = try std.Io.Dir.cwd().createFile(g_io, out_path, .{});
+        defer file.close(g_io);
+        try file.writeStreamingAll(g_io, "0x");
+        try file.writeStreamingAll(g_io, hex);
         std.debug.print("Built successfully (direct): {s}\n", .{out_path});
         std.debug.print("  Bytecode size: {d} bytes\n", .{result.bytecode.len});
     } else {
-        const stdout = std.fs.File.stdout();
+        const stdout = getStdout();
         stdout.writeAll("0x") catch {};
         stdout.writeAll(hex) catch {};
         stdout.writeAll("\n") catch {};
@@ -379,9 +395,9 @@ fn parseEvmVersionForBytecode(name: []const u8) ?bytecode_compiler.EvmVersion {
 
 fn printBuildDirectUsageStdout() void {
     var buf: [4096]u8 = undefined;
-    var stream = std.io.fixedBufferStream(&buf);
-    printBuildDirectUsageTo(stream.writer()) catch {};
-    std.debug.print("{s}", .{stream.getWritten()});
+    var stream = std.Io.Writer.fixed(&buf);
+    printBuildDirectUsageTo(&stream) catch {};
+    std.debug.print("{s}", .{stream.buffered()});
 }
 
 fn printBuildDirectUsageStderr() void {
@@ -494,7 +510,7 @@ fn runEstimate(allocator: std.mem.Allocator, args: []const []const u8) !void {
     if (opts.output_file) |path| {
         try writeOutput(json_out, path);
     } else {
-        const stdout = std.fs.File.stdout();
+        const stdout = getStdout();
         stdout.writeAll(json_out) catch {};
         stdout.writeAll("\n") catch {};
     }
@@ -553,7 +569,7 @@ fn runProfile(allocator: std.mem.Allocator, args: []const []const u8) !void {
     if (opts.output_file) |path| {
         try writeOutput(yul_code, path);
     } else {
-        const stdout = std.fs.File.stdout();
+        const stdout = getStdout();
         stdout.writeAll(yul_code) catch {};
         stdout.writeAll("\n") catch {};
     }
@@ -595,7 +611,7 @@ fn runProfile(allocator: std.mem.Allocator, args: []const []const u8) !void {
             if (opts.profile_out) |path| {
                 try writeOutput(profile_json, path);
             } else {
-                const stdout = std.fs.File.stdout();
+                const stdout = getStdout();
                 stdout.writeAll(profile_json) catch {};
                 stdout.writeAll("\n") catch {};
             }
@@ -676,10 +692,10 @@ fn runDecodeEvent(allocator: std.mem.Allocator, args: []const []const u8) !void 
     const decoded = try event_decode.decodeEvent(allocator, event, opts.topics.items, opts.data.?);
     defer decoded.deinit(allocator);
 
-    const stdout = std.fs.File.stdout();
+    const stdout = getStdout();
     var buf: [4096]u8 = undefined;
-    var stream = std.io.fixedBufferStream(&buf);
-    const writer = stream.writer();
+    var stream = std.Io.Writer.fixed(&buf);
+    const writer = &stream;
     try writer.print("event {s}\n", .{decoded.name});
     for (decoded.fields) |field| {
         try writer.print("- {s} ({s})", .{ field.name, field.abi_type });
@@ -688,7 +704,7 @@ fn runDecodeEvent(allocator: std.mem.Allocator, args: []const []const u8) !void 
         try event_decode.writeValue(writer, field.value);
         try writer.writeAll("\n");
     }
-    stdout.writeAll(stream.getWritten()) catch {};
+    stdout.writeAll(stream.buffered()) catch {};
 }
 
 fn runDecodeAbi(allocator: std.mem.Allocator, args: []const []const u8) !void {
@@ -727,17 +743,17 @@ fn runDecodeAbi(allocator: std.mem.Allocator, args: []const []const u8) !void {
         try event_decode.decodeAbi(allocator, opts.types.items, opts.data.?);
     defer decoded.deinit(allocator);
 
-    const stdout = std.fs.File.stdout();
+    const stdout = getStdout();
     var buf: [4096]u8 = undefined;
-    var stream = std.io.fixedBufferStream(&buf);
-    const writer = stream.writer();
+    var stream = std.Io.Writer.fixed(&buf);
+    const writer = &stream;
 
     for (decoded.fields, 0..) |field, idx| {
         try writer.print("- arg{d} ({s}): ", .{ idx, field.abi_type });
         try event_decode.writeValue(writer, field.value);
         try writer.writeAll("\n");
     }
-    stdout.writeAll(stream.getWritten()) catch {};
+    stdout.writeAll(stream.buffered()) catch {};
 }
 
 fn parseEventParam(allocator: std.mem.Allocator, text: []const u8) !event_decode.EventParam {
@@ -1201,7 +1217,7 @@ fn mapZigTypeToAbi(zig_type: []const u8) []const u8 {
 }
 
 fn jsonStringifyAlloc(allocator: std.mem.Allocator, value: anytype) ![]u8 {
-    var out: std.io.Writer.Allocating = .init(allocator);
+    var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
 
     var write_stream: std.json.Stringify = .{
@@ -1266,7 +1282,7 @@ fn rpcCall(allocator: std.mem.Allocator, url: []const u8, from: []const u8, to: 
 }
 
 fn rpcCallValue(allocator: std.mem.Allocator, url: []const u8, method: []const u8, params_json: []const u8) !std.json.Parsed(std.json.Value) {
-    var client: std.http.Client = .{ .allocator = allocator };
+    var client: std.http.Client = .{ .allocator = allocator, .io = g_io };
     defer client.deinit();
 
     const uri = try std.Uri.parse(url);
@@ -1628,21 +1644,17 @@ fn parseOptions(args: []const []const u8) !Options {
 }
 
 fn readFile(allocator: std.mem.Allocator, path: []const u8) ![:0]const u8 {
-    const file = std.fs.cwd().openFile(path, .{}) catch |err| {
-        std.debug.print("Error: Cannot open file '{s}': {}\n", .{ path, err });
+    return std.Io.Dir.cwd().readFileAllocOptions(
+        g_io,
+        path,
+        allocator,
+        .unlimited,
+        .@"1",
+        0,
+    ) catch |err| {
+        std.debug.print("Error: Cannot read file '{s}': {}\n", .{ path, err });
         std.process.exit(1);
     };
-    defer file.close();
-
-    const stat = try file.stat();
-    const contents = try allocator.allocSentinel(u8, stat.size, 0);
-
-    const bytes_read = try file.readAll(contents);
-    if (bytes_read != stat.size) {
-        return error.UnexpectedEndOfFile;
-    }
-
-    return contents;
 }
 
 const ResolvedInput = struct {
@@ -1691,12 +1703,12 @@ fn findRootSource(allocator: std.mem.Allocator, build_contents: []const u8) ![]c
 
 fn writeOutput(content: []const u8, output_file: ?[]const u8) !void {
     if (output_file) |out_path| {
-        const file = try std.fs.cwd().createFile(out_path, .{});
-        defer file.close();
-        try file.writeAll(content);
+        const file = try std.Io.Dir.cwd().createFile(g_io, out_path, .{});
+        defer file.close(g_io);
+        try file.writeStreamingAll(g_io, content);
         std.debug.print("Output written to: {s}\n", .{out_path});
     } else {
-        const stdout = std.fs.File.stdout();
+        const stdout = getStdout();
         stdout.writeAll(content) catch {};
         stdout.writeAll("\n") catch {};
     }
@@ -1737,7 +1749,7 @@ fn compileSolc(allocator: std.mem.Allocator, yul_code: []const u8, optimize: boo
     // Create temp file for Yul code
     var tmp_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const tmp_path = try createTempFile(yul_code, &tmp_path_buf);
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(g_io, tmp_path) catch {};
 
     // Build solc command
     var argv: std.ArrayList([]const u8) = .empty;
@@ -1752,36 +1764,41 @@ fn compileSolc(allocator: std.mem.Allocator, yul_code: []const u8, optimize: boo
     }
 
     // Run solc
-    var child = std.process.Child.init(argv.items, allocator);
-    child.stderr_behavior = .Pipe;
-    child.stdout_behavior = .Pipe;
-
-    try child.spawn();
-
-    // Read stdout
-    var stdout_buf: [64 * 1024]u8 = undefined;
-    const stdout_len = child.stdout.?.readAll(&stdout_buf) catch |err| {
-        std.debug.print("Error reading solc output: {}\n", .{err});
-        std.process.exit(1);
-    };
-    const stdout = stdout_buf[0..stdout_len];
-
-    // Read stderr
-    var stderr_buf: [64 * 1024]u8 = undefined;
-    const stderr_len = child.stderr.?.readAll(&stderr_buf) catch |err| {
-        std.debug.print("Error reading solc stderr: {}\n", .{err});
-        std.process.exit(1);
-    };
-    const stderr = stderr_buf[0..stderr_len];
-
-    const term = child.wait() catch |err| {
+    var child = std.process.spawn(g_io, .{
+        .argv = argv.items,
+        .stdout = .pipe,
+        .stderr = .pipe,
+    }) catch |err| {
         std.debug.print("Error: Failed to run solc: {}\n", .{err});
         std.debug.print("Make sure solc is installed and in your PATH.\n", .{});
         std.debug.print("Install: npm install -g solc\n", .{});
         std.process.exit(1);
     };
 
-    if (term.Exited != 0) {
+    // Read stdout
+    var stdout_rbuf: [4096]u8 = undefined;
+    var stdout_reader = child.stdout.?.reader(g_io, &stdout_rbuf);
+    const stdout = stdout_reader.interface.allocRemaining(allocator, .limited(1024 * 1024)) catch |err| {
+        std.debug.print("Error reading solc output: {}\n", .{err});
+        std.process.exit(1);
+    };
+    defer allocator.free(stdout);
+
+    // Read stderr
+    var stderr_rbuf: [4096]u8 = undefined;
+    var stderr_reader = child.stderr.?.reader(g_io, &stderr_rbuf);
+    const stderr = stderr_reader.interface.allocRemaining(allocator, .limited(1024 * 1024)) catch |err| {
+        std.debug.print("Error reading solc stderr: {}\n", .{err});
+        std.process.exit(1);
+    };
+    defer allocator.free(stderr);
+
+    const term = child.wait(g_io) catch |err| {
+        std.debug.print("Error: Failed to run solc: {}\n", .{err});
+        std.process.exit(1);
+    };
+
+    if (term != .exited or term.exited != 0) {
         std.debug.print("solc compilation failed:\n{s}\n", .{stderr});
         std.process.exit(1);
     }
@@ -1798,18 +1815,20 @@ fn compileSolc(allocator: std.mem.Allocator, yul_code: []const u8, optimize: boo
 
 fn createTempFile(content: []const u8, buf: *[std.fs.max_path_bytes]u8) ![]const u8 {
     // Use /tmp on Unix
-    const tmp_dir = std.fs.cwd().openDir("/tmp", .{}) catch std.fs.cwd();
+    const tmp_dir = std.Io.Dir.cwd().openDir(g_io, "/tmp", .{}) catch std.Io.Dir.cwd();
 
-    const rand = std.crypto.random.int(u64);
+    var rand_bytes: [8]u8 = undefined;
+    g_io.random(&rand_bytes);
+    const rand = std.mem.readInt(u64, &rand_bytes, .little);
     const filename = std.fmt.bufPrint(buf, "/tmp/zig-to-yul-{x}.yul", .{rand}) catch unreachable;
 
-    const file = tmp_dir.createFile(filename[5..], .{}) catch |err| {
+    const file = tmp_dir.createFile(g_io, filename[5..], .{}) catch |err| {
         std.debug.print("Error creating temp file: {}\n", .{err});
         std.process.exit(1);
     };
-    defer file.close();
+    defer file.close(g_io);
 
-    try file.writeAll(content);
+    try file.writeStreamingAll(g_io, content);
 
     return filename;
 }
@@ -1843,7 +1862,7 @@ fn extractBytecode(allocator: std.mem.Allocator, output: []const u8) ![]const u8
 
 // Printing functions using debug.print (writes to stderr)
 fn printVersionStdout() void {
-    const stdout = std.fs.File.stdout();
+    const stdout = getStdout();
     stdout.writeAll("zig-to-yul v") catch {};
     stdout.writeAll(version) catch {};
     stdout.writeAll("\n") catch {};
@@ -2003,9 +2022,9 @@ fn printUsageTo(writer: anytype) !void {
 
 fn printUsageStdout() void {
     var buf: [4096]u8 = undefined;
-    var stream = std.io.fixedBufferStream(&buf);
-    printUsageTo(stream.writer()) catch {};
-    std.debug.print("{s}", .{stream.getWritten()});
+    var stream = std.Io.Writer.fixed(&buf);
+    printUsageTo(&stream) catch {};
+    std.debug.print("{s}", .{stream.buffered()});
 }
 
 fn printUsageStderr() void {
@@ -2032,26 +2051,29 @@ fn printUsageStderr() void {
 }
 
 fn runCommand(allocator: std.mem.Allocator, argv: []const []const u8) ![]u8 {
-    var child = std.process.Child.init(argv, allocator);
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
+    var child = try std.process.spawn(g_io, .{
+        .argv = argv,
+        .stdout = .pipe,
+        .stderr = .pipe,
+    });
 
-    try child.spawn();
+    var stdout_rbuf: [4096]u8 = undefined;
+    var stdout_reader = child.stdout.?.reader(g_io, &stdout_rbuf);
+    const stdout = stdout_reader.interface.allocRemaining(allocator, .limited(64 * 1024)) catch try allocator.dupe(u8, "");
+    defer allocator.free(stdout);
 
-    var stdout_buf: [64 * 1024]u8 = undefined;
-    var stderr_buf: [64 * 1024]u8 = undefined;
-    const stdout_len = child.stdout.?.readAll(&stdout_buf) catch 0;
-    const stderr_len = child.stderr.?.readAll(&stderr_buf) catch 0;
+    var stderr_rbuf: [4096]u8 = undefined;
+    var stderr_reader = child.stderr.?.reader(g_io, &stderr_rbuf);
+    const stderr = stderr_reader.interface.allocRemaining(allocator, .limited(64 * 1024)) catch try allocator.dupe(u8, "");
+    defer allocator.free(stderr);
 
-    const term = try child.wait();
-    const stdout = stdout_buf[0..stdout_len];
-    const stderr = stderr_buf[0..stderr_len];
-    if (term.Exited != 0) {
+    const term = try child.wait(g_io);
+    if (term != .exited or term.exited != 0) {
         std.debug.print("Command failed: {s}\n{s}\n{s}\n", .{ argv[0], stdout, stderr });
         return error.CommandFailed;
     }
 
-    if (stdout_len == 0 and stderr_len > 0) {
+    if (stdout.len == 0 and stderr.len > 0) {
         return try allocator.dupe(u8, stderr);
     }
     return try allocator.dupe(u8, stdout);
@@ -2124,7 +2146,7 @@ test "cli help" {
     const allocator = arena.allocator();
 
     const exe_path = "zig-out/bin/zig_to_yul";
-    std.fs.cwd().access(exe_path, .{}) catch return error.SkipZigTest;
+    std.Io.Dir.cwd().access(g_io, exe_path, .{}) catch return error.SkipZigTest;
 
     const output = try runCommand(allocator, &.{ exe_path, "help" });
     defer allocator.free(output);

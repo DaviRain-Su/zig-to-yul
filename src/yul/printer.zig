@@ -357,7 +357,7 @@ pub const Printer = struct {
     }
 
     fn writeFmt(self: *Self, comptime fmt: []const u8, args: anytype) Error!void {
-        try self.output.writer(self.allocator).print(fmt, args);
+        try self.output.print(self.allocator, fmt, args);
     }
 
     fn newline(self: *Self) Error!void {

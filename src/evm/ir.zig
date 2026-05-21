@@ -225,8 +225,8 @@ pub const FunctionDef = struct {
     /// Calculate the function selector from the signature.
     pub fn computeSelector(name: []const u8, param_types: []const AbiType) u32 {
         var sig_buf: [1024]u8 = undefined;
-        var stream = std.io.fixedBufferStream(&sig_buf);
-        const writer = stream.writer();
+        var stream = std.Io.Writer.fixed(&sig_buf);
+        const writer = &stream;
 
         writer.writeAll(name) catch unreachable;
         writer.writeByte('(') catch unreachable;
@@ -238,7 +238,7 @@ pub const FunctionDef = struct {
 
         writer.writeByte(')') catch unreachable;
 
-        const signature = stream.getWritten();
+        const signature = stream.buffered();
         const hash = keccak256(signature);
         return @as(u32, hash[0]) << 24 |
             @as(u32, hash[1]) << 16 |

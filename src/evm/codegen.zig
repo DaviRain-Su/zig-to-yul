@@ -425,7 +425,7 @@ pub const Codegen = struct {
                 try self.bytecode.append(self.allocator,@intFromEnum(Opcode.PUSH2));
                 try self.bytecode.appendNTimes(self.allocator,0, 2);
             },
-            .datacopy => |_| {
+            .datacopy => {
                 // CODECOPY pattern - resolved during linking
             },
             .raw_bytes => |bytes| {

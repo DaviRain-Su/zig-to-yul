@@ -1,6 +1,14 @@
 //! JSON-RPC helpers for Ethereum nodes.
 
 const std = @import("std");
+const env = @import("env.zig");
+
+fn defaultIo() std.Io {
+    return if (@import("builtin").is_test)
+        std.testing.io
+    else
+        std.Io.Threaded.global_single_threaded.io();
+}
 
 pub const RpcError = error{
     InvalidResponse,
@@ -46,7 +54,7 @@ pub fn netVersion(allocator: std.mem.Allocator, rpc_url: []const u8) ![]u8 {
 }
 
 fn rpcRequest(allocator: std.mem.Allocator, rpc_url: []const u8, payload: []const u8) ![]u8 {
-    var client: std.http.Client = .{ .allocator = allocator };
+    var client: std.http.Client = .{ .allocator = allocator, .io = defaultIo() };
     defer client.deinit();
 
     const uri = try std.Uri.parse(rpc_url);
@@ -104,10 +112,7 @@ test "rpc compatibility (clientVersion/chainId/net_version)" {
 }
 
 fn runRpcCompatEnv(allocator: std.mem.Allocator, env_name: []const u8) !void {
-    const rpc_url = std.process.getEnvVarOwned(allocator, env_name) catch |err| switch (err) {
-        error.EnvironmentVariableNotFound => return,
-        else => return err,
-    };
+    const rpc_url = (try env.getEnvOwned(allocator, env_name)) orelse return;
     defer allocator.free(rpc_url);
 
     const client_version = try web3ClientVersion(allocator, rpc_url);
