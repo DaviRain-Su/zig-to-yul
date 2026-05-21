@@ -263,12 +263,10 @@ pub const Optimizer = struct {
             }
         }
 
-        // Pattern: PUSH 1, DIV → remove both (x / 1 = x)
-        if (remaining >= 2) {
-            if (isPushValue(insts[i], 1) and insts[i + 1] == .opcode and insts[i + 1].opcode == .DIV) {
-                return 2;
-            }
-        }
+        // Note: there is no safe "PUSH 1, DIV -> remove" peephole. On the EVM,
+        // DIV computes top / second, and an adjacent "PUSH 1, DIV" puts 1 on top,
+        // so it represents 1 / x (div(1, x)), not x / 1. Removing it would be a
+        // miscompilation, so the pattern is intentionally omitted.
 
         // Pattern: PUSH 0, OR → remove both (x | 0 = x)
         if (remaining >= 2) {
@@ -333,22 +331,27 @@ pub const Optimizer = struct {
             const b_val = getPushValue(insts[i + 1]);
 
             if (a_val != null and b_val != null and insts[i + 2] == .opcode) {
+                // `a` is the first-pushed value (deeper on the stack, EVM mu_s[1]);
+                // `b` is the second-pushed value (top of stack, EVM mu_s[0]).
+                // EVM binary ops compute op(top, second) = op(b, a), so for the
+                // non-commutative ops the operands must be applied in that order.
                 const a = a_val.?;
                 const b = b_val.?;
                 const op = insts[i + 2].opcode;
 
                 const result: ?u256 = switch (op) {
                     .ADD => a +% b,
-                    .SUB => a -% b,
+                    .SUB => b -% a,
                     .MUL => a *% b,
-                    .DIV => if (b != 0) a / b else null,
-                    .MOD => if (b != 0) a % b else null,
+                    .DIV => if (a != 0) b / a else null,
+                    .MOD => if (a != 0) b % a else null,
                     .EXP => blk: {
-                        // Only fold small exponents to avoid overflow issues
-                        if (b > 256) break :blk null;
+                        // exp(base, exponent): base is on top (b), exponent is below (a).
+                        // Only fold small exponents to avoid overflow issues.
+                        if (a > 256) break :blk null;
                         var result: u256 = 1;
-                        var base = a;
-                        var exp = b;
+                        var base = b;
+                        var exp = a;
                         while (exp > 0) {
                             if (exp & 1 == 1) result *%= base;
                             base *%= base;
@@ -359,9 +362,11 @@ pub const Optimizer = struct {
                     .AND => a & b,
                     .OR => a | b,
                     .XOR => a ^ b,
-                    .LT => if (a < b) 1 else 0,
-                    .GT => if (a > b) 1 else 0,
+                    .LT => if (b < a) 1 else 0,
+                    .GT => if (b > a) 1 else 0,
                     .EQ => if (a == b) 1 else 0,
+                    // shl/shr(shift, value): shift is on top (b), value is below (a),
+                    // so the result is value-shifted-by-shift = a shifted by b.
                     .SHL => if (b < 256) a << @truncate(b) else 0,
                     .SHR => if (b < 256) a >> @truncate(b) else 0,
                     else => null,
@@ -672,6 +677,123 @@ test "constant folding: mul" {
 
     try std.testing.expectEqual(@as(usize, 2), result.len);
     try std.testing.expectEqual(@as(u256, 42), result[0].push);
+}
+
+// For these non-commutative ops the operand order matters: the EVM computes
+// op(top, second), and the assembler pushes the second operand first, so
+// `PUSH p0, PUSH p1, OP` must fold to op(p1, p0).
+test "constant folding: sub uses correct operand order" {
+    const allocator = std.testing.allocator;
+    var optimizer = Optimizer.init(allocator, .cancun);
+    defer optimizer.deinit();
+
+    // PUSH 3, PUSH 10, SUB == sub(10, 3) == 7 (not 3 - 10)
+    const input = [_]Instruction{
+        .{ .push = 3 },
+        .{ .push = 10 },
+        .{ .opcode = .SUB },
+        .{ .opcode = .STOP },
+    };
+
+    const result = try optimizer.optimize(&input);
+    defer allocator.free(result);
+
+    try std.testing.expectEqual(@as(usize, 2), result.len);
+    try std.testing.expectEqual(@as(u256, 7), result[0].push);
+}
+
+test "constant folding: div uses correct operand order" {
+    const allocator = std.testing.allocator;
+    var optimizer = Optimizer.init(allocator, .cancun);
+    defer optimizer.deinit();
+
+    // PUSH 2, PUSH 10, DIV == div(10, 2) == 5 (not 2 / 10 == 0)
+    const input = [_]Instruction{
+        .{ .push = 2 },
+        .{ .push = 10 },
+        .{ .opcode = .DIV },
+        .{ .opcode = .STOP },
+    };
+
+    const result = try optimizer.optimize(&input);
+    defer allocator.free(result);
+
+    try std.testing.expectEqual(@as(usize, 2), result.len);
+    try std.testing.expectEqual(@as(u256, 5), result[0].push);
+}
+
+test "constant folding: mod uses correct operand order" {
+    const allocator = std.testing.allocator;
+    var optimizer = Optimizer.init(allocator, .cancun);
+    defer optimizer.deinit();
+
+    // PUSH 3, PUSH 10, MOD == mod(10, 3) == 1
+    const input = [_]Instruction{
+        .{ .push = 3 },
+        .{ .push = 10 },
+        .{ .opcode = .MOD },
+        .{ .opcode = .STOP },
+    };
+
+    const result = try optimizer.optimize(&input);
+    defer allocator.free(result);
+
+    try std.testing.expectEqual(@as(usize, 2), result.len);
+    try std.testing.expectEqual(@as(u256, 1), result[0].push);
+}
+
+test "constant folding: lt/gt use correct operand order" {
+    const allocator = std.testing.allocator;
+
+    // PUSH 3, PUSH 10, LT == lt(10, 3) == 0
+    {
+        var optimizer = Optimizer.init(allocator, .cancun);
+        defer optimizer.deinit();
+        const input = [_]Instruction{
+            .{ .push = 3 },
+            .{ .push = 10 },
+            .{ .opcode = .LT },
+            .{ .opcode = .STOP },
+        };
+        const result = try optimizer.optimize(&input);
+        defer allocator.free(result);
+        try std.testing.expectEqual(@as(u256, 0), result[0].push);
+    }
+
+    // PUSH 3, PUSH 10, GT == gt(10, 3) == 1
+    {
+        var optimizer = Optimizer.init(allocator, .cancun);
+        defer optimizer.deinit();
+        const input = [_]Instruction{
+            .{ .push = 3 },
+            .{ .push = 10 },
+            .{ .opcode = .GT },
+            .{ .opcode = .STOP },
+        };
+        const result = try optimizer.optimize(&input);
+        defer allocator.free(result);
+        try std.testing.expectEqual(@as(u256, 1), result[0].push);
+    }
+}
+
+test "constant folding: exp uses correct base and exponent" {
+    const allocator = std.testing.allocator;
+    var optimizer = Optimizer.init(allocator, .cancun);
+    defer optimizer.deinit();
+
+    // PUSH 3, PUSH 2, EXP == exp(2, 3) == 8 (base 2, exponent 3)
+    const input = [_]Instruction{
+        .{ .push = 3 },
+        .{ .push = 2 },
+        .{ .opcode = .EXP },
+        .{ .opcode = .STOP },
+    };
+
+    const result = try optimizer.optimize(&input);
+    defer allocator.free(result);
+
+    try std.testing.expectEqual(@as(usize, 2), result.len);
+    try std.testing.expectEqual(@as(u256, 8), result[0].push);
 }
 
 test "dead code elimination" {
