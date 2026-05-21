@@ -78,6 +78,9 @@ pub fn translateExpression(self: anytype, index: ZigAst.Node.Index) TransformPro
         },
         .string_literal => try self.translateStringLiteralExpr(index, loc),
         .char_literal => try self.translateCharLiteralExpr(index, loc),
+        // `try expr`: internal-call reverts propagate automatically on the EVM,
+        // so the error-union wrapper is transparent — lower to the inner value.
+        .@"try" => try self.translateExpression(p.ast.nodeData(index).node),
         .add => try self.translateBinaryOp(index, "add"),
         .sub => try self.translateBinaryOp(index, "sub"),
         .mul => try self.translateBinaryOp(index, "mul"),

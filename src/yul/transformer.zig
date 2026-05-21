@@ -1122,7 +1122,13 @@ pub const Transformer = struct {
             var return_typed: []const ast.TypedName = &.{};
             const has_return = blk: {
                 if (proto.return_type.unwrap()) |ret_type| {
-                    const ret_src = p.getNodeSource(ret_type);
+                    const ret_src_raw = p.getNodeSource(ret_type);
+                    // Error union `!T` / `ErrSet!T`: error paths revert, so the
+                    // function ABI is just the payload type T.
+                    const ret_src = if (std.mem.indexOfScalar(u8, ret_src_raw, '!')) |bang|
+                        std.mem.trim(u8, ret_src_raw[bang + 1 ..], " \t\r\n")
+                    else
+                        ret_src_raw;
                     if (std.mem.eql(u8, ret_src, "void")) break :blk false;
                     if (self.struct_defs.get(ret_src)) |fields| {
                         return_struct_len = fields.len;
@@ -1806,6 +1812,22 @@ pub const Transformer = struct {
         try self.processAssignBinary(index, stmts, "xor");
     }
 
+    /// Emit a Solidity-style custom-error revert: store the 4-byte selector of
+    /// `Name()` and revert with it. Used to lower `return error.Name`.
+    fn emitErrorRevert(self: *Self, error_name: []const u8, stmts: *std.ArrayList(ast.Statement), loc: ast.SourceLocation) TransformProcessError!void {
+        const selector = try FunctionInfo.calculateSelector(self.allocator, error_name, &.{});
+        const store_selector = try self.builder.builtinCall("mstore", &.{
+            ast.Expression.lit(ast.Literal.number(0)),
+            ast.Expression.lit(ast.Literal.number(selector)),
+        });
+        const revert_call = try self.builder.builtinCall("revert", &.{
+            ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0x1c))),
+            ast.Expression.lit(ast.Literal.number(@as(ast.U256, 4))),
+        });
+        try stmts.append(self.allocator, self.stmtWithLocation(ast.Statement.expr(store_selector), loc));
+        try stmts.append(self.allocator, self.stmtWithLocation(ast.Statement.expr(revert_call), loc));
+    }
+
     pub fn processReturn(self: *Self, index: ZigAst.Node.Index, stmts: *std.ArrayList(ast.Statement)) TransformProcessError!void {
         const p = &self.zig_parser.?;
         const data = p.ast.nodeData(index);
@@ -1813,6 +1835,17 @@ pub const Transformer = struct {
 
         if (opt_node.unwrap()) |ret_node| {
             const tag = p.getNodeTag(ret_node);
+            if (tag == .error_value) {
+                // `return error.Name;` -> custom-error revert (no leave needed,
+                // revert halts execution).
+                const src = p.getNodeSource(ret_node);
+                const err_name = if (std.mem.lastIndexOfScalar(u8, src, '.')) |dot|
+                    std.mem.trim(u8, src[dot + 1 ..], " \t\r\n")
+                else
+                    std.mem.trim(u8, src, " \t\r\n");
+                try self.emitErrorRevert(err_name, stmts, self.nodeLocation(index));
+                return;
+            }
             if (self.isInlineIfExprTag(tag)) {
                 try self.emitInlineIfAssignName(index, "result", ret_node, .return_value, stmts);
             } else {
@@ -10837,6 +10870,43 @@ test "signed types select signed ops" {
     try std.testing.expect(std.mem.indexOf(u8, output, "slt(a, b)") != null);
     // unsigned division stays unsigned
     try std.testing.expect(std.mem.indexOf(u8, output, "result := div(a, b)") != null);
+}
+
+test "error union lowers to revert and try is transparent" {
+    const allocator = std.testing.allocator;
+    const printer = @import("printer.zig");
+
+    const source =
+        \\pub const E = struct {
+        \\    pub fn withdraw(self: *E, amount: u256) !u256 {
+        \\        _ = self;
+        \\        if (amount > 100) {
+        \\            return error.InsufficientBalance;
+        \\        }
+        \\        return amount;
+        \\    }
+        \\    pub fn chained(self: *E, amount: u256) !u256 {
+        \\        return try self.withdraw(amount);
+        \\    }
+        \\};
+    ;
+
+    const source_z = try allocator.dupeZ(u8, source);
+    defer allocator.free(source_z);
+
+    var transformer = Transformer.init(allocator);
+    defer transformer.deinit();
+
+    const yul_ast = try transformer.transform(source_z);
+    const output = try printer.format(allocator, yul_ast);
+    defer allocator.free(output);
+
+    // error.X -> custom-error revert
+    try std.testing.expect(std.mem.indexOf(u8, output, "revert(28, 4)") != null);
+    // !u256 return is unwrapped to a normal uint256 result
+    try std.testing.expect(std.mem.indexOf(u8, output, "result := amount") != null);
+    // try is transparent: chained calls withdraw directly
+    try std.testing.expect(std.mem.indexOf(u8, output, "result := withdraw(amount)") != null);
 }
 
 test "transient storage builtins" {
