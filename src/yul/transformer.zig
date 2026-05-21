@@ -1105,6 +1105,9 @@ pub const Transformer = struct {
                         try param_struct_lens.append(self.allocator, 0);
                         try param_struct_dynamic.append(self.allocator, false);
                         try param_struct_names.append(self.allocator, "");
+                        // Record scalar param type so narrow ints mask and signed
+                        // ints select signed ops inside the body.
+                        try self.setLocalVarType(param_info.name, zig_type);
                     }
                     try param_types.append(self.allocator, abi_type);
                 }
@@ -2511,6 +2514,28 @@ pub const Transformer = struct {
         return transformer_expression.reportUnsupportedExpr(self, index);
     }
 
+    /// Best-effort signedness of a Zig expression node: true if it is (or is
+    /// built from) a signed-typed local/param, or an explicit negation. Storage
+    /// fields are not tracked, so signed storage values are treated as unsigned.
+    fn isSignedNode(self: *Self, node: ZigAst.Node.Index) bool {
+        const p = &self.zig_parser.?;
+        const tag = p.getNodeTag(node);
+        return switch (tag) {
+            .negation, .negation_wrap => true,
+            .grouped_expression => self.isSignedNode(p.ast.nodeData(node).node_and_token[0]),
+            .identifier => blk: {
+                const name = p.getNodeSource(node);
+                const ty = self.local_var_types.get(name) orelse break :blk false;
+                break :blk transformer_types.isSignedTypeName(ty);
+            },
+            .add, .sub, .mul, .div, .mod, .shl, .shr, .bit_and, .bit_or, .bit_xor => blk: {
+                const d = p.ast.nodeData(node).node_and_node;
+                break :blk self.isSignedNode(d[0]) or self.isSignedNode(d[1]);
+            },
+            else => false,
+        };
+    }
+
     pub fn translateBinaryOp(self: *Self, index: ZigAst.Node.Index, op: []const u8) TransformProcessError!ast.Expression {
         const p = &self.zig_parser.?;
         const data = p.ast.nodeData(index);
@@ -2519,7 +2544,14 @@ pub const Transformer = struct {
         const left = try self.translateExpression(nodes[0]);
         const right = try self.translateExpression(nodes[1]);
 
-        return try self.builder.builtinCall(op, &.{ left, right });
+        var eff_op = op;
+        if (transformer_types.signedOpVariant(op)) |signed_op| {
+            if (self.isSignedNode(nodes[0]) or self.isSignedNode(nodes[1])) {
+                eff_op = signed_op;
+            }
+        }
+
+        return try self.builder.builtinCall(eff_op, &.{ left, right });
     }
 
     pub fn translateInequality(self: *Self, index: ZigAst.Node.Index) TransformProcessError!ast.Expression {
@@ -10768,6 +10800,43 @@ test "string and char literals as values" {
 
     try std.testing.expect(std.mem.indexOf(u8, output, "\"ERC20\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "let c := 65") != null);
+}
+
+test "signed types select signed ops" {
+    const allocator = std.testing.allocator;
+    const printer = @import("printer.zig");
+
+    const source =
+        \\pub const Sgn = struct {
+        \\    pub fn divs(self: *Sgn, a: i256, b: i256) i256 {
+        \\        _ = self;
+        \\        return a / b;
+        \\    }
+        \\    pub fn divu(self: *Sgn, a: u256, b: u256) u256 {
+        \\        _ = self;
+        \\        return a / b;
+        \\    }
+        \\    pub fn cmp(self: *Sgn, a: i256, b: i256) bool {
+        \\        _ = self;
+        \\        return a < b;
+        \\    }
+        \\};
+    ;
+
+    const source_z = try allocator.dupeZ(u8, source);
+    defer allocator.free(source_z);
+
+    var transformer = Transformer.init(allocator);
+    defer transformer.deinit();
+
+    const yul_ast = try transformer.transform(source_z);
+    const output = try printer.format(allocator, yul_ast);
+    defer allocator.free(output);
+
+    try std.testing.expect(std.mem.indexOf(u8, output, "sdiv(a, b)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "slt(a, b)") != null);
+    // unsigned division stays unsigned
+    try std.testing.expect(std.mem.indexOf(u8, output, "result := div(a, b)") != null);
 }
 
 test "transient storage builtins" {

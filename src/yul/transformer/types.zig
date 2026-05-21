@@ -5,7 +5,14 @@ pub fn mapZigTypeToAbi(zig_type: []const u8) []const u8 {
     if (std.mem.eql(u8, zig_type, "u128")) return "uint128";
     if (std.mem.eql(u8, zig_type, "u64")) return "uint64";
     if (std.mem.eql(u8, zig_type, "u32")) return "uint32";
+    if (std.mem.eql(u8, zig_type, "u16")) return "uint16";
     if (std.mem.eql(u8, zig_type, "u8")) return "uint8";
+    if (std.mem.eql(u8, zig_type, "i256")) return "int256";
+    if (std.mem.eql(u8, zig_type, "i128")) return "int128";
+    if (std.mem.eql(u8, zig_type, "i64")) return "int64";
+    if (std.mem.eql(u8, zig_type, "i32")) return "int32";
+    if (std.mem.eql(u8, zig_type, "i16")) return "int16";
+    if (std.mem.eql(u8, zig_type, "i8")) return "int8";
     if (std.mem.eql(u8, zig_type, "bool")) return "bool";
     if (std.mem.eql(u8, zig_type, "Address") or std.mem.eql(u8, zig_type, "evm.Address")) return "address";
     if (std.mem.eql(u8, zig_type, "[20]u8")) return "address";
@@ -57,4 +64,26 @@ pub fn zigUintMaskBits(zig_type: []const u8) ?u16 {
         std.mem.eql(u8, zig_type, "[20]u8")) return 160;
     if (zig_type.len < 2 or zig_type[0] != 'u') return null;
     return maskBitsForDigits(zig_type[1..]);
+}
+
+/// True for a Zig signed integer type ("i8", "i256", ...).
+pub fn isSignedTypeName(zig_type: []const u8) bool {
+    if (zig_type.len < 2 or zig_type[0] != 'i') return false;
+    const rest = zig_type[1..];
+    for (rest) |c| {
+        if (c < '0' or c > '9') return false;
+    }
+    const bits = std.fmt.parseInt(u16, rest, 10) catch return false;
+    return bits >= 1 and bits <= 256;
+}
+
+/// Signed EVM op for a sign-sensitive unsigned op, or null if the op has no
+/// signed variant (add/sub/mul/eq/and/... are sign-agnostic).
+pub fn signedOpVariant(op: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, op, "lt")) return "slt";
+    if (std.mem.eql(u8, op, "gt")) return "sgt";
+    if (std.mem.eql(u8, op, "div")) return "sdiv";
+    if (std.mem.eql(u8, op, "mod")) return "smod";
+    if (std.mem.eql(u8, op, "shr")) return "sar";
+    return null;
 }
