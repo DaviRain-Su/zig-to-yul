@@ -60,13 +60,7 @@ pub fn generateFunctionCase(self: anytype, fi: anytype) !ast.Block {
                     const load_expr = try self.builder.builtinCall("mload", &.{
                         ast.Expression.lit(ast.Literal.number(@as(ast.U256, @intCast(k * 32)))),
                     });
-                    const value_expr = if (std.mem.eql(u8, param_abi, "address"))
-                        try self.builder.builtinCall("and", &.{
-                            load_expr,
-                            ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0xffffffffffffffffffffffffffffffffffffffff))),
-                        })
-                    else
-                        load_expr;
+                    const value_expr = try self.maskExprToAbiType(load_expr, param_abi);
                     const var_decl = try self.builder.varDecl(&.{param_name}, value_expr);
                     try case_stmts.append(self.allocator, var_decl);
                     try call_args.append(self.allocator, ast.Expression.id(param_name));
@@ -208,13 +202,7 @@ pub fn generateFunctionCase(self: anytype, fi: anytype) !ast.Block {
             const load_call = try self.builder.builtinCall("calldataload", &.{
                 ast.Expression.lit(ast.Literal.number(offset)),
             });
-            const value_expr = if (std.mem.eql(u8, abi_type, "address"))
-                try self.builder.builtinCall("and", &.{
-                    load_call,
-                    ast.Expression.lit(ast.Literal.number(@as(ast.U256, 0xffffffffffffffffffffffffffffffffffffffff))),
-                })
-            else
-                load_call;
+            const value_expr = try self.maskExprToAbiType(load_call, abi_type);
             const var_decl = try self.builder.varDecl(&.{param_name}, value_expr);
             try case_stmts.append(self.allocator, var_decl);
             try call_args.append(self.allocator, ast.Expression.id(param_name));
@@ -309,9 +297,13 @@ pub fn generateFunctionCase(self: anytype, fi: anytype) !ast.Block {
             });
             try case_stmts.append(self.allocator, ast.Statement.expr(return_call));
         } else {
+            const ret_value = if (fi.return_abi) |abi|
+                try self.maskExprToAbiType(ast.Expression.id("_result"), abi)
+            else
+                ast.Expression.id("_result");
             const mstore_call = try self.builder.builtinCall("mstore", &.{
                 ast.Expression.lit(ast.Literal.number(0)),
-                ast.Expression.id("_result"),
+                ret_value,
             });
             try case_stmts.append(self.allocator, ast.Statement.expr(mstore_call));
 

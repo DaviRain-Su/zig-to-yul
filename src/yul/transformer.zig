@@ -45,6 +45,9 @@ pub const Transformer = struct {
     struct_init_helpers: std.StringHashMap([]const u8),
 
     local_struct_vars: std.StringHashMap([]const u8),
+    /// Declared primitive type of scalar locals/params (e.g. "u8", "address"),
+    /// used to mask narrow integers to their width on store.
+    local_var_types: std.StringHashMap([]const u8),
     local_mapping_ref_vars: std.StringHashMap(MappingRefTypeInfo),
     local_mapping_remove_ref_vars: std.StringHashMap(MappingRemoveRefTypeInfo),
     local_mapping_ref_ptr_vars: std.StringHashMap(MappingRefTypeInfo),
@@ -193,6 +196,7 @@ pub const Transformer = struct {
             .enum_defs = std.StringHashMap(EnumDef).init(allocator),
             .struct_init_helpers = std.StringHashMap([]const u8).init(allocator),
             .local_struct_vars = std.StringHashMap([]const u8).init(allocator),
+            .local_var_types = std.StringHashMap([]const u8).init(allocator),
             .local_mapping_ref_vars = std.StringHashMap(MappingRefTypeInfo).init(allocator),
             .local_mapping_remove_ref_vars = std.StringHashMap(MappingRemoveRefTypeInfo).init(allocator),
             .local_mapping_ref_ptr_vars = std.StringHashMap(MappingRefTypeInfo).init(allocator),
@@ -251,6 +255,12 @@ pub const Transformer = struct {
             self.allocator.free(entry.value_ptr.*);
         }
         self.local_struct_vars.deinit();
+        var var_type_it = self.local_var_types.iterator();
+        while (var_type_it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            self.allocator.free(entry.value_ptr.*);
+        }
+        self.local_var_types.deinit();
         var ref_it = self.local_mapping_ref_vars.iterator();
         while (ref_it.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
@@ -1452,6 +1462,11 @@ pub const Transformer = struct {
                 try self.addError(msg, self.nodeLocation(index), .type_error);
             }
 
+            if (type_override) |declared_type| {
+                try self.setLocalVarType(name, declared_type);
+                if (value) |v| value = try self.maskExprToZigType(v, declared_type);
+            }
+
             const stmt = try self.builder.varDecl(&.{name}, value);
             try stmts.append(self.allocator, self.stmtWithLocation(stmt, self.nodeLocation(index)));
         }
@@ -1598,7 +1613,11 @@ pub const Transformer = struct {
             try stmts.append(self.allocator, self.stmtWithLocation(ast.Statement.expr(value), self.nodeLocation(index)));
             return;
         }
-        const stmt = try self.builder.assign(&.{target_name}, value);
+        const masked_value = if (self.local_var_types.get(target_name)) |declared_type|
+            try self.maskExprToZigType(value, declared_type)
+        else
+            value;
+        const stmt = try self.builder.assign(&.{target_name}, masked_value);
         try stmts.append(self.allocator, self.stmtWithLocation(stmt, self.nodeLocation(index)));
     }
 
@@ -10288,6 +10307,39 @@ pub const Transformer = struct {
         try self.local_array_elem_types.put(key, val);
     }
 
+    fn setLocalVarType(self: *Self, name: []const u8, type_name: []const u8) !void {
+        if (self.local_var_types.getEntry(name)) |entry| {
+            self.allocator.free(entry.value_ptr.*);
+            entry.value_ptr.* = try self.allocator.dupe(u8, type_name);
+            return;
+        }
+        const key = try self.allocator.dupe(u8, name);
+        const val = try self.allocator.dupe(u8, type_name);
+        try self.local_var_types.put(key, val);
+    }
+
+    /// Wrap `expr` in `and(expr, (1<<bits)-1)`. `bits` must be in [1, 255].
+    pub fn maskExprToBits(self: *Self, expr: ast.Expression, bits: u16) TransformProcessError!ast.Expression {
+        const mask: ast.U256 = (@as(ast.U256, 1) << @intCast(bits)) - 1;
+        return try self.builder.builtinCall("and", &.{
+            expr,
+            ast.Expression.lit(ast.Literal.number(mask)),
+        });
+    }
+
+    /// Mask a value to the width of a Zig unsigned type (u8/u32/.../address).
+    /// No-op for u256, signed, or non-integer types.
+    pub fn maskExprToZigType(self: *Self, expr: ast.Expression, zig_type: []const u8) TransformProcessError!ast.Expression {
+        const bits = transformer_types.zigUintMaskBits(zig_type) orelse return expr;
+        return self.maskExprToBits(expr, bits);
+    }
+
+    /// Mask a value to the width of an ABI unsigned type (uint8/.../address).
+    pub fn maskExprToAbiType(self: *Self, expr: ast.Expression, abi_type: []const u8) TransformProcessError!ast.Expression {
+        const bits = transformer_types.abiUintMaskBits(abi_type) orelse return expr;
+        return self.maskExprToBits(expr, bits);
+    }
+
     fn setFunctionParamStructs(self: *Self, name: []const u8, items: []const []const u8) !void {
         return transformer_dispatch.setFunctionParamStructs(self, name, items);
     }
@@ -10596,6 +10648,42 @@ test "packed storage generates masked sload" {
 
     try std.testing.expect(std.mem.indexOf(u8, output, "sload") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "and") != null);
+}
+
+test "small int arithmetic is masked to width" {
+    const allocator = std.testing.allocator;
+    const printer = @import("printer.zig");
+
+    const source =
+        \\pub const M = struct {
+        \\    pub fn addU8(self: *M, a: u8, b: u8) u8 {
+        \\        _ = self;
+        \\        const c: u8 = a + b;
+        \\        return c;
+        \\    }
+        \\    pub fn wide(self: *M, a: u256, b: u256) u256 {
+        \\        _ = self;
+        \\        return a + b;
+        \\    }
+        \\};
+    ;
+
+    const source_z = try allocator.dupeZ(u8, source);
+    defer allocator.free(source_z);
+
+    var transformer = Transformer.init(allocator);
+    defer transformer.deinit();
+
+    const yul_ast = try transformer.transform(source_z);
+    const output = try printer.format(allocator, yul_ast);
+    defer allocator.free(output);
+
+    // u8 local decl wraps to 255
+    try std.testing.expect(std.mem.indexOf(u8, output, "and(add(a, b), 255)") != null);
+    // u8 params masked on input
+    try std.testing.expect(std.mem.indexOf(u8, output, "and(calldataload(4), 255)") != null);
+    // u256 addition is left unmasked
+    try std.testing.expect(std.mem.indexOf(u8, output, "result := add(a, b)") != null);
 }
 
 test "transient storage builtins" {

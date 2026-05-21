@@ -27,3 +27,34 @@ pub fn isDynamicAbiType(abi: []const u8) bool {
 pub fn isDynamicArrayAbiType(abi: []const u8) bool {
     return std.mem.endsWith(u8, abi, "[]");
 }
+
+/// Bit width to mask an *unsigned* value to, or null when no masking is needed
+/// (full-width uint256, signed types, non-integers). Used to wrap small ints
+/// and clean address high bits at store/ABI boundaries.
+fn maskBitsForDigits(rest: []const u8) ?u16 {
+    if (rest.len == 0) return null; // bare "uint"/"int" alias == 256 bits
+    for (rest) |c| {
+        if (c < '0' or c > '9') return null; // arrays, brackets, etc.
+    }
+    const bits = std.fmt.parseInt(u16, rest, 10) catch return null;
+    if (bits == 0 or bits >= 256) return null;
+    return bits;
+}
+
+/// Mask width for an ABI type string ("uint8" -> 8, "address" -> 160).
+/// Signed (intN) and uint256 return null (handled elsewhere / no masking).
+pub fn abiUintMaskBits(abi: []const u8) ?u16 {
+    if (std.mem.eql(u8, abi, "address")) return 160;
+    if (!std.mem.startsWith(u8, abi, "uint")) return null;
+    return maskBitsForDigits(abi[4..]);
+}
+
+/// Mask width for a Zig type string ("u8" -> 8, "address"/"[20]u8" -> 160).
+/// u256 and signed types return null.
+pub fn zigUintMaskBits(zig_type: []const u8) ?u16 {
+    if (std.mem.eql(u8, zig_type, "address") or
+        std.mem.eql(u8, zig_type, "evm.Address") or
+        std.mem.eql(u8, zig_type, "[20]u8")) return 160;
+    if (zig_type.len < 2 or zig_type[0] != 'u') return null;
+    return maskBitsForDigits(zig_type[1..]);
+}
