@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+### Session 2026-05-22-001
+
+**Date**: 2026-05-22
+**Goal**: Make the no-solc `build-direct` backend correctly compile contracts with functions/mappings
+
+#### Completed Work
+1. Rewrote `src/evm/from_yul.zig` to a memory-frame calling convention: every Yul
+   variable lives in a fixed memory slot; calls pass arguments via slots and a
+   return-address JUMP. This removes the broken global stack tracker and the
+   stack-too-deep hazard.
+2. Detect and reject recursive call graphs (static slots cannot support recursion).
+3. Fixed a use-after-free in `build-direct --optimize-yul` (optimizer outlived by AST).
+4. Fixed operand-order miscompilation in the IR constant folder (SUB/DIV/MOD/EXP/LT/GT)
+   and removed an unsafe `PUSH 1, DIV` peephole.
+
+#### Test Results
+- Unit tests: `zig build test --summary all` (236 pass)
+- On-chain (anvil + cast): `counter` (set/get/increment/decrement) and `token`
+  (init/balanceOf/transfer/totalSupply, including insufficient-balance path)
+  behave correctly and match solc-built bytecode.
+
 ### Session 2026-01-12-001
 
 **Date**: 2026-01-12

@@ -83,14 +83,18 @@ zig-to-yul build -O contract.zig -o contract.bin
 ### Build Without solc (experimental)
 
 `build-direct` uses a built-in Yul→EVM backend, so it needs no external solc.
-It is **experimental and only supports a subset of Yul**: simple contracts
-(see `examples/counter.zig`) compile, but contracts whose internal functions
-are called from inside expressions — most notably mappings, which lower to
-nested helper calls — are not yet supported and will report an error.
-For full language support and smaller bytecode, use `build` (solc).
+User-defined functions (including mappings, which lower to internal helper calls)
+are supported via a memory-frame calling convention, and the examples
+(`counter.zig`, `token.zig`) compile and run correctly on-chain.
+
+It remains **experimental** with known limitations: recursive functions are not
+supported (a static memory frame is used), and contracts that write to high
+memory addresses directly may collide with the variable frame. solc-built
+bytecode is also smaller, so prefer `build` (solc) for production.
 
 ```bash
 zig-to-yul build-direct counter.zig -o counter.bin
+zig-to-yul build-direct token.zig -o token.bin
 ```
 
 ### Commands
