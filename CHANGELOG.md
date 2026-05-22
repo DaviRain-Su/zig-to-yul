@@ -16,12 +16,20 @@
 3. Fixed a use-after-free in `build-direct --optimize-yul` (optimizer outlived by AST).
 4. Fixed operand-order miscompilation in the IR constant folder (SUB/DIV/MOD/EXP/LT/GT)
    and removed an unsafe `PUSH 1, DIV` peephole.
+5. Optimizations to shrink `build-direct` output toward solc:
+   - mem2reg peephole: `PUSH s, MSTORE, PUSH s, MLOAD` -> `DUP1, PUSH s, MSTORE`.
+   - Small-function inlining in `from_yul`: functions with a single call site (or a
+     tiny body) are expanded at the call site and their standalone body is omitted.
+     Arguments are now fully evaluated before any parameter slot is written, which
+     also removes a parameter-clobber hazard in the static-slot convention.
+   - Sizes (with deploy code): counter -O 238 -> 152, token -O 916 -> 834
+     (solc -O: counter 107, token 323).
 
 #### Test Results
-- Unit tests: `zig build test --summary all` (236 pass)
+- Unit tests: `zig build test --summary all` (238 pass)
 - On-chain (anvil + cast): `counter` (set/get/increment/decrement) and `token`
   (init/balanceOf/transfer/totalSupply, including insufficient-balance path)
-  behave correctly and match solc-built bytecode.
+  behave correctly and match solc-built bytecode, for both no-opt and -O builds.
 
 ### Session 2026-01-12-001
 

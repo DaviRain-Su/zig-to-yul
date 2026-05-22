@@ -63,7 +63,16 @@ const FunctionInfo = struct {
     param_slots: []const u256,
     return_slots: []const u256,
     body: yul_ast.Block,
+    /// Whether this function is inlined at every call site (small + non-recursive).
+    /// Inlined functions are not emitted as standalone bodies.
+    inlinable: bool = false,
 };
+
+/// A multi-call-site function is only inlined if its body is at or below this
+/// node count (so duplication stays cheap). Single-call-site functions are
+/// always inlined regardless of size, since inlining then removes the body
+/// entirely rather than duplicating it.
+const INLINE_NODE_THRESHOLD: usize = 10;
 
 /// Loop context for break/continue.
 const LoopContext = struct {
@@ -86,6 +95,9 @@ pub const TransformContext = struct {
     functions: std.StringHashMap(FunctionInfo),
     scopes: std.ArrayList(Scope),
     loop_stack: std.ArrayList(LoopContext),
+    /// Stack of "end of inlined body" labels. While non-empty, a `leave` jumps to
+    /// the innermost inline end instead of performing a function return.
+    leave_targets: std.ArrayList(Label),
     in_function: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, evm_version: opcodes.EvmVersion) TransformContext {
@@ -97,6 +109,7 @@ pub const TransformContext = struct {
             .functions = std.StringHashMap(FunctionInfo).init(allocator),
             .scopes = .empty,
             .loop_stack = .empty,
+            .leave_targets = .empty,
         };
     }
 
@@ -106,6 +119,7 @@ pub const TransformContext = struct {
         for (self.scopes.items) |*s| s.deinit();
         self.scopes.deinit(self.allocator);
         self.loop_stack.deinit(self.allocator);
+        self.leave_targets.deinit(self.allocator);
         self.arena.deinit();
     }
 
@@ -175,6 +189,9 @@ pub fn transformObject(
     // Reject recursive call graphs (static slot assignment cannot support them).
     try checkNoRecursion(&ctx);
 
+    // Decide which functions to inline (single call site, or tiny body).
+    try finalizeInlining(&ctx, obj.code.statements);
+
     // Global scope for top-level (object code) variables.
     try ctx.pushScope();
     try transformStatements(&ctx, obj.code.statements);
@@ -217,6 +234,7 @@ fn collectFunctions(ctx: *TransformContext, statements: []const yul_ast.Statemen
                     .param_slots = param_slots,
                     .return_slots = return_slots,
                     .body = func.body,
+                    .inlinable = false, // decided later by finalizeInlining
                 }) catch return TransformError.OutOfMemory;
 
                 try collectFunctions(ctx, func.body.statements);
@@ -225,6 +243,115 @@ fn collectFunctions(ctx: *TransformContext, statements: []const yul_ast.Statemen
             else => {},
         }
     }
+}
+
+/// Decide which functions are inlined. A function is inlined if it has at most
+/// one static call site (inlining then removes the body entirely), or if its
+/// body is tiny enough that duplicating it across its few call sites is still
+/// cheaper than the call overhead. Recursion is already excluded.
+fn finalizeInlining(ctx: *TransformContext, statements: []const yul_ast.Statement) TransformError!void {
+    var census = std.StringHashMap(usize).init(ctx.arena.allocator());
+    try censusCallSites(statements, &census);
+
+    var it = ctx.functions.iterator();
+    while (it.next()) |entry| {
+        const name = entry.key_ptr.*;
+        const sites = census.get(name) orelse 0;
+        const small = countNodes(entry.value_ptr.body.statements) <= INLINE_NODE_THRESHOLD;
+        entry.value_ptr.inlinable = (sites <= 1) or small;
+    }
+}
+
+/// Tally every static function-call site (including those inside function bodies).
+fn censusCallSites(statements: []const yul_ast.Statement, census: *std.StringHashMap(usize)) TransformError!void {
+    for (statements) |stmt| {
+        switch (stmt) {
+            .expression_statement => |es| try censusExpr(es.expression, census),
+            .variable_declaration => |vd| if (vd.value) |v| try censusExpr(v, census),
+            .assignment => |as_| try censusExpr(as_.value, census),
+            .block => |b| try censusCallSites(b.statements, census),
+            .if_statement => |i| {
+                try censusExpr(i.condition, census);
+                try censusCallSites(i.body.statements, census);
+            },
+            .switch_statement => |sw| {
+                try censusExpr(sw.expression, census);
+                for (sw.cases) |c| try censusCallSites(c.body.statements, census);
+            },
+            .for_loop => |f| {
+                try censusCallSites(f.pre.statements, census);
+                try censusExpr(f.condition, census);
+                try censusCallSites(f.post.statements, census);
+                try censusCallSites(f.body.statements, census);
+            },
+            .function_definition => |fd| try censusCallSites(fd.body.statements, census),
+            else => {},
+        }
+    }
+}
+
+fn censusExpr(expr: yul_ast.Expression, census: *std.StringHashMap(usize)) TransformError!void {
+    switch (expr) {
+        .function_call => |call| {
+            const gop = census.getOrPut(call.function_name) catch return TransformError.OutOfMemory;
+            if (gop.found_existing) gop.value_ptr.* += 1 else gop.value_ptr.* = 1;
+            for (call.arguments) |arg| try censusExpr(arg, census);
+        },
+        .builtin_call => |call| {
+            for (call.arguments) |arg| try censusExpr(arg, census);
+        },
+        else => {},
+    }
+}
+
+/// Count AST nodes (statements + expression nodes) in a statement list.
+/// Used as the inlining size heuristic.
+fn countNodes(statements: []const yul_ast.Statement) usize {
+    var n: usize = 0;
+    for (statements) |stmt| {
+        n += 1;
+        switch (stmt) {
+            .expression_statement => |es| n += countExprNodes(es.expression),
+            .variable_declaration => |vd| if (vd.value) |v| {
+                n += countExprNodes(v);
+            },
+            .assignment => |as_| n += countExprNodes(as_.value),
+            .block => |b| n += countNodes(b.statements),
+            .if_statement => |i| {
+                n += countExprNodes(i.condition);
+                n += countNodes(i.body.statements);
+            },
+            .switch_statement => |sw| {
+                n += countExprNodes(sw.expression);
+                for (sw.cases) |c| n += countNodes(c.body.statements);
+            },
+            .for_loop => |f| {
+                n += countNodes(f.pre.statements);
+                n += countExprNodes(f.condition);
+                n += countNodes(f.post.statements);
+                n += countNodes(f.body.statements);
+            },
+            .function_definition => |fd| n += countNodes(fd.body.statements),
+            else => {},
+        }
+    }
+    return n;
+}
+
+fn countExprNodes(expr: yul_ast.Expression) usize {
+    return switch (expr) {
+        .literal, .identifier => 1,
+        .builtin_call => |c| blk: {
+            var n: usize = 1;
+            for (c.arguments) |a| n += countExprNodes(a);
+            break :blk n;
+        },
+        .function_call => |c| blk: {
+            var n: usize = 1;
+            for (c.arguments) |a| n += countExprNodes(a);
+            break :blk n;
+        },
+    };
 }
 
 fn checkNoRecursion(ctx: *TransformContext) TransformError!void {
@@ -543,6 +670,10 @@ fn transformForLoop(ctx: *TransformContext, for_stmt: yul_ast.ForLoop) Transform
 fn transformFunctionDefinition(ctx: *TransformContext, func: yul_ast.FunctionDefinition) TransformError!void {
     const info = ctx.functions.get(func.name) orelse return TransformError.UnknownFunction;
 
+    // Inlinable functions are expanded at every call site, so the standalone
+    // body is never reached and is not emitted.
+    if (info.inlinable) return;
+
     // Jump over the body; it is only entered via an explicit call.
     const skip_label = ctx.newLabel("skip_func");
     ctx.builder.jump(skip_label) catch return TransformError.OutOfMemory;
@@ -572,7 +703,10 @@ fn transformFunctionDefinition(ctx: *TransformContext, func: yul_ast.FunctionDef
 }
 
 fn transformLeave(ctx: *TransformContext) TransformError!void {
-    if (ctx.in_function) {
+    if (ctx.leave_targets.items.len > 0) {
+        // Inside an inlined body: jump to the end of the inline expansion.
+        ctx.builder.jump(ctx.leave_targets.getLast()) catch return TransformError.OutOfMemory;
+    } else if (ctx.in_function) {
         // Return address is on top of the stack at any statement boundary.
         ctx.builder.emit(.JUMP) catch return TransformError.OutOfMemory;
     } else {
@@ -654,26 +788,57 @@ fn transformBuiltinCall(ctx: *TransformContext, call: yul_ast.BuiltinCall) Trans
 }
 
 /// Emit a call to a user function. Arguments are written into the callee's
-/// parameter slots, then control transfers via a return-address JUMP. Results
-/// are left in the callee's return slots. Returns the callee's FunctionInfo.
+/// parameter slots, then the body either runs inline or is reached via a
+/// return-address JUMP. Results are left in the callee's return slots. Returns
+/// the callee's FunctionInfo.
 fn transformCall(ctx: *TransformContext, call: yul_ast.FunctionCall) TransformError!FunctionInfo {
     const info = ctx.functions.get(call.function_name) orelse return TransformError.UnknownFunction;
     if (call.arguments.len != info.param_slots.len) return TransformError.InvalidArgumentCount;
 
-    // Write each argument value into the callee's parameter slot.
-    for (call.arguments, 0..) |arg, i| {
-        try transformExpression(ctx, arg); // -> value on stack
-        try storeTo(ctx, info.param_slots[i]);
+    // Evaluate ALL arguments onto the stack first, then store them into the
+    // parameter slots. Doing the stores only after every argument is evaluated
+    // avoids clobbering a parameter slot when a later argument's evaluation
+    // (transitively) calls the same function with its static slots.
+    for (call.arguments) |arg| try transformExpression(ctx, arg);
+    var i = call.arguments.len;
+    while (i > 0) {
+        i -= 1;
+        try storeTo(ctx, info.param_slots[i]); // consumes top of stack
     }
 
-    // Push return address, then jump to the function entry.
-    const ret_label = ctx.newLabel("ret");
-    ctx.builder.instructions.append(ctx.allocator, .{ .label_ref = ret_label }) catch
-        return TransformError.OutOfMemory;
-    ctx.builder.jump(info.entry_label) catch return TransformError.OutOfMemory;
-    ctx.builder.defineLabel(ret_label) catch return TransformError.OutOfMemory;
+    if (info.inlinable) {
+        try emitInlineBody(ctx, info);
+    } else {
+        // Push return address, then jump to the function entry.
+        const ret_label = ctx.newLabel("ret");
+        ctx.builder.instructions.append(ctx.allocator, .{ .label_ref = ret_label }) catch
+            return TransformError.OutOfMemory;
+        ctx.builder.jump(info.entry_label) catch return TransformError.OutOfMemory;
+        ctx.builder.defineLabel(ret_label) catch return TransformError.OutOfMemory;
+    }
 
     return info;
+}
+
+/// Emit a function body inline (no call/return). Parameters are assumed already
+/// written to the parameter slots. A `leave` inside the body jumps to a local
+/// end label rather than performing a function return.
+fn emitInlineBody(ctx: *TransformContext, info: FunctionInfo) TransformError!void {
+    // Return variables start at zero on each (inlined) activation.
+    for (info.return_slots) |slot| try storeZero(ctx, slot);
+
+    const end_label = ctx.newLabel("inline_end");
+    ctx.leave_targets.append(ctx.allocator, end_label) catch return TransformError.OutOfMemory;
+
+    try ctx.pushScope();
+    for (info.params, 0..) |p, idx| try ctx.bindSlot(p.name, info.param_slots[idx]);
+    for (info.returns, 0..) |r, idx| try ctx.bindSlot(r.name, info.return_slots[idx]);
+
+    try transformStatements(ctx, info.body.statements);
+
+    ctx.popScope();
+    _ = ctx.leave_targets.pop();
+    ctx.builder.defineLabel(end_label) catch return TransformError.OutOfMemory;
 }
 
 // =============================================
