@@ -201,6 +201,25 @@ pub const Optimizer = struct {
     fn tryPeepholeAt(self: *Optimizer, insts: []const Instruction, i: usize) !?usize {
         const remaining = insts.len - i;
 
+        // Pattern (mem2reg): PUSH s, MSTORE, PUSH s, MLOAD → DUP1, PUSH s, MSTORE
+        // Storing a value to memory slot `s` and immediately reloading the same
+        // slot yields the value just stored. Keep the store (the slot may be read
+        // later) but reuse the value on the stack instead of an MLOAD round-trip.
+        // This recovers most of the cost of the memory-frame calling convention.
+        if (remaining >= 4) {
+            const s1 = getPushValue(insts[i]);
+            const s2 = getPushValue(insts[i + 2]);
+            if (s1 != null and s2 != null and s1.? == s2.? and
+                insts[i + 1] == .opcode and insts[i + 1].opcode == .MSTORE and
+                insts[i + 3] == .opcode and insts[i + 3].opcode == .MLOAD)
+            {
+                try self.output.append(self.allocator, .{ .opcode = .DUP1 });
+                try self.output.append(self.allocator, insts[i]); // PUSH s (original form)
+                try self.output.append(self.allocator, .{ .opcode = .MSTORE });
+                return 4;
+            }
+        }
+
         // Pattern: PUSH X, POP → remove both (2 instructions)
         if (remaining >= 2) {
             if (isPush(insts[i]) and insts[i + 1] == .opcode and insts[i + 1].opcode == .POP) {
@@ -794,6 +813,65 @@ test "constant folding: exp uses correct base and exponent" {
 
     try std.testing.expectEqual(@as(usize, 2), result.len);
     try std.testing.expectEqual(@as(u256, 8), result[0].push);
+}
+
+test "mem2reg: store then reload same slot reuses value" {
+    const allocator = std.testing.allocator;
+    var optimizer = Optimizer.init(allocator, .cancun);
+    defer optimizer.deinit();
+
+    // PUSH 7, PUSH 0x80, MSTORE, PUSH 0x80, MLOAD, STOP
+    // -> PUSH 7, DUP1, PUSH 0x80, MSTORE, STOP  (no MLOAD)
+    const input = [_]Instruction{
+        .{ .push = 7 },
+        .{ .push = 0x80 },
+        .{ .opcode = .MSTORE },
+        .{ .push = 0x80 },
+        .{ .opcode = .MLOAD },
+        .{ .opcode = .STOP },
+    };
+
+    const result = try optimizer.optimize(&input);
+    defer allocator.free(result);
+
+    var has_dup1 = false;
+    var has_mload = false;
+    for (result) |inst| {
+        switch (inst) {
+            .opcode => |op| {
+                if (op == .DUP1) has_dup1 = true;
+                if (op == .MLOAD) has_mload = true;
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(has_dup1);
+    try std.testing.expect(!has_mload);
+}
+
+test "mem2reg: different slots are not merged" {
+    const allocator = std.testing.allocator;
+    var optimizer = Optimizer.init(allocator, .cancun);
+    defer optimizer.deinit();
+
+    // Store to 0x80, load from 0xA0 -> must keep the MLOAD.
+    const input = [_]Instruction{
+        .{ .push = 7 },
+        .{ .push = 0x80 },
+        .{ .opcode = .MSTORE },
+        .{ .push = 0xA0 },
+        .{ .opcode = .MLOAD },
+        .{ .opcode = .STOP },
+    };
+
+    const result = try optimizer.optimize(&input);
+    defer allocator.free(result);
+
+    var has_mload = false;
+    for (result) |inst| {
+        if (inst == .opcode and inst.opcode == .MLOAD) has_mload = true;
+    }
+    try std.testing.expect(has_mload);
 }
 
 test "dead code elimination" {
