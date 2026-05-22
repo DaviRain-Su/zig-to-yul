@@ -22,7 +22,11 @@
      tiny body) are expanded at the call site and their standalone body is omitted.
      Arguments are now fully evaluated before any parameter slot is written, which
      also removes a parameter-clobber hazard in the static-slot convention.
-   - Sizes (with deploy code): counter -O 238 -> 152, token -O 916 -> 834
+   - Dead store elimination for memory-frame slots: a store to a frame slot
+     (>= 0x80) that is never read is removed. Sound by construction: the pass
+     bails unless it can prove no instruction reads a frame address (no dynamic
+     MLOAD, and every memory-range read stays below the frame).
+   - Sizes (with deploy code): counter -O 238 -> 132, token -O 916 -> 785
      (solc -O: counter 107, token 323).
 
 #### Test Results

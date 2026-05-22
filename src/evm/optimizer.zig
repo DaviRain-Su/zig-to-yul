@@ -54,6 +54,8 @@ pub const OptimizerConfig = struct {
     dead_code_elimination: bool = true,
     /// Enable jump optimization.
     jump_optimization: bool = true,
+    /// Enable dead store elimination for memory-frame slots.
+    dead_store_elimination: bool = true,
 };
 
 /// Statistics about optimizations performed.
@@ -155,6 +157,13 @@ pub const Optimizer = struct {
 
             if (self.config.jump_optimization) {
                 const new = try self.jumpOptimizationPass(current);
+                if (new.len != current.len) changed = true;
+                self.allocator.free(current);
+                current = new;
+            }
+
+            if (self.config.dead_store_elimination) {
+                const new = try self.deadStoreEliminationPass(current);
                 if (new.len != current.len) changed = true;
                 self.allocator.free(current);
                 current = new;
@@ -548,6 +557,100 @@ pub const Optimizer = struct {
     }
 
     // =========================================
+    // Dead Store Elimination (memory-frame slots)
+    // =========================================
+
+    /// Base address of the memory variable frame. Must match `FRAME_BASE` in
+    /// src/evm/from_yul.zig. Stores to slots at or above this address are part of
+    /// the calling convention's frame; if such a slot is never read, the store is
+    /// dead and can be removed.
+    const FRAME_SLOT_BASE: u256 = 0x80;
+
+    /// Remove stores to frame slots that are never read. Sound by construction:
+    /// the pass first proves that no instruction can read a frame address (no
+    /// dynamic MLOAD, and every memory-range read stays below the frame). If that
+    /// cannot be proven, the pass bails and changes nothing.
+    fn deadStoreEliminationPass(self: *Optimizer, instructions: []const Instruction) ![]Instruction {
+        // --- Soundness gate + collect frame slots that ARE read ---
+        var read_slots = std.AutoHashMap(u256, void).init(self.allocator);
+        defer read_slots.deinit();
+
+        for (instructions, 0..) |inst, i| {
+            if (inst != .opcode) continue;
+            switch (inst.opcode) {
+                .MLOAD => {
+                    // Constant load? Track the slot. Dynamic load? Bail.
+                    if (i == 0) return self.copyOf(instructions);
+                    const c = getPushValue(instructions[i - 1]) orelse
+                        return self.copyOf(instructions);
+                    if (c >= FRAME_SLOT_BASE) try read_slots.put(c, {});
+                },
+                // Memory-range reads: layout is `PUSH len, PUSH off, OP`.
+                .KECCAK256, .RETURN, .REVERT => {
+                    if (i < 2) return self.copyOf(instructions);
+                    const off = getPushValue(instructions[i - 1]) orelse
+                        return self.copyOf(instructions);
+                    const len = getPushValue(instructions[i - 2]) orelse
+                        return self.copyOf(instructions);
+                    if (off + len > FRAME_SLOT_BASE) return self.copyOf(instructions);
+                },
+                // Opcodes whose memory range is hard to bound here: be safe.
+                .CALL, .CALLCODE, .DELEGATECALL, .STATICCALL, .CREATE, .CREATE2, .MCOPY, .LOG0, .LOG1, .LOG2, .LOG3, .LOG4, .CALLDATACOPY, .RETURNDATACOPY, .EXTCODECOPY => {
+                    return self.copyOf(instructions);
+                },
+                else => {},
+            }
+        }
+
+        // --- Remove dead frame-slot stores ---
+        self.output.clearRetainingCapacity();
+        var i: usize = 0;
+        while (i < instructions.len) {
+            // Match `PUSH s, MSTORE` with s a constant frame slot that is never read.
+            if (i + 1 < instructions.len and
+                instructions[i + 1] == .opcode and instructions[i + 1].opcode == .MSTORE)
+            {
+                if (getPushValue(instructions[i])) |s| {
+                    if (s >= FRAME_SLOT_BASE and !read_slots.contains(s)) {
+                        // Dead store. Balance the stack based on the value source,
+                        // which is the last instruction already emitted to output.
+                        const last = if (self.output.items.len > 0)
+                            self.output.items[self.output.items.len - 1]
+                        else
+                            null;
+                        if (last != null and last.? == .opcode and last.?.opcode == .DUP1) {
+                            // DUP1, PUSH s, MSTORE: drop the DUP1 and the store;
+                            // the original value stays on the stack.
+                            _ = self.output.pop();
+                        } else if (last != null and isPush(last.?)) {
+                            // PUSH v, PUSH s, MSTORE: the value was pushed only for
+                            // this store; drop it and the store.
+                            _ = self.output.pop();
+                        } else {
+                            // Value produced by other computation: replace the store
+                            // with a POP to discard it.
+                            try self.output.append(self.allocator, .{ .opcode = .POP });
+                        }
+                        self.stats.dead_code_removed += 1;
+                        i += 2;
+                        continue;
+                    }
+                }
+            }
+            try self.output.append(self.allocator, instructions[i]);
+            i += 1;
+        }
+
+        return try self.output.toOwnedSlice(self.allocator);
+    }
+
+    fn copyOf(self: *Optimizer, instructions: []const Instruction) ![]Instruction {
+        const result = try self.allocator.alloc(Instruction, instructions.len);
+        @memcpy(result, instructions);
+        return result;
+    }
+
+    // =========================================
     // Helper Functions
     // =========================================
 
@@ -817,7 +920,12 @@ test "constant folding: exp uses correct base and exponent" {
 
 test "mem2reg: store then reload same slot reuses value" {
     const allocator = std.testing.allocator;
-    var optimizer = Optimizer.init(allocator, .cancun);
+    // Disable DSE so the surviving DUP1+store (the mem2reg result) is observable;
+    // with DSE on, the now-unread store would be removed entirely (also correct).
+    var optimizer = Optimizer.initWithConfig(allocator, .{
+        .evm_version = .cancun,
+        .dead_store_elimination = false,
+    });
     defer optimizer.deinit();
 
     // PUSH 7, PUSH 0x80, MSTORE, PUSH 0x80, MLOAD, STOP
@@ -872,6 +980,82 @@ test "mem2reg: different slots are not merged" {
         if (inst == .opcode and inst.opcode == .MLOAD) has_mload = true;
     }
     try std.testing.expect(has_mload);
+}
+
+test "dse: dead frame store is removed" {
+    const allocator = std.testing.allocator;
+    var optimizer = Optimizer.init(allocator, .cancun);
+    defer optimizer.deinit();
+
+    // PUSH 9, PUSH 0x80, MSTORE, STOP  -> slot 0x80 never read -> store removed.
+    const input = [_]Instruction{
+        .{ .push = 9 },
+        .{ .push = 0x80 },
+        .{ .opcode = .MSTORE },
+        .{ .opcode = .STOP },
+    };
+    const result = try optimizer.optimize(&input);
+    defer allocator.free(result);
+
+    for (result) |inst| {
+        try std.testing.expect(!(inst == .opcode and inst.opcode == .MSTORE));
+    }
+}
+
+test "dse: store kept when slot is read" {
+    const allocator = std.testing.allocator;
+    // Isolate DSE so the mem2reg peephole doesn't fold the store/load away first.
+    var optimizer = Optimizer.initWithConfig(allocator, .{
+        .evm_version = .cancun,
+        .peephole = false,
+        .constant_folding = false,
+        .dead_code_elimination = false,
+        .jump_optimization = false,
+        .dead_store_elimination = true,
+    });
+    defer optimizer.deinit();
+
+    // Slot 0x80 is read by the MLOAD, so its store must be kept.
+    const input = [_]Instruction{
+        .{ .push = 9 },
+        .{ .push = 0x80 },
+        .{ .opcode = .MSTORE },
+        .{ .push = 0x80 },
+        .{ .opcode = .MLOAD },
+        .{ .opcode = .STOP },
+    };
+    const result = try optimizer.optimize(&input);
+    defer allocator.free(result);
+
+    var has_mstore = false;
+    for (result) |inst| {
+        if (inst == .opcode and inst.opcode == .MSTORE) has_mstore = true;
+    }
+    try std.testing.expect(has_mstore);
+}
+
+test "dse: bails when a memory-range opcode could read the frame" {
+    const allocator = std.testing.allocator;
+    var optimizer = Optimizer.init(allocator, .cancun);
+    defer optimizer.deinit();
+
+    // A CALL is present: the pass cannot bound its memory range, so it must keep
+    // the (otherwise unread) frame store.
+    const input = [_]Instruction{
+        .{ .push = 9 },
+        .{ .push = 0x80 },
+        .{ .opcode = .MSTORE },
+        .{ .opcode = .CALL },
+        .{ .opcode = .STOP },
+    };
+    const result = try optimizer.optimize(&input);
+    defer allocator.free(result);
+
+    var has_mstore = false;
+    for (result) |inst| {
+        if (inst == .opcode and inst.opcode == .MSTORE) has_mstore = true;
+    }
+    try std.testing.expect(has_mstore);
 }
 
 test "dead code elimination" {
